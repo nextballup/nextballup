@@ -1,0 +1,79 @@
+# NextBallUp — Local Development Services
+# Usage: docker compose up -d
+# Access: PostgreSQL on 5432, Redis on 6379, MinIO on 9000 (console 9001)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nbu-postgres
+    environment:
+      POSTGRES_USER: nextballup
+      POSTGRES_PASSWORD: nextballup_dev
+      POSTGRES_DB: nextballup
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextballup"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: nbu-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MinIO replaces S3 for local development
+  # Buckets: nbu-raw-video, nbu-mezzanine, nbu-hls, nbu-clips, nbu-thumbnails, nbu-reports
+  minio:
+    image: minio/minio:latest
+    container_name: nbu-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Create default buckets on startup
+  minio-init:
+    image: minio/mc:latest
+    container_name: nbu-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin123;
+      mc mb --ignore-existing local/nbu-raw-video;
+      mc mb --ignore-existing local/nbu-mezzanine;
+      mc mb --ignore-existing local/nbu-hls;
+      mc mb --ignore-existing local/nbu-clips;
+      mc mb --ignore-existing local/nbu-thumbnails;
+      mc mb --ignore-existing local/nbu-reports;
+      exit 0;
+      "
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

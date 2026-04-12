@@ -1,0 +1,58 @@
+name: Security Scan
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 8 * * 1'  # Weekly Monday 8am UTC
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  python-audit:
+    name: Python Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - run: uv sync --all-packages
+      - name: Check for known vulnerabilities
+        run: uv run pip-audit --strict --desc
+      - name: Verify no copyleft licenses
+        run: |
+          uv run pip-licenses --format=csv --with-license-file --no-license-path \
+            | grep -iE "GPL|AGPL|SSPL|EUPL|OSL|CPAL" \
+            && echo "::error::Copyleft license detected — blocked by project policy" && exit 1 \
+            || echo "License check passed"
+
+  npm-audit:
+    name: Frontend Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: cd apps/web && pnpm install --frozen-lockfile
+      - name: Audit frontend dependencies
+        run: cd apps/web && pnpm audit --audit-level=high
+
+  secrets-scan:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --only-verified
