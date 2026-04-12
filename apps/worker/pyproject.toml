@@ -8,9 +8,9 @@ dependencies = [
     "nextballup-db",
     "nextballup-cv",
     "nextballup-clips",
-    "celery[redis]>=5.4",
+    "celery[redis]>=5.4,<5.7",
     "boto3>=1.35",
-    "redis>=5.2",
+    "redis>=5.0,<6",
 ]
 
 [build-system]

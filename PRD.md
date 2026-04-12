@@ -118,7 +118,7 @@ Each stage shows: pending (○), running with percent (◉), complete (✓), or 
 
 1. **Transcode**: Convert to H.264 mezzanine (1080p, 30fps). Generate HLS segments. Extract thumbnail.
 2. **Detect**: Run RF-DETR on all frames. Output bounding boxes for players, ball, hoop, referees.
-3. **Track**: Run BoT-SORT via BoxMOT. Assign persistent track IDs to players. Run SmolVLM2 for jersey number OCR. Cluster team colors.
+3. **Track**: Run BoT-SORT (standalone MIT repo). Assign persistent track IDs to players. Run SmolVLM2 for jersey number OCR. Cluster team colors.
 4. **Court Map**: Detect court keypoints (corners, lane markings, center circle, hoops). Compute homography matrix per segment. Map all detections to court coordinates.
 5. **Events**: Detect possession boundaries. Classify events (shots, passes, turnovers, rebounds, screens, cuts). Assign tactical tags (P&R, DHO, zone, etc.). Link events to actors.
 6. **Metrics**: Compute box score stats, shooting zones, spatial IQ components, conversion rates, player tendencies, and predictive features (shot quality, pass risk).

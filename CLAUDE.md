@@ -4,7 +4,7 @@
 
 - **What**: AI vision platform for basketball player analysis — "hidden impact" metrics beyond box scores
 - **Stack**: Python 3.12+ (uv workspaces) · FastAPI · PostgreSQL 16 · Redis · Next.js 15 · Celery
-- **CV Pipeline**: RF-DETR → BoT-SORT (via BoxMOT) → ViTPose++ → SmolVLM2 (jersey OCR) → court homography → event classifiers
+- **CV Pipeline**: RF-DETR → BoT-SORT (standalone MIT repo) → ViTPose++ → SmolVLM2 (jersey OCR) → court homography → event classifiers
 - **License constraint**: ALL dependencies must be Apache-2.0, MIT, or BSD. No AGPL. No "non-commercial" licenses. No Ultralytics YOLO. No OpenPose. No AlphaPose.
 - **Target**: Basketball first. Volleyball expansion planned but not in MVP scope.
 - **User roles**: Players and Coaches create accounts. Coaches create and manage Teams. Players join Teams via invite.
@@ -86,7 +86,7 @@ nextballup/
 │   │       ├── detection/       # RF-DETR player/ball/hoop detector
 │   │       │   ├── detector.py
 │   │       │   └── config.py
-│   │       ├── tracking/        # BoT-SORT via BoxMOT
+│   │       ├── tracking/        # BoT-SORT (standalone MIT repo, NOT BoxMOT)
 │   │       │   ├── tracker.py
 │   │       │   └── reid.py      # Team color + jersey ReID
 │   │       ├── court/           # Court registration + homography
@@ -701,7 +701,7 @@ Six sequential idempotent stages, each a separate Celery task:
 
 1. **Transcode** — FFmpeg → 1080p/30fps/H.264/CRF18 mezzanine + HLS 6s chunks + thumbnail.
 2. **Detect** — RF-DETR on every frame. Classes: player, basketball, hoop/backboard, referee. Tiling for small ball detection. Confidence 0.3 players, 0.2 ball.
-3. **Track** — BoT-SORT (BoxMOT) assigns persistent track IDs. Camera motion compensation. SigLIP embeddings for team color clustering. SmolVLM2 for jersey OCR on cropped bboxes.
+3. **Track** — BoT-SORT (standalone MIT repo — do NOT use BoxMOT which is AGPL-3.0) assigns persistent track IDs. Camera motion compensation. SigLIP embeddings for team color clustering. SmolVLM2 for jersey OCR on cropped bboxes.
 4. **Court Map** — Detect 15+ court keypoints → RANSAC homography → map all tracks to canonical court coordinates (94ft × 50ft). Re-estimate per 5-second segment. Quality score from reprojection error. **Fallback**: if <4 keypoints detected, offer manual 4-point calibration UI. Degrade gracefully: disable spatial metrics, still deliver box score stats.
 5. **Events** — Heuristic layer (possession changes, shot attempts, rebounds, turnovers) + ML classifier (MMAction2/PySlowFast for tactical actions: PnR, DHO, flare, cut, iso, spot-up). **Conflict resolution**: ML wins when confidence > 0.8, heuristic wins when ML < 0.5, both flagged for review between 0.5-0.8. Actor assignment via court-coordinate proximity.
 6. **Metrics** — Box score, shooting by zone, Spatial IQ components, conversion rates, predictive features (shot quality, pass risk), tendency cards, defensive metrics. All written to player_game_metrics. **Suppress metrics computed from fewer than 10 possessions** — small sample unreliability.
@@ -837,8 +837,10 @@ These findings were identified by a second deep review after the first audit ite
 
 ### Research & Tooling (Tools Analyst — Round 2)
 
-- **BoxMOT AGPL contamination risk.** The `boxmot` package bundles DeepSORT (GPL-3.0) alongside MIT trackers. Verify at import time that only MIT-licensed tracker code is loaded. Add a runtime check: `assert tracker_type in ["botsort", "bytetrack", "ocsort"]` before initializing BoxMOT. If BoxMOT's import mechanism loads DeepSORT code regardless of which tracker you select, you may need to vendor only the MIT tracker files directly instead of depending on the full package. Test this before committing to the dependency.
-- **Missing dependencies in cv_pipeline pyproject.toml.** Add: `decord>=0.6` (Apache-2.0, fast video reading, 3× faster than OpenCV VideoCapture for batch extraction), `supervision>=0.25` (MIT, Roboflow's CV utilities for annotation visualization and format conversion), `av>=13.0` (BSD, PyAV for programmatic FFmpeg — more reliable than ffmpeg-python for complex transcoding).
+- **BoxMOT AGPL-3.0 — RESOLVED: removed from dependencies.** BoxMOT is AGPL-3.0 for the entire package. Importing any part triggers copyleft regardless of which tracker you select. Use standalone MIT-licensed tracker repos directly: ByteTrack (github.com/ifzhang/ByteTrack), BoT-SORT (github.com/NirAharon/BoT-SORT), OC-SORT (github.com/noahcao/OC_SORT). Claude Code must clone and integrate these directly, not install boxmot.
+- **decord — RESOLVED: replaced with PyAV (av>=17.0).** decord is abandoned (last release 2021), has no Python 3.12 wheels, no Apple Silicon wheels. PyAV provides the same fast video decoding with BSD license and native ARM64 support.
+- **Security: PyTorch model loading RCE (CVE-2026-24747).** Even `torch.load(..., weights_only=True)` had RCE risk prior to PyTorch 2.10. Always use PyTorch >= 2.11 (pinned in cv_pipeline). Never load untrusted model checkpoints — only accept weights produced by your own CI or from verified sources.
+- **Security: MMDetection distributed training RCE.** MMDetection has a known advisory for unsafe pickle deserialization in its distributed training API. Never expose training endpoints to the network. Training runs should be isolated, not accessible from the API or worker services.
 - **No feature flag system.** When rolling out new metrics or model versions, you need gradual exposure to catch regressions before they affect all users. Add `flagsmith` (BSD-3-Clause) or implement a simple JSON-based feature flag config: `{"spatial_iq_composite": false, "defensive_metrics": false, "new_ball_tracker_v2": false}` stored in Redis and checked at API response time. This lets you enable experimental metrics for specific teams during pilot.
 - **The training/ directory is empty.** Add structure: `training/detection/train.py` (RF-DETR fine-tuning script), `training/detection/export.py` (PyTorch → ONNX → CoreML), `training/tracking/eval.py` (TrackEval harness), `training/events/train.py` (action classifier), `training/configs/` (hyperparameter YAML files), `training/data/` (DVC-tracked dataset symlinks). Each training script should log to W&B and output versioned model artifacts.
 - **No A/B testing for model versions.** When you ship a new detector or tracker version, you need to compare it against the previous version on the same footage. Implement a shadow processing mode: new model processes a game in parallel with the production model, results are compared on held-out gold set games, new model promoted only if metrics improve on all acceptance criteria. This prevents regressions that look good in isolation but fail on real gym footage.

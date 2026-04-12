@@ -74,7 +74,7 @@ disallow_untyped_defs = true
 plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
 
 [[tool.mypy.overrides]]
-module = ["cv2.*", "torch.*", "torchvision.*", "boxmot.*", "mmpose.*"]
+module = ["cv2.*", "torch.*", "torchvision.*", "mmpose.*", "filterpy.*"]
 ignore_missing_imports = true
 
 # ---- Pytest configuration ----
