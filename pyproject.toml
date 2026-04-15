@@ -3,14 +3,23 @@ name = "nextballup"
 version = "0.1.0"
 description = "AI vision platform for basketball player analysis — hidden impact metrics beyond box scores"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 license = { text = "Proprietary" }
 
-# Root-level dev dependencies (shared across workspace)
-dependencies = []
+# Root depends on every non-CV workspace member so `uv sync` installs the
+# backend (API + worker) in one shot. "Lightweight" here means CV-heavy
+# `packages/cv_pipeline` stays out of the workspace entirely; celery/redis
+# used by the worker service are orders of magnitude smaller than torch/
+# OpenMMLab and are part of the default backend footprint.
+dependencies = [
+    "nextballup-core",
+    "nextballup-db",
+    "nextballup-api",
+    "nextballup-worker",
+]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
@@ -19,13 +28,17 @@ dev-dependencies = [
     "ruff>=0.8",
     "mypy>=1.13",
     "pre-commit>=4.0",
+    "pip-audit>=2.8",
+    "pip-licenses>=5.0",
 ]
+
+[tool.uv]
+default-groups = ["dev"]
 
 [tool.uv.workspace]
 members = [
     "packages/core",
     "packages/db",
-    "packages/cv_pipeline",
     "packages/clip_engine",
     "apps/api",
     "apps/worker",
@@ -34,8 +47,9 @@ members = [
 [tool.uv.sources]
 nextballup-core = { workspace = true }
 nextballup-db = { workspace = true }
-nextballup-cv = { workspace = true }
 nextballup-clips = { workspace = true }
+nextballup-api = { workspace = true }
+nextballup-worker = { workspace = true }
 
 # ---- Ruff configuration ----
 [tool.ruff]
@@ -59,6 +73,18 @@ select = [
 ignore = [
     "E501",    # line length (handled by formatter)
     "B008",    # do not perform function calls in argument defaults (FastAPI Depends)
+    # TC* (formerly TCH) demands moving annotation-only imports under TYPE_CHECKING.
+    # FastAPI / Pydantic / SQLAlchemy resolve type hints at runtime via
+    # get_type_hints(), which requires the symbols to be importable at module
+    # level — the rule actively breaks our dependency injection in practice.
+    "TC001",
+    "TC002",
+    "TC003",
+    # RUF059 nags when a tuple-returning helper's extra elements aren't used
+    # by a specific caller. Test files use the same helper for many cases and
+    # often need only a subset of the tuple; prefixing every unused element is
+    # churn without benefit.
+    "RUF059",
 ]
 
 [tool.ruff.lint.isort]
@@ -74,8 +100,18 @@ disallow_untyped_defs = true
 plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
 
 [[tool.mypy.overrides]]
-module = ["cv2.*", "torch.*", "torchvision.*", "mmpose.*", "filterpy.*"]
+module = ["boto3", "botocore.*", "celery", "celery.*", "jose"]
 ignore_missing_imports = true
+
+# Celery has no py.typed marker, so its Task base and @app.task decorators
+# project as Any. Allow subclassing/decoration without mypy complaints inside
+# the worker task shim — everything we care about is typed in the runtime
+# modules it delegates to.
+[[tool.mypy.overrides]]
+module = ["nextballup_worker.tasks"]
+disallow_untyped_decorators = false
+disable_error_code = ["misc"]
+
 
 # ---- Pytest configuration ----
 [tool.pytest.ini_options]

@@ -2,7 +2,7 @@
 name = "nextballup-db"
 version = "0.1.0"
 description = "NextBallUp database layer — SQLAlchemy models, repositories, migrations"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "nextballup-core",
     "sqlalchemy[asyncio]>=2.0.36",

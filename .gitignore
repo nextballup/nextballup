@@ -207,6 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 # NextBallUp
+.DS_Store
+celerybeat-schedule.db
 keys/
 *.pem
 .env.local

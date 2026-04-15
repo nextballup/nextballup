@@ -2,11 +2,10 @@
 name = "nextballup-worker"
 version = "0.1.0"
 description = "NextBallUp Celery worker for GPU-intensive CV processing tasks"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "nextballup-core",
     "nextballup-db",
-    "nextballup-cv",
     "nextballup-clips",
     "celery[redis]>=5.4,<5.7",
     "boto3>=1.35",
@@ -18,4 +17,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["apps/worker"]
+packages = ["src/nextballup_worker"]

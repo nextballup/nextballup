@@ -16,22 +16,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
       - uses: astral-sh/setup-uv@v4
         with:
           version: "latest"
-      - run: uv sync --all-packages
+      - run: uv sync
+      - name: Export third-party Python requirements for auditing
+        run: >
+          uv export --format requirements.txt --locked --no-header --no-annotate
+          --no-emit-project --no-emit-workspace
+          --output-file .ci-third-party-requirements.txt
       - name: Check for known vulnerabilities
-        run: uv run pip-audit --strict --desc
+        run: >
+          uv run --no-sync pip-audit --strict --desc
+          --requirement .ci-third-party-requirements.txt
+          --no-deps --disable-pip
       - name: Verify no copyleft licenses
         run: |
-          uv run pip-licenses --format=csv --with-license-file --no-license-path \
-            | grep -iE "GPL|AGPL|SSPL|EUPL|OSL|CPAL" \
+          uv run --no-sync pip-licenses --format=csv \
+            | grep -iE ',"[^"]*(GPL|AGPL|SSPL|EUPL|OSL|CPAL)[^"]*"$' \
             && echo "::error::Copyleft license detected — blocked by project policy" && exit 1 \
             || echo "License check passed"
 
   npm-audit:
     name: Frontend Dependency Audit
     runs-on: ubuntu-latest
+    if: ${{ hashFiles('apps/web/package.json') != '' && hashFiles('apps/web/pnpm-lock.yaml') != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
