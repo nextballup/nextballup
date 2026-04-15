@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+
+class AuditAction:
+    """Stable audit log action identifiers — append-only."""
+
+    USER_REGISTER_SUCCEEDED = "auth.register.succeeded"
+    USER_REGISTER_FAILED = "auth.register.failed"
+    USER_LOGIN_SUCCEEDED = "auth.login.succeeded"
+    USER_LOGIN_FAILED = "auth.login.failed"
+    USER_REFRESH_SUCCEEDED = "auth.refresh.succeeded"
+    USER_REFRESH_FAILED = "auth.refresh.failed"
+    USER_LOGOUT = "auth.logout"
+
+    TEAM_CREATED = "teams.create"
+    TEAM_INVITE_CREATED = "teams.invite.create"
+    TEAM_JOIN_SUCCEEDED = "teams.join.succeeded"
+    TEAM_JOIN_FAILED = "teams.join.failed"
+
+    GAME_CREATED = "games.create"
+    VIDEO_UPLOAD_INITIATED = "videos.upload.initiate"
+    VIDEO_UPLOAD_COMPLETED = "videos.upload.complete"
+    VIDEO_UPLOAD_FAILED = "videos.upload.failed"
+    VIDEO_UPLOAD_ABANDONED = "videos.upload.abandoned"
+    VIDEO_PROCESSING_QUEUED = "videos.processing.queue"
+    VIDEO_PROCESSING_DISPATCHED = "videos.processing.dispatch"
+    VIDEO_PROCESSING_STARTED = "videos.processing.start"
+    VIDEO_PROCESSING_COMPLETED = "videos.processing.complete"
+    VIDEO_PROCESSING_FAILED = "videos.processing.failed"
+    VIDEO_PROCESSING_RECOVERED_STALE = "videos.processing.stale_recovered"
+    VIDEO_OUTPUT_MATERIALIZED = "videos.output.materialized"
+    VIDEO_PLAYBACK_ISSUED = "videos.playback.issued"
+
+    GAME_UPDATED = "games.update"
+
+
+class ErrorCode:
+    """Stable error codes returned in API error responses."""
+
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+    EMAIL_TAKEN = "EMAIL_TAKEN"
+    INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
+    RATE_LIMITED = "RATE_LIMITED"
+    UNAUTHENTICATED = "UNAUTHENTICATED"
+    FORBIDDEN = "FORBIDDEN"
+    NOT_FOUND = "NOT_FOUND"
+    USER_INACTIVE = "USER_INACTIVE"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+    TEAM_NOT_FOUND = "TEAM_NOT_FOUND"
+    INVITE_NOT_FOUND = "INVITE_NOT_FOUND"
+    INVITE_EXPIRED = "INVITE_EXPIRED"
+    INVITE_EXHAUSTED = "INVITE_EXHAUSTED"
+    INVITE_INACTIVE = "INVITE_INACTIVE"
+    INVITE_ROLE_MISMATCH = "INVITE_ROLE_MISMATCH"
+    JERSEY_NUMBER_REQUIRED = "JERSEY_NUMBER_REQUIRED"
+    JERSEY_NUMBER_TAKEN = "JERSEY_NUMBER_TAKEN"
+    ALREADY_MEMBER = "ALREADY_MEMBER"
+
+    GAME_NOT_FOUND = "GAME_NOT_FOUND"
+    VIDEO_NOT_FOUND = "VIDEO_NOT_FOUND"
+    INVALID_CONTENT_TYPE = "INVALID_CONTENT_TYPE"
+    FILE_TOO_LARGE = "FILE_TOO_LARGE"
+    INVALID_FILE_SIZE = "INVALID_FILE_SIZE"
+    STORAGE_NOT_CONFIGURED = "STORAGE_NOT_CONFIGURED"
+    STORAGE_FAILURE = "STORAGE_FAILURE"
+    INVALID_VIDEO_STATE = "INVALID_VIDEO_STATE"
+    MULTIPART_PARTS_REQUIRED = "MULTIPART_PARTS_REQUIRED"
+    INVALID_MULTIPART_PARTS = "INVALID_MULTIPART_PARTS"
+
+    PROCESSING_JOB_NOT_FOUND = "PROCESSING_JOB_NOT_FOUND"
+    PROCESSING_JOB_TERMINAL = "PROCESSING_JOB_TERMINAL"
+    PROCESSING_STORAGE_FAILURE = "PROCESSING_STORAGE_FAILURE"
+    PROCESSING_CHECKSUM_MISMATCH = "PROCESSING_CHECKSUM_MISMATCH"
+    PROCESSING_OBJECT_MISSING = "PROCESSING_OBJECT_MISSING"
+    PROCESSING_SIZE_MISMATCH = "PROCESSING_SIZE_MISMATCH"
+    PROCESSING_STALE_RECOVERED = "PROCESSING_STALE_RECOVERED"
+    PLAYBACK_NOT_AVAILABLE = "PLAYBACK_NOT_AVAILABLE"
+    INVALID_PAGINATION = "INVALID_PAGINATION"
+    GAME_TERMINAL_STATUS = "GAME_TERMINAL_STATUS"
+
+
+# httpOnly cookies are the canonical credential transport (CLAUDE.md). The
+# Authorization header is also accepted for clients that prefer it (mobile,
+# server-to-server); see security.jwt for resolution order.
+REQUEST_ID_HEADER = "X-Request-ID"
