@@ -3,7 +3,7 @@
 ## Base URL
 
 ```
-Development: http://localhost:8000/api/v1
+Development: http://127.0.0.1:8000/api/v1
 Production:  https://api.nextballup.com/v1
 ```
 
@@ -55,6 +55,10 @@ Returns 200 only if database and Redis are reachable.
 ```json
 { "status": "not_ready", "database": "ok", "redis": "timeout", "storage": "ok" }
 ```
+
+If Redis and storage are not configured in the current environment, Phase 1 may
+return `"not_configured"` for those fields while still returning 200 in local
+development. Production environments should configure and require all three.
 
 ### GET `/health/live`
 
@@ -153,7 +157,8 @@ Create a new user account. User chooses role at registration.
 
 ### POST `/auth/logout`
 
-Invalidates the refresh token (adds to blocklist in Redis).
+Invalidates the current session by rotating a server-side session version, which
+causes previously issued access and refresh tokens to stop working.
 
 **Response: 204** No content
 

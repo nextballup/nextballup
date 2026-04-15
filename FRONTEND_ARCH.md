@@ -10,7 +10,7 @@
 - **Video Player**: Video.js with HLS.js plugin
 - **Charts**: Recharts (shot charts, metrics dashboards)
 - **Court Visualizations**: D3.js (court diagrams, spatial overlays, shot charts)
-- **Auth**: JWT stored in httpOnly cookies (not localStorage)
+- **Auth**: Custom FastAPI-issued JWTs stored in httpOnly cookies (not localStorage). Do not add NextAuth/Auth.js as a parallel auth system.
 - **Package Manager**: pnpm
 
 ## App Router Structure
@@ -72,9 +72,10 @@ apps/web/src/
 │   │   └── alerts/
 │   │       ├── page.tsx
 │   │       └── new/page.tsx
-│   └── api/                          # Next.js API routes (BFF proxy if needed)
+│   └── api/                          # Optional BFF proxy routes only; no NextAuth/Auth.js
 │       └── auth/
-│           └── [...nextauth]/route.ts
+│           ├── refresh/route.ts
+│           └── logout/route.ts
 ├── components/
 │   ├── ui/                    # Generic UI primitives
 │   │   ├── Button.tsx

@@ -4,6 +4,17 @@
 
 PostgreSQL 16 with extensions: `uuid-ossp`, `pg_trgm` (text search), `btree_gist` (exclusion constraints).
 
+## Tenant Isolation Baseline
+
+Tenant isolation is a **database-level baseline control**, not an app-layer convenience. The initial Alembic revision must enable PostgreSQL row-level security on every tenant-scoped table. API filters and repository `WHERE team_id = ...` clauses are still required, but they are defense-in-depth only.
+
+```sql
+-- Applied in the initial migration, not postponed as a hardening step
+ALTER TABLE games ENABLE ROW LEVEL SECURITY;
+CREATE POLICY games_tenant_isolation ON games
+    USING (team_id = current_setting('app.current_team_id')::uuid);
+```
+
 ```python
 # packages/db/src/nextballup_db/engine.py
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -103,6 +114,7 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     avatar_url: Mapped[str | None] = mapped_column(String(1024))
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     is_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
+    session_version: Mapped[int] = mapped_column(default=1, nullable=False)
 
     # Player-specific fields (nullable for coaches)
     height_inches: Mapped[int | None] = mapped_column(Integer)
@@ -1036,7 +1048,7 @@ class AlertTriggered(UUIDPrimaryKeyMixin, Base):
 
 ## Migration Strategy
 
-Use Alembic with async support. All migrations must be reversible (implement both `upgrade()` and `downgrade()`).
+Use Alembic with async support. All migrations must be reversible (implement both `upgrade()` and `downgrade()`). In this scaffold, the commands below describe the target migration workflow once the `alembic/` directory exists.
 
 ```bash
 # Generate migration from model changes

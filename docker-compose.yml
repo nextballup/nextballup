@@ -1,6 +1,7 @@
 # NextBallUp — Local Development Services
 # Usage: docker compose up -d
-# Access: PostgreSQL on 5432, Redis on 6379, MinIO on 9000 (console 9001)
+# Access: localhost-only on 127.0.0.1
+# PostgreSQL on 5432, Redis on 6379, MinIO on 9000 (console 9001)
 
 services:
   postgres:
@@ -11,7 +12,7 @@ services:
       POSTGRES_PASSWORD: nextballup_dev
       POSTGRES_DB: nextballup
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
@@ -25,7 +26,7 @@ services:
     image: redis:7-alpine
     container_name: nbu-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -43,8 +44,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin123
     ports:
-      - "9000:9000"   # API
-      - "9001:9001"   # Console
+      - "127.0.0.1:9000:9000"   # API
+      - "127.0.0.1:9001:9001"   # Console
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"
