@@ -18,18 +18,23 @@ export default async function GameUploadPage({
   }
   return (
     <section className="space-y-6">
-      <div>
-        <Link
-          href={`/games/${game.id}`}
-          className="text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)] hover:underline"
-        >
-          ← Back to game
+      <nav aria-label="Breadcrumb" className="flex flex-wrap gap-1 text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+        <Link href="/games" className="hover:underline">
+          All games
         </Link>
-        <h1 className="mt-2 text-2xl font-semibold tracking-tight">Upload video</h1>
+        <span>/</span>
+        <Link href={`/games/${game.id}`} className="hover:underline">
+          Game
+        </Link>
+        <span>/</span>
+        <span className="text-[color:var(--color-nbu-text)]">Upload</span>
+      </nav>
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Upload video</h1>
         <p className="text-sm text-[color:var(--color-nbu-text-muted)]">
-          Up to 10 GB. MP4, MOV, or MKV. Files over 1 GB use multipart upload —
-          those are not supported in the browser UI yet, but you can still
-          upload them from the CLI.
+          Up to 10 GB. MP4, MOV, or MKV. Files over 1 GB upload directly to
+          storage in parts so a dropped connection only retries the failed
+          part, not the whole file.
         </p>
       </div>
       <UploadFlow gameId={game.id} />

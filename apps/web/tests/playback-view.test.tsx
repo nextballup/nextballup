@@ -63,12 +63,43 @@ describe("VideoPlaybackView", () => {
         wrap(
           <VideoPlaybackView
             initialVideo={baseVideo({ status: "processing" })}
+            viewerRole="coach"
           />,
         ),
       );
     });
     expect(
       screen.getByText(/Playback not available yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("explains processed-but-missing artifacts without implying raw passthrough playback", async () => {
+    const video = baseVideo({
+      status: "processed",
+      filename: "iphone_clip.mov",
+      playback_url: null,
+      playback_format: null,
+      processing: { transcode: "completed" },
+    });
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          stage: null,
+          progress_percent: 100,
+          stages: { transcode: { status: "completed" } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+    expect(
+      screen.getByText(/Playback not available for this upload yet/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/stays stored privately and is not served directly/i),
     ).toBeInTheDocument();
   });
 
@@ -92,13 +123,57 @@ describe("VideoPlaybackView", () => {
       ),
     );
     await act(async () => {
-      render(wrap(<VideoPlaybackView initialVideo={video} />));
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
     });
     const player = await waitFor(() => screen.getByTestId("video-player"));
     expect(player.tagName).toBe("VIDEO");
     expect(player.getAttribute("src")).toBe(
       "https://signed.example/v1.mp4?sig=abc",
     );
+  });
+
+  it("labels unimplemented CV stages honestly instead of showing 'pending'", async () => {
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(baseVideo({ status: "processing" })),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processing",
+          stage: "transcode",
+          progress_percent: 50,
+          stages: {
+            transcode: { status: "running", progress_percent: 50 },
+            detection: { status: "pending" },
+            tracking: { status: "pending" },
+            court_mapping: { status: "pending" },
+            events: { status: "pending" },
+            metrics: { status: "pending" },
+          },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({ status: "processing" })}
+            viewerRole="coach"
+          />,
+        ),
+      );
+    });
+    // The CV stages block must appear with honest copy, not "pending".
+    const block = await screen.findByTestId("upcoming-cv-stages");
+    expect(block.textContent).toMatch(/not yet implemented|not implemented yet/i);
+    // Each downstream stage is listed but labelled "not implemented yet".
+    expect(block.textContent).toMatch(/detection/);
+    expect(block.textContent).toMatch(/tracking/);
+    expect(block.textContent).toMatch(/court_mapping/);
+    expect(block.textContent).toMatch(/events/);
+    expect(block.textContent).toMatch(/metrics/);
+    // And the transcode stage stays in the implemented grid, not relabelled.
+    expect(screen.getByText("transcode")).toBeInTheDocument();
   });
 
   it("surfaces an HLS manifest URL as the video source", async () => {
@@ -121,7 +196,7 @@ describe("VideoPlaybackView", () => {
       ),
     );
     await act(async () => {
-      render(wrap(<VideoPlaybackView initialVideo={video} />));
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
     });
     const player = await waitFor(() => screen.getByTestId("video-player"));
     // The hls.js path sets src asynchronously; the fallback ("canPlayType"
@@ -131,6 +206,93 @@ describe("VideoPlaybackView", () => {
       expect(player.getAttribute("src")).toBe(
         "https://signed.example/v1/manifest.m3u8?sig=zzz",
       );
+    });
+  });
+
+  it("hides the admin requeue control from non-admin viewers", async () => {
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(baseVideo({ status: "failed" })),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "failed",
+          stage: "transcode",
+          progress_percent: 0,
+          stages: { transcode: { status: "failed" } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({ status: "failed" })}
+            viewerRole="coach"
+          />,
+        ),
+      );
+    });
+    expect(screen.queryByTestId("requeue-transcode")).not.toBeInTheDocument();
+  });
+
+  it("shows the admin requeue control for failed stages when viewer is admin", async () => {
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(baseVideo({ status: "failed" })),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "failed",
+          stage: "transcode",
+          progress_percent: 0,
+          stages: { transcode: { status: "failed" } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({ status: "failed" })}
+            viewerRole="admin"
+          />,
+        ),
+      );
+    });
+    const button = await screen.findByTestId("requeue-transcode");
+    expect(button).toBeInTheDocument();
+    expect(button.textContent).toMatch(/requeue/i);
+  });
+
+  it("does not show the requeue button for a running stage, even to an admin", async () => {
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(baseVideo({ status: "processing" })),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processing",
+          stage: "transcode",
+          progress_percent: 30,
+          stages: { transcode: { status: "running", progress_percent: 30 } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({ status: "processing" })}
+            viewerRole="admin"
+          />,
+        ),
+      );
+    });
+    // Running stages aren't accepted by the backend (409); surfacing a button
+    // for them would only produce an error on click.
+    await waitFor(() => {
+      expect(screen.queryByTestId("requeue-transcode")).not.toBeInTheDocument();
     });
   });
 });

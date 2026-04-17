@@ -10,8 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_api.audit import write_audit
 from nextballup_api.deps import get_app_settings, get_current_user, get_db
-from nextballup_api.permissions import require_team_coach, require_team_member
-from nextballup_api.security.jwt import create_playback_token
+from nextballup_api.permissions import (
+    require_team_coach,
+    require_team_member,
+    require_user_role,
+)
+from nextballup_api.security.jwt import create_playback_token, decode_token
 from nextballup_api.security.rate_limit import enforce_rate_limit
 from nextballup_api.storage import (
     PresignedUpload,
@@ -33,10 +37,12 @@ from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.enums import (
     ProcessingJobStage,
     ProcessingJobStatus,
+    UserRole,
     VideoStatus,
 )
 from nextballup_core.errors import (
     AppError,
+    AuthenticationError,
     ConflictError,
     NotFoundError,
     ServiceUnavailableError,
@@ -47,8 +53,12 @@ from nextballup_core.schemas.video import (
     CompleteUploadResponse,
     CreateUploadRequest,
     CreateUploadResponse,
+    PlaybackVerifyRequest,
+    PlaybackVerifyResponse,
     PresignedPart,
     ProcessingStageStatus,
+    RequeueProcessingRequest,
+    RequeueProcessingResponse,
     VideoDetailResponse,
     VideoStatusResponse,
 )
@@ -59,8 +69,8 @@ from nextballup_db.models.video import ProcessingJob, Video
 
 router = APIRouter(prefix="/videos", tags=["videos"])
 
-# Phase 3 only enqueues the transcode placeholder; downstream stages exist in
-# the schema for forward compatibility with the worker package.
+# The first concrete worker stage materializes a browser-safe MP4 mezzanine;
+# downstream CV stages exist in the schema for forward compatibility.
 _PIPELINE_STAGES: tuple[ProcessingJobStage, ...] = (
     ProcessingJobStage.TRANSCODE,
     ProcessingJobStage.DETECTION,
@@ -102,7 +112,7 @@ def _playback_candidates(video: Video) -> tuple[tuple[str, str], ...]:
 async def _try_issue_playback(
     *,
     video: Video,
-    user_id: uuid.UUID,
+    user: User,
     storage: StoragePresigner | None,
     settings: Settings,
 ) -> _PlaybackArtifact | None:
@@ -117,6 +127,12 @@ async def _try_issue_playback(
         return None
     if storage is None:
         return None
+    # A playback URL that outlives its JWT weakens the whole point of the
+    # session-aware verify flow. Cap the presigned URL to the shorter token TTL.
+    url_ttl_seconds = min(
+        settings.playback_url_expires_seconds,
+        settings.playback_token_expire_seconds,
+    )
     # Only hand out playback credentials for an artifact that still exists.
     # This keeps the API from issuing dead presigned URLs when a DB row points
     # at stale HLS/mezzanine keys, and lets us gracefully fall back from HLS to
@@ -130,11 +146,13 @@ async def _try_issue_playback(
         url = await storage_presign_get(
             storage,
             key=storage_key,
-            expires_in=settings.playback_url_expires_seconds,
+            expires_in=url_ttl_seconds,
             response_content_type=_playback_content_type(fmt),
         )
         token, expires_at = create_playback_token(
-            subject=user_id,
+            subject=user.id,
+            role=user.role,
+            session_version=user.session_version,
             video_id=video.id,
             team_id=video.team_id,
             settings=settings,
@@ -159,6 +177,36 @@ def _require_storage(presigner: StoragePresigner | None) -> StoragePresigner:
     return presigner
 
 
+def _filename_is_safe(filename: str) -> bool:
+    """Reject filenames that could confuse loggers, URL parsers, or storage
+    backends. These checks run *before* we trust the extension.
+
+    We reject (rather than silently sanitize) at the API boundary so clients
+    get a clear error: it's almost always a bug or an abuse probe when a
+    filename contains a control char or a path segment. The downstream
+    `_sanitize_filename_component` call in storage.py still hardens the
+    storage key as belt-and-suspenders.
+    """
+    if not filename or filename.strip() != filename:
+        return False
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in filename):
+        return False
+    # Path separators never belong in a filename — they're always either a
+    # serializer bug on the client (posting a relative path) or a traversal
+    # attempt. Same for `..` runs, which try to escape the containing dir.
+    return not ("/" in filename or "\\" in filename or ".." in filename)
+
+
+def _filename_extension_allowed(filename: str, content_type: str, settings: Settings) -> bool:
+    lowered = filename.lower()
+    dot = lowered.rfind(".")
+    if dot == -1:
+        return False
+    ext = lowered[dot:]
+    allowed = settings.upload_content_type_extensions.get(content_type, [])
+    return ext in allowed
+
+
 def _validate_upload(payload: CreateUploadRequest, settings: Settings) -> None:
     allowed = {ct.lower() for ct in settings.allowed_video_content_types}
     if payload.content_type not in allowed:
@@ -167,10 +215,35 @@ def _validate_upload(payload: CreateUploadRequest, settings: Settings) -> None:
             code=ErrorCode.INVALID_CONTENT_TYPE,
             details={"allowed": sorted(allowed)},
         )
+    if not _filename_is_safe(payload.filename):
+        raise ValidationFailedError(
+            "Filename contains unsupported characters",
+            code=ErrorCode.INVALID_FILENAME,
+        )
+    if not _filename_extension_allowed(payload.filename, payload.content_type, settings):
+        raise ValidationFailedError(
+            "Filename extension does not match the declared content type",
+            code=ErrorCode.CONTENT_TYPE_EXTENSION_MISMATCH,
+            details={
+                "content_type": payload.content_type,
+                "allowed_extensions": sorted(
+                    settings.upload_content_type_extensions.get(payload.content_type, [])
+                ),
+            },
+        )
     if payload.file_size_bytes <= 0:
         raise ValidationFailedError(
             "file_size_bytes must be positive",
             code=ErrorCode.INVALID_FILE_SIZE,
+        )
+    if payload.file_size_bytes < settings.min_upload_size_bytes:
+        raise ValidationFailedError(
+            "Requested file is below the minimum upload size",
+            code=ErrorCode.FILE_TOO_SMALL,
+            details={
+                "min_bytes": settings.min_upload_size_bytes,
+                "requested_bytes": payload.file_size_bytes,
+            },
         )
     if payload.file_size_bytes > settings.max_upload_size_bytes:
         raise ValidationFailedError(
@@ -691,7 +764,7 @@ async def get_video(
     jobs = list(jobs_result.scalars().all())
     playback = await _try_issue_playback(
         video=video,
-        user_id=current_user.id,
+        user=current_user,
         storage=storage,
         settings=settings,
     )
@@ -737,3 +810,170 @@ async def get_video_status(
     )
     jobs = list(jobs_result.scalars().all())
     return _video_status(video, jobs)
+
+
+# ---- POST /videos/{video_id}/playback/verify ------------------------------
+
+
+@router.post("/{video_id}/playback/verify", response_model=PlaybackVerifyResponse)
+async def verify_playback_token(
+    video_id: uuid.UUID,
+    payload: PlaybackVerifyRequest,
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+    current_user: User = Depends(get_current_user),
+) -> PlaybackVerifyResponse:
+    """Cross-check a live playback token against the current session.
+
+    The flow is: the client holds a playback token handed out by the video
+    detail endpoint and periodically asks the server if it's still valid. The
+    server rejects the token if (a) it's expired / malformed, (b) it was
+    minted for a different user, (c) the user's session_version has moved
+    (e.g. they logged out), or (d) the token scopes a video the caller is no
+    longer entitled to read. A 200 means 'keep playing'; any 4xx means 'drop
+    the stream'. This is what turns playback tokens from theatre into actual
+    revocation, without having to invalidate presigned URLs individually.
+    """
+    try:
+        claims = decode_token(
+            payload.token,
+            expected_type="playback",
+            settings=settings,
+            audience=settings.playback_token_audience,
+        )
+    except AuthenticationError as exc:
+        raise exc
+
+    try:
+        token_user_id = uuid.UUID(claims["sub"])
+        token_video_id = uuid.UUID(claims["vid"])
+        token_team_id = uuid.UUID(claims["tid"])
+    except (KeyError, ValueError) as exc:
+        raise AuthenticationError("Malformed playback token") from exc
+
+    # Binding checks: the token must be for *this* request's video AND the
+    # currently authenticated user. Mismatch means the client is trying to
+    # replay a token across videos or sessions.
+    if token_video_id != video_id:
+        raise AuthenticationError("Playback token does not match video")
+    if token_user_id != current_user.id:
+        raise AuthenticationError("Playback token belongs to a different user")
+    if claims.get("sv") != current_user.session_version:
+        raise AuthenticationError("Session has been invalidated")
+
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    if video.team_id != token_team_id:
+        raise AuthenticationError("Playback token tenant mismatch")
+    await set_tenant_context(session, video.team_id)
+    # Current membership still required — a user who was removed from the team
+    # between issuance and verify must be dropped here.
+    await require_team_member(session, user=current_user, team_id=video.team_id)
+
+    exp = datetime.fromtimestamp(int(claims["exp"]), tz=UTC)
+    return PlaybackVerifyResponse(video_id=video_id, expires_at=exp)
+
+
+# ---- POST /videos/{video_id}/processing/requeue ---------------------------
+
+
+@router.post("/{video_id}/processing/requeue", response_model=RequeueProcessingResponse)
+async def requeue_processing(
+    video_id: uuid.UUID,
+    payload: RequeueProcessingRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> RequeueProcessingResponse:
+    """Admin-only: return a terminal processing job (FAILED/COMPLETED) to
+    PENDING so the beat dispatcher re-runs it.
+
+    Scope:
+    * Restricted to `UserRole.ADMIN` — requeue bypasses the tenant coach
+      controls that normally govern video state, so platform admins are the
+      only principals trusted to kick stuck jobs.
+    * Only jobs in a terminal status can be requeued. Trying to requeue a
+      PENDING/RUNNING job is rejected (409) so operators don't race a live
+      worker.
+    * The video row's status is not rewritten here — the worker will drive
+      it forward on the next claim.
+    """
+    require_user_role(current_user, UserRole.ADMIN)
+
+    try:
+        stage = ProcessingJobStage(payload.stage)
+    except ValueError as exc:
+        raise ValidationFailedError(
+            "Unknown processing stage",
+            code=ErrorCode.PROCESSING_STAGE_UNKNOWN,
+            details={"stage": payload.stage},
+        ) from exc
+
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+
+    await set_tenant_context(session, video.team_id)
+
+    job = await session.scalar(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.stage == stage,
+        )
+        .with_for_update()
+    )
+    if job is None:
+        raise NotFoundError(
+            "Processing job not found for this stage",
+            code=ErrorCode.PROCESSING_JOB_NOT_FOUND,
+        )
+    if job.status not in {ProcessingJobStatus.FAILED, ProcessingJobStatus.COMPLETED}:
+        raise ConflictError(
+            "Processing job is still active — cannot requeue",
+            code=ErrorCode.PROCESSING_JOB_NOT_REQUEUABLE,
+            details={"current_status": job.status.value},
+        )
+
+    job.status = ProcessingJobStatus.PENDING
+    job.progress_percent = 0
+    job.error_message = None
+    job.result_metadata = None
+    job.celery_task_id = None
+    job.started_at = None
+    job.completed_at = None
+    job.heartbeat_at = None
+
+    requeued_at = datetime.now(tz=UTC)
+
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_PROCESSING_REQUEUED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="processing_job",
+        resource_id=job.id,
+        team_id=video.team_id,
+        extra={
+            "video_id": str(video.id),
+            "stage": stage.value,
+        },
+    )
+    await session.commit()
+    await session.refresh(job)
+
+    return RequeueProcessingResponse(
+        job_id=job.id,
+        stage=stage.value,
+        status=job.status.value,
+        requeued_at=requeued_at,
+    )

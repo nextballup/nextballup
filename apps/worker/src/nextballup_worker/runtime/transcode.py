@@ -10,7 +10,6 @@ from nextballup_api.storage import (
     get_storage_presigner,
     normalize_etag,
     storage_head_object,
-    storage_key_for_mezzanine,
 )
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +31,7 @@ from nextballup_worker.runtime.jobs import (
     set_video_status,
     touch_heartbeat,
 )
+from nextballup_worker.runtime.media import BrowserMezzanineArtifact, create_browser_mezzanine
 from nextballup_worker.tenant import (
     clear_worker_context,
     set_worker_context,
@@ -123,31 +123,25 @@ async def _materialize_outputs(
     session: AsyncSession,
     *,
     video: Video,
-    storage_etag: str | None,
+    artifact: BrowserMezzanineArtifact,
 ) -> dict[str, str | None]:
-    """Persist the playback output keys onto the video row.
-
-    Phase 5 transcode is *passthrough*: the raw object IS the playable
-    artifact. We point `storage_key_mezzanine` at the raw key (so playback
-    URL signing has a stable target) and leave `storage_key_hls` /
-    `thumbnail_url` null until a real FFmpeg integration produces them.
-    Recording the choice in `result_metadata.transcode_mode` makes this
-    visible to operators reviewing audit logs.
-    """
-    mezzanine_key = video.storage_key_raw or storage_key_for_mezzanine(
-        team_id=str(video.team_id), video_id=str(video.id)
-    )
+    """Persist the browser-safe playback artifact metadata onto the video row."""
     await session.execute(
         update(Video)
         .where(Video.id == video.id)
         .values(
-            storage_key_mezzanine=mezzanine_key,
-            storage_etag=storage_etag,
+            storage_key_mezzanine=artifact.mezzanine_key,
+            storage_etag=artifact.storage_etag,
+            duration_seconds=artifact.duration_seconds,
+            width=artifact.width,
+            height=artifact.height,
+            fps=artifact.fps,
+            codec=artifact.codec,
         )
     )
     await session.commit()
     return {
-        "mezzanine": mezzanine_key,
+        "mezzanine": artifact.mezzanine_key,
         "hls": None,
         "thumbnail": None,
     }
@@ -162,7 +156,7 @@ async def execute_transcode(
     settings: Settings | None = None,
     storage: StoragePresigner | None = None,
 ) -> TranscodeResult:
-    """Execute the placeholder `transcode` stage for a processing job.
+    """Execute the browser-safe mezzanine `transcode` stage for a processing job.
 
     The function is idempotent against duplicate Celery delivery: the claim is
     atomic and a non-PENDING job returns success-with-skip.
@@ -220,8 +214,8 @@ async def execute_transcode(
     )
     await session.commit()
 
-    # 3. Do the work. Phase 4's placeholder re-verifies the uploaded object;
-    # real transcoding lands in Phase 5.
+    # 3. Do the work. Re-verify the uploaded object, then materialize a
+    # browser-safe playback mezzanine without exposing the raw upload.
     try:
         await touch_heartbeat(session, job_id=claimed.id, progress_percent=10)
         video = await _load_video(session, claimed.video_id)
@@ -240,10 +234,15 @@ async def execute_transcode(
             )
         verification = await _verify_storage(video=video, presigner=resolved_storage)
         await touch_heartbeat(session, job_id=claimed.id, progress_percent=50)
+        artifact = await create_browser_mezzanine(
+            video=video,
+            presigner=resolved_storage,
+            settings=resolved_settings,
+        )
         outputs = await _materialize_outputs(
             session,
             video=video,
-            storage_etag=verification.get("storage_etag"),
+            artifact=artifact,
         )
         await write_worker_audit(
             session,
@@ -255,7 +254,9 @@ async def execute_transcode(
             extra={
                 "stage": claimed.stage.value,
                 "outputs": outputs,
-                "transcode_mode": "passthrough",
+                "transcode_mode": artifact.transcoder,
+                "metadata_stripped": True,
+                "output_size_bytes": artifact.output_size_bytes,
             },
         )
         await session.commit()
@@ -286,7 +287,9 @@ async def execute_transcode(
         result_metadata={
             "verification": verification,
             "outputs": outputs,
-            "transcode_mode": "passthrough",
+            "transcode_mode": artifact.transcoder,
+            "metadata_stripped": True,
+            "output_size_bytes": artifact.output_size_bytes,
         },
     )
     # In Phase 4 the pipeline has a single stage — completing it implies the

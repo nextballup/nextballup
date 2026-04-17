@@ -10,7 +10,8 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -44,7 +45,7 @@ from nextballup_core.enums import (
     UploadMethod,
     VideoStatus,
 )
-from nextballup_core.settings import reload_settings
+from nextballup_core.settings import Settings, reload_settings
 from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.video import ProcessingJob, Video
 
@@ -121,6 +122,12 @@ class FakeWorkerStorage:
         ct_param = f"&rct={response_content_type}" if response_content_type else ""
         return f"https://fake-storage.test/{key}?X-Get=1&exp={expires_in}{ct_param}"
 
+    def download_file(self, *, key: str, destination: str) -> None:
+        Path(destination).write_bytes(b"fake-video")
+
+    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+        self.object_sizes[key] = Path(source).stat().st_size
+
 
 # ---- Fixtures -------------------------------------------------------------
 
@@ -137,6 +144,11 @@ async def storage_client(
     from nextballup_api.deps import get_db
     from nextballup_api.main import app
 
+    from nextballup_core.settings import reload_settings
+    from tests.csrf_helper import make_csrf_mirror_hook
+
+    reload_settings()
+
     async def _override_get_db() -> AsyncIterator[AsyncSession]:
         yield db_session
 
@@ -147,7 +159,11 @@ async def storage_client(
     app.dependency_overrides[get_storage] = _override_storage
     transport = ASGITransport(app=app)
     try:
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            event_hooks={"request": [make_csrf_mirror_hook()]},
+        ) as ac:
             yield ac
     finally:
         app.dependency_overrides.clear()
@@ -402,9 +418,13 @@ async def test_execute_transcode_happy_path(
     verification = job.result_metadata["verification"]
     assert verification["content_length"] == 250 * 1024 * 1024
     assert verification["client_checksum_present"] is True
+    assert job.result_metadata["transcode_mode"] == "test-stub"
+    assert job.result_metadata["outputs"]["mezzanine"].startswith(f"mezzanine/{team_id}/")
 
     video = await _load_video(db_session, video_id)
     assert video.status is VideoStatus.PROCESSED
+    assert video.storage_key_mezzanine is not None
+    assert video.storage_key_mezzanine != video.storage_key_raw
 
     # Audit lifecycle: STARTED + COMPLETED must both be present for the team.
     assert (
@@ -907,7 +927,9 @@ async def test_status_endpoint_reflects_completed_worker_run(
 
 def test_worker_startup_requires_broker_outside_test(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "development")
-    monkeypatch.delenv("CELERY_BROKER_URL", raising=False)
+    # Settings also read `.env`, so deleting the process env alone is not
+    # enough on local machines that already have a broker configured there.
+    monkeypatch.setenv("CELERY_BROKER_URL", "")
     reload_settings()
     try:
         with pytest.raises(RuntimeError, match="CELERY_BROKER_URL must be configured"):
@@ -915,6 +937,77 @@ def test_worker_startup_requires_broker_outside_test(monkeypatch: pytest.MonkeyP
     finally:
         monkeypatch.setenv("APP_ENV", "test")
         reload_settings()
+
+
+def test_worker_startup_requires_runtime_db_role_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://localhost:6379/1")
+    monkeypatch.setenv("DATABASE_URL_RUNTIME", "")
+    reload_settings()
+    try:
+        with pytest.raises(RuntimeError, match="DATABASE_URL_RUNTIME must be configured"):
+            _ensure_runtime_broker_configured()
+    finally:
+        monkeypatch.setenv("APP_ENV", "test")
+        monkeypatch.delenv("DATABASE_URL_RUNTIME", raising=False)
+        reload_settings()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_worker_session_uses_runtime_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nextballup_worker import session as worker_session_module
+
+    created_urls: list[str] = []
+
+    class FakeEngine:
+        disposed = False
+
+        async def dispose(self) -> None:
+            self.disposed = True
+
+    fake_session = cast("AsyncSession", object())
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> AsyncSession:
+            return fake_session
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    class FakeSessionMaker:
+        def __call__(self) -> FakeSessionContext:
+            return FakeSessionContext()
+
+    fake_engine = FakeEngine()
+
+    def fake_create_async_engine(url: str, **kwargs: object) -> FakeEngine:
+        created_urls.append(url)
+        return fake_engine
+
+    def fake_async_sessionmaker(*args: object, **kwargs: object) -> FakeSessionMaker:
+        return FakeSessionMaker()
+
+    monkeypatch.setattr(worker_session_module, "create_async_engine", fake_create_async_engine)
+    monkeypatch.setattr(worker_session_module, "async_sessionmaker", fake_async_sessionmaker)
+
+    settings = Settings(
+        app_env="development",
+        database_url="postgresql+asyncpg://owner@localhost:5432/nextballup",
+        database_url_sync="postgresql://owner@localhost:5432/nextballup",
+        database_url_runtime="postgresql+asyncpg://app@localhost:5432/nextballup",
+        jwt_private_key="test-private-key",
+        jwt_public_key="test-public-key",
+    )
+
+    async with worker_session_module.worker_session(settings) as session:
+        assert session is fake_session
+
+    assert created_urls == [settings.database_url_runtime]
+    assert fake_engine.disposed is True
 
 
 # ---- Dead-letter simulation ---------------------------------------------

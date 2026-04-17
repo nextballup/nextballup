@@ -1,10 +1,14 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { apiJson } from "@/lib/api-client";
+import { ApiError } from "@/lib/errors";
 import {
+  CV_PIPELINE_STAGES,
+  IMPLEMENTED_PIPELINE_STAGES,
   VIDEO_TERMINAL_STATUSES,
+  type UserRole,
   type VideoDetailResponse,
   type VideoStatusResponse,
 } from "@/lib/contract";
@@ -15,10 +19,17 @@ const POLL_INTERVAL_MS = 3_000;
 // playback on a slow connection without the URL expiring mid-stream.
 const TOKEN_REFRESH_SLACK_MS = 30_000;
 
+// Stages where the admin requeue endpoint will accept input. Non-terminal
+// states (running/pending) are rejected by the backend with 409, so don't
+// even offer the button for those.
+const REQUEUEABLE_STAGE_STATES = new Set(["failed", "completed"]);
+
 export function VideoPlaybackView({
   initialVideo,
+  viewerRole,
 }: {
   initialVideo: VideoDetailResponse;
+  viewerRole: UserRole | null;
 }) {
   const videoQuery = useQuery<VideoDetailResponse>({
     queryKey: ["video", initialVideo.id],
@@ -74,20 +85,38 @@ export function VideoPlaybackView({
     <div className="space-y-4">
       <PlaybackPanel video={video} />
       <MetadataPanel video={video} />
-      <ProcessingPanel status={statusQuery.data} video={video} />
+      <ProcessingPanel
+        status={statusQuery.data}
+        video={video}
+        viewerRole={viewerRole}
+      />
     </div>
   );
 }
 
 function PlaybackPanel({ video }: { video: VideoDetailResponse }) {
   if (!video.playback_url || !video.playback_format) {
+    const processedWithoutArtifact = video.status === "processed";
     return (
       <div className="rounded-lg border border-dashed border-[color:var(--color-nbu-border)] px-4 py-8 text-center text-sm text-[color:var(--color-nbu-text-muted)]">
-        <p className="font-medium">Playback not available yet.</p>
-        <p className="mt-1">
-          The worker is still processing this upload. Status polls automatically
-          — you will see a player here as soon as the mezzanine output is ready.
+        <p className="font-medium">
+          {processedWithoutArtifact
+            ? "Playback not available for this upload yet."
+            : "Playback not available yet."}
         </p>
+        {processedWithoutArtifact ? (
+          <p className="mt-1">
+            This upload finished processing, but its sanitized playback artifact
+            is unavailable. For privacy and compatibility, the original upload
+            stays stored privately and is not served directly to the browser.
+          </p>
+        ) : (
+          <p className="mt-1">
+            The worker is still processing this upload. Status polls
+            automatically — you will see a player here as soon as the
+            mezzanine output is ready.
+          </p>
+        )}
       </div>
     );
   }
@@ -142,35 +171,130 @@ function MetadataPanel({ video }: { video: VideoDetailResponse }) {
 function ProcessingPanel({
   status,
   video,
+  viewerRole,
 }: {
   status: VideoStatusResponse | undefined;
   video: VideoDetailResponse;
+  viewerRole: UserRole | null;
 }) {
   const stages = status?.stages ?? fallbackStages(video);
+  const implemented = Object.entries(stages).filter(([stage]) =>
+    IMPLEMENTED_PIPELINE_STAGES.has(stage),
+  );
+  const upcoming = Object.keys(stages).filter(
+    (stage) =>
+      !IMPLEMENTED_PIPELINE_STAGES.has(stage) && CV_PIPELINE_STAGES.includes(stage),
+  );
+  const isAdmin = viewerRole === "admin";
   return (
-    <div className="rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm">
-      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+    <div className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm">
+      <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
         Processing pipeline
       </h2>
       <ul className="grid gap-2 sm:grid-cols-3">
-        {Object.entries(stages).map(([stage, detail]) => {
+        {implemented.map(([stage, detail]) => {
           const statusValue = detail.status;
           const progress =
             "progress_percent" in detail ? detail.progress_percent : undefined;
+          const canRequeue =
+            isAdmin && REQUEUEABLE_STAGE_STATES.has(statusValue);
           return (
             <li
               key={stage}
-              className="flex items-center justify-between gap-2 rounded-md border border-[color:var(--color-nbu-border)] px-3 py-2"
+              className="flex flex-col gap-1 rounded-md border border-[color:var(--color-nbu-border)] px-3 py-2"
             >
-              <span className="font-medium">{stage}</span>
-              <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
-                {statusValue}
-                {typeof progress === "number" ? ` ${progress}%` : ""}
-              </span>
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium">{stage}</span>
+                <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+                  {statusValue}
+                  {typeof progress === "number" ? ` ${progress}%` : ""}
+                </span>
+              </div>
+              {canRequeue && (
+                <RequeueButton videoId={video.id} stage={stage} />
+              )}
             </li>
           );
         })}
       </ul>
+      {upcoming.length > 0 && (
+        <div
+          data-testid="upcoming-cv-stages"
+          className="space-y-2 rounded-md border border-dashed border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2"
+        >
+          <div className="text-xs font-medium uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            Computer-vision stages (coming later)
+          </div>
+          <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
+            Detection, tracking, court mapping, event extraction, and derived
+            metrics are not yet implemented in this phase. They appear below
+            so the pipeline view stays stable as real CV work lands.
+          </p>
+          <ul className="grid gap-2 sm:grid-cols-3">
+            {upcoming.map((stage) => (
+              <li
+                key={stage}
+                className="flex items-center justify-between gap-2 rounded-md border border-[color:var(--color-nbu-border)] px-3 py-2 opacity-70"
+              >
+                <span className="font-medium">{stage}</span>
+                <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+                  not implemented yet
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RequeueButton({
+  videoId,
+  stage,
+}: {
+  videoId: string;
+  stage: string;
+}) {
+  const queryClient = useQueryClient();
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: () =>
+      apiJson(`/videos/${videoId}/processing/requeue`, {
+        method: "POST",
+        json: { stage },
+      }),
+    onSuccess: () => {
+      setErrorMessage(null);
+      // Invalidate both the video detail and status queries so the next poll
+      // picks up the new PENDING row without a full page refresh.
+      queryClient.invalidateQueries({ queryKey: ["video", videoId] });
+      queryClient.invalidateQueries({ queryKey: ["video-status", videoId] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage("Unable to requeue stage.");
+      }
+    },
+  });
+  return (
+    <div className="flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={() => mutation.mutate()}
+        disabled={mutation.isPending}
+        data-testid={`requeue-${stage}`}
+        className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+      >
+        {mutation.isPending ? "Requeuing…" : "Requeue stage (admin)"}
+      </button>
+      {errorMessage && (
+        <span role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
+          {errorMessage}
+        </span>
+      )}
     </div>
   );
 }
@@ -221,8 +345,7 @@ function VideoPlayer({
     }
     let hlsInstance: { destroy: () => void } | null = null;
     let cancelled = false;
-    // Lazy import hls.js so non-HLS users (the Phase 5 passthrough mp4 case)
-    // don't pay for the bundle.
+    // Lazy import hls.js so non-HLS users don't pay for the bundle.
     import("hls.js").then(({ default: Hls }) => {
       if (cancelled || !videoRef.current) return;
       if (!Hls.isSupported()) {

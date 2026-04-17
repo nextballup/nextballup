@@ -4,11 +4,12 @@ This file is the **lean operational guide for Claude Code**. Read `README.md` fi
 
 ## Quick Facts
 
-- **Repo state**: backend + Celery worker + Next.js 15 frontend are runnable (auth, teams, games list/detail/PATCH, video upload, placeholder transcode, beat-scheduled cleanup, signed playback delivery, frontend covers auth + games + upload + playback). Real CV execution is still deferred.
+- **Repo state**: backend + Celery worker + Next.js 15 frontend are runnable (auth, teams, games list/detail/PATCH, video upload with optional client-side SHA-256 attestation for files ≤ 2 GB, browser-safe mezzanine transcode for accepted uploads, beat-scheduled cleanup, signed playback delivery, admin-only audit log viewer at `/admin/audit`, frontend covers auth + games + upload + playback + audit). Real CV execution is still deferred.
 - **Current focus**: build upward from the existing backend/frontend/auth/video/worker slice
 - **Stack**: Python 3.12.x, FastAPI, PostgreSQL 16, Redis, Next.js 15, Celery
 - **Workspace rule**: root `uv` workspace is backend-only; `packages/cv_pipeline` is intentionally excluded for now
-- **Auth**: custom FastAPI-issued JWTs in httpOnly cookies; do not add NextAuth/Auth.js
+- **Auth**: custom FastAPI-issued JWTs in **httpOnly cookies only** (no tokens in JSON bodies). Access uses the access cookie; refresh uses a path-scoped refresh cookie (`/api/v1/auth/refresh` only). Cookie-authenticated mutations require a matching `X-CSRF-Token` header. Do not add NextAuth/Auth.js.
+- **Runtime DB role**: staging/production runs request + worker traffic through `DATABASE_URL_RUNTIME` (non-owner `nextballup_app` role). Alembic is the only consumer of `DATABASE_URL` (owner).
 - **License**: Apache-2.0 / MIT / BSD only; no AGPL / GPL / SSPL
 
 ## Valid Commands
@@ -23,10 +24,15 @@ uv sync
 # Apply database migrations
 uv run alembic upgrade head
 
+# Optional demo seed (coach + player + team + scheduled game; idempotent).
+# Refuses staging/production and non-local DATABASE_URL targets unless
+# NBU_ALLOW_NONLOCAL_SEED=1 is explicitly set.
+uv run python -m nextballup_api.seed
+
 # Run the FastAPI app (auto-reload in dev, localhost only)
 uv run uvicorn nextballup_api.main:app --reload --host 127.0.0.1 --port 8000
 
-# Run the Celery worker (placeholder transcode + maintenance tasks)
+# Run the Celery worker (browser-safe mezzanine transcode + maintenance tasks)
 uv run celery -A nextballup_worker.celery_app worker --loglevel=info \
   --queues=nextballup.default,nextballup.transcode,nextballup.maintenance
 
@@ -45,10 +51,13 @@ pnpm test       # vitest + msw
 pnpm build
 ```
 
-`apps/web` now covers auth, games (list + detail + PATCH), video upload, and
-processed-video playback. Real CV execution is still deferred — the worker
-runs a placeholder `transcode` stage that verifies the uploaded object and
-marks the video PROCESSED with a passthrough mezzanine output.
+`apps/web` now covers auth, games (list + detail + PATCH), video upload
+(with a best-effort in-browser SHA-256 digest for files ≤ 2 GB, surfaced on
+`/videos/{id}/complete`), processed-video playback, and an admin-only audit
+log viewer (`/admin/audit`, backed by `GET /api/v1/admin/audit/logs`). Real
+CV execution is still deferred — the worker verifies the uploaded object and
+creates a sanitized browser-safe MP4 mezzanine for accepted uploads before
+marking the video PROCESSED.
 
 ## Current Build Order
 
@@ -65,7 +74,8 @@ Implement in this order unless the task explicitly says otherwise:
 9. Frontend
 10. CV pipeline
 
-For Phase 1, stay narrow:
+Historical Phase 1 narrow-scope note (kept so older prompts do not widen
+unexpectedly):
 
 - Build `packages/core`, `packages/db`, `apps/api`, `alembic/`, and tests
 - Leave frontend untouched

@@ -32,6 +32,48 @@ class MockXHR {
   }
 }
 
+/**
+ * Multipart mock that echoes per-part ETag headers. The real S3/MinIO flow
+ * requires the ETag header to be exposed; the UI surfaces an explicit error
+ * if the header is missing, so we keep this branching visible in tests.
+ */
+class MultipartMockXHR {
+  static calls: Array<{ url: string; partNumber?: number }> = [];
+  static withheldEtag = false;
+  upload = { onprogress: null as null | ((e: ProgressEvent) => void) };
+  status = 0;
+  onload: null | (() => void) = null;
+  onerror: null | (() => void) = null;
+  onabort: null | (() => void) = null;
+  private _url = "";
+  private _etag = "";
+  open(_method: string, url: string) {
+    this._url = url;
+    const match = /partNumber=(\d+)/.exec(url);
+    const partNumber = match ? Number(match[1]) : undefined;
+    MultipartMockXHR.calls.push({ url, partNumber });
+    this._etag = `etag-${partNumber ?? "single"}`;
+  }
+  setRequestHeader() {}
+  getResponseHeader(name: string): string | null {
+    if (name.toLowerCase() === "etag" && !MultipartMockXHR.withheldEtag) {
+      return `"${this._etag}"`;
+    }
+    return null;
+  }
+  send(body: Blob) {
+    const size = body.size;
+    this.upload.onprogress?.(
+      { lengthComputable: true, loaded: size, total: size } as ProgressEvent,
+    );
+    this.status = 200;
+    this.onload?.();
+  }
+  abort() {
+    this.onabort?.();
+  }
+}
+
 describe("UploadFlow", () => {
   it("presigns, PUTs, and completes a single-PUT upload end to end", async () => {
     const originalXHR = window.XMLHttpRequest;
@@ -106,7 +148,7 @@ describe("UploadFlow", () => {
     expect(alert.textContent).toMatch(/storage isn't configured/i);
   });
 
-  it("blocks multipart-sized files client-side (no browser UI for multipart yet)", async () => {
+  it("rejects files above the hard 10 GB upload cap without hitting the API", async () => {
     let called = false;
     server.use(
       http.post("/api/v1/videos/upload", () => {
@@ -116,15 +158,15 @@ describe("UploadFlow", () => {
     );
     const user = userEvent.setup();
     render(<UploadFlow gameId="g1" />);
-    // Fake a 2 GB file without actually allocating 2 GB of memory.
+    // Fake an 11 GB file without actually allocating 11 GB of memory.
     const file = new File([new Uint8Array(10)], "clip.mp4", {
       type: "video/mp4",
     });
-    Object.defineProperty(file, "size", { value: 2 * 1024 * 1024 * 1024 });
+    Object.defineProperty(file, "size", { value: 11 * 1024 * 1024 * 1024 });
     await user.upload(screen.getByLabelText(/Video file/i), file);
     await user.click(screen.getByRole("button", { name: /start upload/i }));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/multipart upload/i);
+    expect(alert.textContent).toMatch(/10 GB/i);
     expect(called).toBe(false);
   });
 
@@ -181,6 +223,219 @@ describe("UploadFlow", () => {
       content_type: "video/x-matroska",
     });
     await screen.findByText(/Upload complete/i);
+
+    window.XMLHttpRequest = originalXHR;
+  });
+
+  it("uploads a multipart file part-by-part and sends ETags back to /complete", async () => {
+    const originalXHR = window.XMLHttpRequest;
+    MultipartMockXHR.calls = [];
+    MultipartMockXHR.withheldEtag = false;
+    window.XMLHttpRequest = MultipartMockXHR as unknown as typeof XMLHttpRequest;
+
+    let completionBody: unknown = null;
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            id: "big-video",
+            upload_method: "MULTIPART",
+            upload_url: null,
+            upload_headers: null,
+            upload_id: "mpid-42",
+            part_size_bytes: 64,
+            part_urls: [
+              { part_number: 1, url: "https://signed/1?partNumber=1" },
+              { part_number: 2, url: "https://signed/2?partNumber=2" },
+            ],
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          { status: 201 },
+        ),
+      ),
+      http.post("/api/v1/videos/big-video/complete", async ({ request }) => {
+        completionBody = await request.json();
+        return HttpResponse.json({
+          id: "big-video",
+          status: "queued",
+          estimated_processing_minutes: 45,
+          job_id: "job-1",
+        });
+      }),
+    );
+
+    const user = userEvent.setup({ applyAccept: false });
+    render(<UploadFlow gameId="g1" />);
+    // Build a small "file" but claim it's large enough to be multipart on the
+    // backend. We don't test the size threshold client-side because the
+    // backend is the source of truth — the UI just respects whatever method
+    // the backend chose.
+    const file = new File([new Uint8Array(128)], "big.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+    await screen.findByText(/Upload complete/i);
+
+    // Each part must have been PUT to its signed URL.
+    const parts = MultipartMockXHR.calls.filter((c) => c.partNumber != null);
+    expect(parts.map((c) => c.partNumber).sort()).toEqual([1, 2]);
+
+    // /complete payload must carry the right ETags keyed to part numbers.
+    expect(completionBody).toMatchObject({
+      parts: [
+        { part_number: 1, etag: "etag-1" },
+        { part_number: 2, etag: "etag-2" },
+      ],
+    });
+
+    window.XMLHttpRequest = originalXHR;
+  });
+
+  it("computes a SHA-256 checksum and forwards it to /complete after the upload", async () => {
+    const originalXHR = window.XMLHttpRequest;
+    window.XMLHttpRequest = MockXHR as unknown as typeof XMLHttpRequest;
+
+    let completionBody: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            id: "checksum-video",
+            upload_method: "PUT",
+            upload_url: "https://signed.storage.test/checksum-video",
+            upload_headers: { "Content-Type": "video/mp4" },
+            upload_id: null,
+            part_size_bytes: null,
+            part_urls: null,
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          { status: 201 },
+        ),
+      ),
+      http.post("/api/v1/videos/checksum-video/complete", async ({ request }) => {
+        completionBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({
+          id: "checksum-video",
+          status: "queued",
+          estimated_processing_minutes: 45,
+          job_id: "job-1",
+        });
+      }),
+    );
+
+    const user = userEvent.setup({ applyAccept: false });
+    render(<UploadFlow gameId="g1" />);
+    // Deterministic body so we can assert the known SHA-256 of 8 zero bytes.
+    const file = new File([new Uint8Array(8)], "clip.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+    await screen.findByText(/Upload complete/i);
+
+    // SHA-256 of eight 0x00 bytes.
+    expect(completionBody).toMatchObject({
+      checksum_sha256:
+        "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+    });
+
+    window.XMLHttpRequest = originalXHR;
+  });
+
+  it("skips client-side SHA-256 for files above the browser-memory threshold", async () => {
+    // Any file big enough to cross the 2 GB checksum threshold is already
+    // well above the 1 GB single-PUT limit, so the only realistic exerciser
+    // of the skip path is the multipart flow.
+    const originalXHR = window.XMLHttpRequest;
+    MultipartMockXHR.calls = [];
+    MultipartMockXHR.withheldEtag = false;
+    window.XMLHttpRequest = MultipartMockXHR as unknown as typeof XMLHttpRequest;
+
+    let completionBody: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            id: "huge-video",
+            upload_method: "MULTIPART",
+            upload_url: null,
+            upload_headers: null,
+            upload_id: "mpid-huge",
+            part_size_bytes: 64,
+            part_urls: [
+              { part_number: 1, url: "https://signed/1?partNumber=1" },
+            ],
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          { status: 201 },
+        ),
+      ),
+      http.post("/api/v1/videos/huge-video/complete", async ({ request }) => {
+        completionBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({
+          id: "huge-video",
+          status: "queued",
+          estimated_processing_minutes: 45,
+          job_id: "job-1",
+        });
+      }),
+    );
+
+    const user = userEvent.setup({ applyAccept: false });
+    render(<UploadFlow gameId="g1" />);
+    const file = new File([new Uint8Array(64)], "huge.mp4", {
+      type: "video/mp4",
+    });
+    // Lie about the size to cross the client-side checksum threshold without
+    // allocating gigabytes of test memory.
+    Object.defineProperty(file, "size", { value: 3 * 1024 ** 3 });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+    await screen.findByText(/Upload complete/i);
+
+    // Above CHECKSUM_MAX_BYTES the client must *not* attempt to hash — the
+    // backend's size + ETag check is the integrity floor for these uploads.
+    expect(completionBody).not.toHaveProperty("checksum_sha256");
+
+    window.XMLHttpRequest = originalXHR;
+  });
+
+  it("surfaces a clear error when storage hides the ETag header", async () => {
+    const originalXHR = window.XMLHttpRequest;
+    MultipartMockXHR.calls = [];
+    MultipartMockXHR.withheldEtag = true;
+    window.XMLHttpRequest = MultipartMockXHR as unknown as typeof XMLHttpRequest;
+
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            id: "hidden-etag-video",
+            upload_method: "MULTIPART",
+            upload_url: null,
+            upload_headers: null,
+            upload_id: "mpid-hidden",
+            part_size_bytes: 64,
+            part_urls: [
+              { part_number: 1, url: "https://signed/1?partNumber=1" },
+            ],
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          { status: 201 },
+        ),
+      ),
+    );
+
+    const user = userEvent.setup({ applyAccept: false });
+    render(<UploadFlow gameId="g1" />);
+    const file = new File([new Uint8Array(64)], "big.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/ETag/i);
 
     window.XMLHttpRequest = originalXHR;
   });

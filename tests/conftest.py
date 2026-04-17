@@ -13,6 +13,7 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -133,13 +134,23 @@ async def client(db_session: AsyncSession):  # type: ignore[no-untyped-def]
     from nextballup_api.deps import get_db
     from nextballup_api.main import app
 
+    from nextballup_core.settings import reload_settings
+    from tests.csrf_helper import make_csrf_mirror_hook
+
+    reload_settings()
+
     async def _override_get_db() -> AsyncIterator[AsyncSession]:
         yield db_session
 
     app.dependency_overrides[get_db] = _override_get_db
+
     transport = ASGITransport(app=app)
     try:
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            event_hooks={"request": [make_csrf_mirror_hook()]},
+        ) as ac:
             yield ac
     finally:
         app.dependency_overrides.clear()
@@ -148,3 +159,50 @@ async def client(db_session: AsyncSession):  # type: ignore[no-untyped-def]
 # Ensure the project root is on sys.path so test modules can import unprefixed.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _stub_browser_mezzanine_transcode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite deterministic without requiring ffmpeg on the host.
+
+    Runtime tests still execute the real worker/job code paths; only the
+    heavyweight media conversion step is swapped for a stable fake artifact.
+    """
+    from nextballup_api.storage import storage_key_for_mezzanine
+    from nextballup_worker.runtime import media as worker_media
+    from nextballup_worker.runtime import transcode as worker_transcode
+    from nextballup_worker.runtime.media import BrowserMezzanineArtifact
+
+    async def _fake_create_browser_mezzanine(
+        *,
+        video: Any,
+        presigner: Any,
+        settings: Any,
+    ) -> BrowserMezzanineArtifact:
+        mezzanine_key = storage_key_for_mezzanine(
+            team_id=str(video.team_id),
+            video_id=str(video.id),
+        )
+        output_size = max(1, int((video.file_size_bytes or 1) * 0.9))
+        object_sizes = getattr(presigner, "object_sizes", None)
+        if isinstance(object_sizes, dict):
+            object_sizes[mezzanine_key] = output_size
+        synthetic_etag = (mezzanine_key.encode("utf-8").hex().ljust(32, "0"))[:32]
+        return BrowserMezzanineArtifact(
+            mezzanine_key=mezzanine_key,
+            storage_etag=synthetic_etag,
+            output_size_bytes=output_size,
+            duration_seconds=42.0,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            codec="h264",
+            transcoder="test-stub",
+        )
+
+    monkeypatch.setattr(worker_media, "create_browser_mezzanine", _fake_create_browser_mezzanine)
+    monkeypatch.setattr(
+        worker_transcode,
+        "create_browser_mezzanine",
+        _fake_create_browser_mezzanine,
+    )

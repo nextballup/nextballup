@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -67,6 +68,10 @@ class StoragePresigner(Protocol):
     def presign_get(
         self, *, key: str, expires_in: int, response_content_type: str | None = None
     ) -> str: ...
+
+    def download_file(self, *, key: str, destination: str) -> None: ...
+
+    def upload_file(self, *, key: str, source: str, content_type: str) -> None: ...
 
 
 class S3StoragePresigner:
@@ -209,6 +214,23 @@ class S3StoragePresigner:
             raise StorageFailureError("Failed to presign GET URL", details={"key": key}) from exc
         return url
 
+    def download_file(self, *, key: str, destination: str) -> None:
+        try:
+            self._client.download_file(self._bucket, key, destination)
+        except (BotoCoreError, ClientError) as exc:
+            raise StorageFailureError("Failed to download object", details={"key": key}) from exc
+
+    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+        try:
+            self._client.upload_file(
+                source,
+                self._bucket,
+                key,
+                ExtraArgs={"ContentType": content_type},
+            )
+        except (BotoCoreError, ClientError) as exc:
+            raise StorageFailureError("Failed to upload object", details={"key": key}) from exc
+
 
 def get_storage_presigner(settings: Settings) -> StoragePresigner | None:
     """Construct a presigner only when all S3 settings are populated. Routers
@@ -283,11 +305,63 @@ async def storage_presign_get(
     )
 
 
+async def storage_download_file(
+    presigner: StoragePresigner,
+    *,
+    key: str,
+    destination: str,
+) -> None:
+    await to_thread.run_sync(lambda: presigner.download_file(key=key, destination=destination))
+
+
+async def storage_upload_file(
+    presigner: StoragePresigner,
+    *,
+    key: str,
+    source: str,
+    content_type: str,
+) -> None:
+    await to_thread.run_sync(
+        lambda: presigner.upload_file(key=key, source=source, content_type=content_type)
+    )
+
+
+# Only `[A-Za-z0-9._-]` survive sanitation. Anything else — unicode, spaces,
+# path separators, control chars, shell metacharacters — collapses to `_`.
+# The original filename stays on the Video row for display; this is purely
+# the on-disk/S3 key component, which must be stable, case-safe, and free of
+# anything that could confuse intermediate systems (log pipelines, URL
+# libraries, CDN key-validation rules).
+_SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+_MULTIDOT = re.compile(r"\.{2,}")
+
+
+def _sanitize_filename_component(filename: str) -> str:
+    """Reduce the user-supplied filename to an S3-safe token.
+
+    Belt-and-suspenders: the API validation layer already rejects filenames
+    with traversal segments and control characters, so this function should
+    in practice only see already-safe input. The reason we still sanitize:
+    if a future code path ever constructs a storage key with a less-strict
+    validator (e.g., an admin backfill tool), the key must stay safe.
+    """
+    if not filename:
+        return "upload"
+    cleaned = _SAFE_FILENAME_CHARS.sub("_", filename)
+    # "..", "....", ". ." etc. are traversal markers in most filesystems —
+    # replace any dot-run ≥ 2 so the sanitized key can never resemble one.
+    cleaned = _MULTIDOT.sub("__", cleaned)
+    # Strip leading/trailing dots and underscores so we don't create hidden
+    # files (`.foo`) or awkward double-delimiter keys.
+    cleaned = cleaned.strip("._") or "upload"
+    return cleaned[:200]
+
+
 def storage_key_for_video(*, team_id: str, video_id: str, filename: str) -> str:
     """Deterministic raw-bucket key. Including team_id keeps cross-tenant
     enumeration impossible even if a key leaks; including the video_id
     guarantees per-video uniqueness."""
-    safe_name = filename.replace("/", "_").replace("\\", "_")[:200]
+    safe_name = _sanitize_filename_component(filename)
     return f"raw/{team_id}/{video_id}/{safe_name}"
 
 
@@ -301,6 +375,37 @@ def storage_key_for_hls(*, team_id: str, video_id: str) -> str:
 
 def storage_key_for_thumbnail(*, team_id: str, video_id: str) -> str:
     return f"thumbnails/{team_id}/{video_id}/preview.jpg"
+
+
+# --- CV-stage artifact layout ---------------------------------------------
+#
+# Each downstream CV stage deposits its output at a deterministic key under
+# `artifacts/{team}/{video}/`. Co-locating them means the retention/cleanup
+# code can prune per-video artifacts with a single bucket-list + prefix
+# delete, and keeps cross-stage joins (e.g. events referencing tracking IDs)
+# addressable by convention alone. The `.json` suffix is load-bearing for
+# downstream CDN/content-type routing and for admin tooling that inspects
+# artifacts without having to query the DB for content type.
+
+
+def storage_key_for_detections(*, team_id: str, video_id: str) -> str:
+    return f"artifacts/{team_id}/{video_id}/detections.json"
+
+
+def storage_key_for_tracking(*, team_id: str, video_id: str) -> str:
+    return f"artifacts/{team_id}/{video_id}/tracking.json"
+
+
+def storage_key_for_court_mapping(*, team_id: str, video_id: str) -> str:
+    return f"artifacts/{team_id}/{video_id}/court.json"
+
+
+def storage_key_for_events(*, team_id: str, video_id: str) -> str:
+    return f"artifacts/{team_id}/{video_id}/events.json"
+
+
+def storage_key_for_metrics(*, team_id: str, video_id: str) -> str:
+    return f"artifacts/{team_id}/{video_id}/metrics.json"
 
 
 def normalize_etag(etag: str | None) -> str | None:

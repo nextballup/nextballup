@@ -1,10 +1,15 @@
 # NextBallUp
 
-**AI vision platform for basketball player analysis.** Hidden impact metrics beyond box scores — conversion rates, Spatial IQ, predictive features, and automatic tagging for coaches and recruiters.
+**Production-minded basketball film archive and review platform foundation.**
+Team management, game organization, upload, processing, and signed playback
+are implemented now. Deep computer-vision analytics are still future work.
 
 ## Repo Status
 
-This repository is a **Claude Code-oriented scaffold with a runnable Phase 1 backend foundation**. It now includes the first FastAPI/auth/database slice while still leaving the frontend, worker behavior, and CV pipeline for later phases.
+This repository is a **Claude Code-oriented scaffold with a runnable Phase 7
+backend/worker/frontend foundation**. It includes the current auth, teams,
+games, upload, worker, and playback slices while still deferring real CV
+inference/training.
 
 Checked in now:
 
@@ -16,7 +21,11 @@ Checked in now:
   signed playback delivery
 - Celery worker + beat with PENDING-only claim, heartbeat, stale recovery,
   abandoned upload cleanup (`apps/worker`)
-- Next.js 15 frontend for auth / games / upload / playback (`apps/web`)
+- Next.js 15 frontend for auth / games / upload / playback (`apps/web`),
+  with a per-request CSP nonce middleware and a SHA-256 integrity attestation
+  computed in the browser before `/videos/{id}/complete` for uploads ≤ 2 GB
+- Admin-only audit log viewer (`GET /api/v1/admin/audit/logs` + `/admin/audit`
+  page) for SOC 2 evidence + GDPR subject-access workflows
 - Core/domain package (`packages/core`)
 - Database models and Alembic migrations (`packages/db`, `alembic/`)
 - Backend integration tests + frontend vitest suite
@@ -24,9 +33,10 @@ Checked in now:
 Not checked in yet:
 
 - Real CV inference/training in the default setup path (worker runs a
-  placeholder `transcode` stage)
-- Seed data and richer feature slices beyond the auth / team / video / game
-  / playback foundation
+  real ingest transcode stage that creates a browser-safe MP4 mezzanine, but
+  downstream CV inference/training is still deferred)
+- Richer analytics/clips/metrics surfaces beyond the current auth / team /
+  video / game / playback foundation
 
 ## Bootstrap
 
@@ -36,6 +46,9 @@ Not checked in yet:
 - Node.js 20+ with pnpm
 - Docker and Docker Compose
 - FFmpeg (`brew install ffmpeg`) when working on ingest, clip generation, or CV
+  (macOS local dev can fall back to the built-in `avconvert`, but FFmpeg
+  remains the portable/default path and is required for the broadest codec
+  support)
 
 ### Local Setup
 
@@ -56,6 +69,11 @@ uv sync
 
 # Apply database migrations (creates users, teams, team_memberships, audit_logs)
 uv run alembic upgrade head
+
+# (Optional) Seed a demo coach / player / team / game so the frontend is
+# immediately usable. Refuses staging/production and non-local DATABASE_URL
+# targets unless you explicitly opt in. Idempotent.
+uv run python -m nextballup_api.seed
 
 # Run the API (bind localhost only)
 uv run uvicorn nextballup_api.main:app --reload --host 127.0.0.1 --port 8000
@@ -96,8 +114,10 @@ The CV package is intentionally kept outside the root uv workspace so a plain
 ## Baseline Decisions
 
 - Tenant isolation is a baseline security control: the initial Alembic migration must enable PostgreSQL row-level security on tenant-scoped tables.
-- The auth model is custom FastAPI-issued JWTs stored in httpOnly cookies. Do not add NextAuth/Auth.js as a parallel auth system.
-- Logout invalidates issued JWTs by rotating a server-side `session_version`, so old access/refresh tokens stop working even if copied elsewhere.
+- The auth model is custom FastAPI-issued RS256 JWTs delivered **cookie-only**. The access JWT rides in the httpOnly access cookie, the refresh JWT rides in a path-scoped httpOnly refresh cookie (`/api/v1/auth/refresh` only), and `/auth/register`, `/auth/login`, and `/auth/refresh` never return tokens in the JSON body. Do not add NextAuth/Auth.js as a parallel auth system.
+- Cookie-authenticated mutations are gated by a double-submit CSRF check — the browser mirrors the readable `nbu_csrf_token` cookie into the `X-CSRF-Token` header; the frontend `apiFetch` helper does this automatically.
+- Logout invalidates issued JWTs by rotating a server-side `session_version`, so old access/refresh/playback tokens stop validating even if copied elsewhere.
+- In staging/production, request and worker DB traffic runs as the CRUD-only `nextballup_app` role via `DATABASE_URL_RUNTIME`. The owner connection (`DATABASE_URL`) is reserved for Alembic. Local dev may leave `DATABASE_URL_RUNTIME` unset and fall back to the owner URL.
 - Python is pinned to 3.12.x to avoid accidental adoption of unsupported Torch / CV wheels.
 - The CV package is intentionally excluded from the root uv workspace until the M5 Max arrives and the CV layer is actively being built.
 

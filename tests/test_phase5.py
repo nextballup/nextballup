@@ -11,6 +11,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -91,6 +92,12 @@ class FakeStorage:
         )
         return f"https://fake-storage.test/{key}?GET=1&exp={expires_in}"
 
+    def download_file(self, *, key: str, destination: str) -> None:
+        Path(destination).write_bytes(b"fake-video")
+
+    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+        self.object_sizes[key] = Path(source).stat().st_size
+
 
 @pytest_asyncio.fixture(loop_scope="session")
 async def fake_storage() -> FakeStorage:
@@ -104,6 +111,11 @@ async def storage_client(
     from nextballup_api.deps import get_db
     from nextballup_api.main import app
 
+    from nextballup_core.settings import reload_settings
+    from tests.csrf_helper import make_csrf_mirror_hook
+
+    reload_settings()
+
     async def _override_get_db() -> AsyncIterator[AsyncSession]:
         yield db_session
 
@@ -114,7 +126,11 @@ async def storage_client(
     app.dependency_overrides[get_storage] = _override_storage
     transport = ASGITransport(app=app)
     try:
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            event_hooks={"request": [make_csrf_mirror_hook()]},
+        ) as ac:
             yield ac
     finally:
         app.dependency_overrides.clear()
@@ -188,12 +204,18 @@ async def _seed_processed_video(
     fake_storage: FakeStorage,
     *,
     coach_email: str,
+    upload_overrides: dict[str, Any] | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     """Returns (team_id, video_id, transcode_job_id) — video is PROCESSED."""
     await client.post(f"{API}/auth/register", json=_coach(coach_email))
     team = (await client.post(f"{API}/teams", json=_team_body())).json()
     game = (await client.post(f"{API}/games", json=_game_body(team["id"]))).json()
-    upload = (await client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))).json()
+    upload = (
+        await client.post(
+            f"{API}/videos/upload",
+            json=_upload_body(game["id"], **(upload_overrides or {})),
+        )
+    ).json()
     complete = (
         await client.post(
             f"{API}/videos/{upload['id']}/complete",
@@ -232,9 +254,11 @@ async def test_worker_persists_output_keys_and_etag(
     assert video is not None
     assert video.status is VideoStatus.PROCESSED
     assert video.storage_key_mezzanine is not None
-    assert video.storage_key_mezzanine == video.storage_key_raw  # passthrough
+    assert video.storage_key_mezzanine != video.storage_key_raw
     assert video.storage_etag is not None
     assert "-" not in video.storage_etag  # single-part MD5-shape
+    assert video.codec == "h264"
+    assert video.duration_seconds == 42.0
 
     # Audit row for output materialization is present and tied to the team
     materialized = await db_session.scalar(
@@ -267,6 +291,7 @@ async def test_processed_video_returns_signed_playback(
     assert body["status"] == VideoStatus.PROCESSED.value
     assert body["playback_url"]
     assert body["playback_url"].startswith("https://fake-storage.test/")
+    assert "/mezzanine/" in body["playback_url"]
     assert body["playback_token"]
     assert body["playback_format"] == "mp4"
     assert body["token_expires_at"] is not None
@@ -282,6 +307,10 @@ async def test_processed_video_returns_signed_playback(
     assert decoded["vid"] == str(video_id)
     assert decoded["tid"] == str(team_id)
     assert decoded["aud"] == settings.playback_token_audience
+    assert fake_storage.presigned_get_calls[-1]["expires_in"] == min(
+        settings.playback_url_expires_seconds,
+        settings.playback_token_expire_seconds,
+    )
 
     issued = await db_session.scalar(
         select(func.count())
@@ -292,6 +321,33 @@ async def test_processed_video_returns_signed_playback(
         )
     )
     assert issued and issued >= 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_processed_mov_returns_signed_playback_from_mezzanine(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+) -> None:
+    _, video_id, _ = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="play-mov@example.com",
+        upload_overrides={
+            "filename": "iphone_clip.mov",
+            "content_type": "video/quicktime",
+        },
+    )
+
+    response = await storage_client.get(f"{API}/videos/{video_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == VideoStatus.PROCESSED.value
+    assert body["playback_url"] is not None
+    assert "/mezzanine/" in body["playback_url"]
+    assert body["playback_token"] is not None
+    assert body["playback_format"] == "mp4"
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -420,8 +476,8 @@ async def test_missing_playback_object_returns_no_playback_fields_and_no_issue_a
     )
     video = await db_session.scalar(select(Video).where(Video.id == video_id))
     assert video is not None
-    assert video.storage_key_raw is not None
-    fake_storage.object_sizes.pop(video.storage_key_raw, None)
+    assert video.storage_key_mezzanine is not None
+    fake_storage.object_sizes.pop(video.storage_key_mezzanine, None)
 
     issued_before = await db_session.scalar(
         select(func.count())

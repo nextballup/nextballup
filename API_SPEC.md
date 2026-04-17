@@ -7,23 +7,50 @@ Development: http://127.0.0.1:8000/api/v1
 Production:  https://api.nextballup.com/v1
 ```
 
+**Implemented API surface in the current repo:** health, auth, teams, games,
+videos, and a small admin surface (`/admin/audit/logs`).
+
+Sections later in this document that describe `/users`, `/events`, `/players`,
+`/metrics`, `/clips`, `/scouting`, `/search`, `/alerts`, and `/notes` are
+**planned product/API targets**, not current runnable endpoints, unless and
+until the codebase adds those routers.
+
 ## Authentication
 
-All endpoints except `/auth/register` and `/auth/login` require a Bearer token.
+Authentication is cookie-first. `/auth/register`, `/auth/login`, and
+`/auth/refresh` set two httpOnly cookies (access + refresh) plus a readable
+CSRF cookie. The browser never sees the JWT itself — the cookies carry it.
 
-```
-Authorization: Bearer <access_token>
-```
+Tokens are RS256 JWTs. Access tokens expire in 15 minutes. Refresh tokens
+expire in 7 days. Logout bumps a per-user `session_version` so every
+outstanding token stops validating even if it was copied elsewhere.
 
-Tokens are RS256 JWTs. Access tokens expire in 15 minutes. Refresh tokens expire in 7 days.
+### Cookies set on successful auth
 
-### Token payload
+| Cookie | httpOnly | Purpose |
+|---|---|---|
+| `nbu_access_token` (or `__Host-nbu_access_token` when `COOKIE_HOST_PREFIX` + `COOKIE_SECURE` are enabled) | yes | Short-lived bearer for request auth |
+| `nbu_refresh_token` | yes | Refresh-only JWT, path-scoped to `/api/v1/auth/refresh` |
+| `nbu_csrf_token` (or `__Host-…`) | **no** | Double-submit CSRF token the browser mirrors into `X-CSRF-Token` on mutating requests |
+
+### Non-browser / service clients
+
+Service clients can still use the bearer-header path. Read the access
+cookie off the `Set-Cookie` header of `/auth/login` and send it back as
+`Authorization: Bearer …` on subsequent calls. Bearer-authenticated
+mutations are CSRF-exempt; cookie-authenticated mutations must echo the
+CSRF cookie into the `X-CSRF-Token` header or they are rejected with
+`403 CSRF_FAILED`.
+
+### Access token payload
 
 ```json
 {
   "sub": "uuid",
   "role": "coach | player | admin",
   "team_ids": ["uuid", "uuid"],
+  "sv": 1,
+  "type": "access",
   "iat": 1714000000,
   "exp": 1714000900
 }
@@ -56,9 +83,9 @@ Returns 200 only if database and Redis are reachable.
 { "status": "not_ready", "database": "ok", "redis": "timeout", "storage": "ok" }
 ```
 
-If Redis and storage are not configured in the current environment, Phase 1 may
-return `"not_configured"` for those fields while still returning 200 in local
-development. Production environments should configure and require all three.
+If Redis and storage are not configured in the current environment, local/dev
+setups may return `"not_configured"` for those fields while still returning 200.
+Production environments should configure and require all three.
 
 ### GET `/health/live`
 
@@ -85,8 +112,7 @@ Create a new user account. User chooses role at registration.
   "full_name": "Mike Johnson",
   "role": "coach",
   "phone": "+15551234567",       // optional
-  "institution": "Lincoln High",  // optional, free text
-  "sport_experience": "10 years varsity coaching"  // optional
+  "institution": "Lincoln High"  // optional, free text
 }
 ```
 
@@ -94,7 +120,11 @@ Create a new user account. User chooses role at registration.
 - `role` must be `"coach"` or `"player"` (admin is internal only)
 - `email` must be unique, valid format
 - `password` minimum 8 characters, at least 1 number and 1 uppercase letter
-- If user is under 13 (determined during onboarding), block registration and show parental consent flow
+- `phone` and `institution` are optional, max-length-bounded free-text fields
+
+**Current scope note:**
+- COPPA / parental-consent onboarding is **not** implemented in this phase.
+- Do not represent this registration flow as legally complete for under-13 users yet.
 
 **Response: 201**
 ```json
@@ -103,13 +133,17 @@ Create a new user account. User chooses role at registration.
   "email": "coach@example.com",
   "full_name": "Mike Johnson",
   "role": "coach",
-  "created_at": "2026-05-01T00:00:00Z",
-  "access_token": "eyJ...",
-  "refresh_token": "eyJ..."
+  "created_at": "2026-05-01T00:00:00Z"
 }
 ```
 
-**Errors:** 409 email exists · 422 validation failed
+Three `Set-Cookie` headers ride along on success: the access cookie,
+the refresh cookie, and the CSRF cookie. The access + CSRF cookies may be
+prefixed with `__Host-` when `COOKIE_HOST_PREFIX=true` and
+`COOKIE_SECURE=true`. The refresh cookie intentionally stays unprefixed so
+it can be scoped narrowly to `/api/v1/auth/refresh`.
+
+**Errors:** 409 email exists · 422 validation failed · 429 rate limited
 
 ### POST `/auth/login`
 
@@ -124,8 +158,6 @@ Create a new user account. User chooses role at registration.
 **Response: 200**
 ```json
 {
-  "access_token": "eyJ...",
-  "refresh_token": "eyJ...",
   "user": {
     "id": "uuid",
     "email": "coach@example.com",
@@ -138,22 +170,32 @@ Create a new user account. User chooses role at registration.
 }
 ```
 
+Access, refresh, and CSRF cookies are set on the response. JWTs are never
+included in the response body.
+
 **Errors:** 401 invalid credentials · 429 rate limited (5/min)
 
 ### POST `/auth/refresh`
 
+Rotate the access + refresh cookies. Cookie-only: the refresh JWT is read
+exclusively from the `nbu_refresh_token` cookie, never from the request
+body. Passing a legacy `{"refresh_token": "…"}` body is rejected with
+`422` so a stolen token cannot be replayed through the JSON contract.
+
 **Request:**
 ```json
-{ "refresh_token": "eyJ..." }
+{}
 ```
 
 **Response: 200**
 ```json
-{
-  "access_token": "eyJ...",
-  "refresh_token": "eyJ..."
-}
+{ "refreshed_at": "2026-11-16T00:00:00Z" }
 ```
+
+New access + refresh cookies are attached to the response; the old
+refresh cookie is invalidated by rotation.
+
+**Errors:** 401 missing/expired refresh cookie · 422 legacy body fields
 
 ### POST `/auth/logout`
 
@@ -166,7 +208,45 @@ causes previously issued access and refresh tokens to stop working.
 
 Returns current user profile.
 
-**Response: 200** — Same shape as user object in login response.
+**Response: 200** — Same shape as `user` object in login response.
+
+### GET `/auth/me/export`
+
+GDPR Art. 15 self-serve access: returns every row keyed to the caller
+(profile, active + inactive memberships, videos they uploaded, audit
+events where they were the actor) in a single JSON bundle.
+
+**Response: 200**
+```json
+{
+  "exported_at": "2026-05-01T00:00:00Z",
+  "user": { "id": "uuid", "email": "coach@example.com", "full_name": "Mike Johnson", "role": "coach" },
+  "team_memberships": [ ... ],
+  "videos_uploaded": [ ... ],
+  "audit_events": [ ... ]
+}
+```
+
+Tenant-owned rows that the caller can merely *see* (teammates' videos,
+team-wide audit events) are intentionally **not** included; those belong
+in a tenant-owner export we don't expose yet.
+
+### DELETE `/auth/me`
+
+GDPR Art. 17 self-serve erasure: anonymizes the user row rather than
+hard-deleting so FKs on audits and videos stay valid. Personal fields
+(name, phone, institution, avatar, player biometrics, parental consent
+flags) are scrubbed, the email is rewritten to a deterministic
+nonresolvable address, the password is replaced with a bcrypt-invalid
+sentinel, `session_version` is bumped so outstanding tokens fail, and
+every membership is deactivated.
+
+**Response: 200**
+```json
+{ "deleted_at": "2026-05-01T00:00:00Z", "user_id": "uuid" }
+```
+
+Auth + CSRF cookies are cleared on the response.
 
 ---
 
@@ -265,9 +345,8 @@ Create a new team. Only coaches can create teams.
 
 ### GET `/teams`
 
-List teams the current user belongs to.
-
-**Query params:** `?sport=basketball&season=2026-2027`
+List teams the caller currently has an **active** membership in. Players
+get `invite_code: null`; coaches and admins see the live invite code.
 
 **Response: 200**
 ```json
@@ -278,12 +357,36 @@ List teams the current user belongs to.
       "name": "Lincoln Varsity Boys",
       "sport": "basketball",
       "level": "high_school",
+      "institution": "Lincoln High School",
+      "institution_type": "k12_school",
       "season": "2026-2027",
-      "my_role": "head_coach",
+      "invite_code": "LVB-2026-X7K9",
+      "my_team_role": "head_coach",
       "member_count": 15,
       "game_count": 12
     }
   ]
+}
+```
+
+### GET `/teams/{team_id}/members`
+
+Flat member roster. Same access control as `GET /teams/{team_id}`.
+
+**Response: 200**
+```json
+{
+  "members": [
+    {
+      "user_id": "uuid",
+      "full_name": "Mike Johnson",
+      "role": "coach",
+      "team_role": "head_coach",
+      "jersey_number": null,
+      "joined_at": "2026-05-01T00:00:00Z"
+    }
+  ],
+  "total": 15
 }
 ```
 
@@ -474,7 +577,40 @@ Full game detail including score, lineup, and processing status.
 
 ### PATCH `/games/{game_id}`
 
-Update game details (score, status, notes, lineup).
+Update game details (score, status, notes, periods).
+
+**Terminal-status rule:** if the game is already in `completed` or
+`failed`, non-admin callers can still PATCH fields *without* changing
+`status` (or by passing the same `status` value as the current one). Any
+attempt to transition a terminal game to a non-terminal status from a
+non-admin caller is rejected with `403 GAME_TERMINAL_STATUS`. Admins can
+reopen a terminal game by PATCHing a non-terminal status.
+
+### GET `/games/{game_id}/videos`
+
+List videos attached to a game. Any active team member may read; this
+endpoint deliberately does **not** issue signed playback URLs, so it is
+safe for every tenant role. Use `GET /videos/{video_id}` for playback
+delivery.
+
+**Response: 200**
+```json
+{
+  "videos": [
+    {
+      "id": "uuid",
+      "filename": "lincoln_vs_jefferson_full.mp4",
+      "status": "processed",
+      "file_size_bytes": 4294967296,
+      "duration_seconds": 5400,
+      "camera_position": "sideline",
+      "camera_height": "elevated",
+      "created_at": "2026-11-15T22:00:00Z"
+    }
+  ],
+  "total": 1
+}
+```
 
 ### POST `/games/{game_id}/lineup`
 
@@ -546,12 +682,31 @@ Client uploads each 100MB part in parallel via presigned PUT, then calls complet
 
 ### POST `/videos/{video_id}/complete`
 
-Signal upload complete. Triggers transcoding and CV pipeline.
+Signal upload complete. The server HEADs the uploaded object and
+validates the declared size *before* flipping the video to `queued`; a
+missing object or size mismatch is rejected with `409 INVALID_VIDEO_STATE`
+and never creates a processing job.
 
-**Request:**
+**Request (single PUT upload):**
 ```json
 { "checksum_sha256": "abc123..." }
 ```
+
+**Request (multipart upload):**
+```json
+{
+  "checksum_sha256": "abc123...",
+  "parts": [
+    { "part_number": 1, "etag": "\"etag-1\"" },
+    { "part_number": 2, "etag": "\"etag-2\"" }
+  ]
+}
+```
+
+**Idempotency:** calling `/complete` again after a successful completion
+returns the existing transcode job id rather than creating a duplicate.
+A duplicate call against a pending upload that is still in
+`PENDING_UPLOAD` proceeds normally.
 
 **Response: 200**
 ```json
@@ -562,6 +717,10 @@ Signal upload complete. Triggers transcoding and CV pipeline.
   "job_id": "uuid"
 }
 ```
+
+**Errors:** 404 video · 409 video in wrong state / object missing / size
+mismatch · 422 missing `parts` for a multipart upload · 503 storage
+unavailable
 
 ### GET `/videos/{video_id}`
 
@@ -590,6 +749,55 @@ Video detail with playback URLs.
   }
 }
 ```
+
+The `playback_url` presigned URL lifetime is capped to the shorter of
+`PLAYBACK_URL_EXPIRES_SECONDS` and `PLAYBACK_TOKEN_EXPIRE_SECONDS`, so a
+presigned URL can never outlive its matching token.
+
+### POST `/videos/{video_id}/playback/verify`
+
+Live revocation check. The client holds a `playback_token` from
+`/videos/{video_id}` and periodically asks the server to re-validate it.
+Returns `200` + expiry when the token is still good; any `4xx` means
+drop the stream.
+
+**Request:**
+```json
+{ "token": "eyJ..." }
+```
+
+**Response: 200**
+```json
+{ "video_id": "uuid", "expires_at": "2026-11-16T00:00:00Z" }
+```
+
+Rejects with `401` if the token is expired/malformed, belongs to a
+different user, scopes a different video, or if `session_version` has
+advanced (logout, account delete, team removal).
+
+### POST `/videos/{video_id}/processing/requeue`
+
+Admin-only. Resets a terminal (`FAILED` or `COMPLETED`) processing job
+back to `PENDING` so the beat dispatcher re-runs it. Rejects `RUNNING`
+and `PENDING` jobs with `409` so operators can't race a live worker.
+
+**Request:**
+```json
+{ "stage": "transcode" }
+```
+
+**Response: 200**
+```json
+{
+  "job_id": "uuid",
+  "stage": "transcode",
+  "status": "pending",
+  "requeued_at": "2026-11-16T00:00:00Z"
+}
+```
+
+**Errors:** 403 non-admin caller · 404 video or stage not found · 409
+job is not in a terminal state · 422 unknown stage
 
 ### GET `/videos/{video_id}/status`
 
@@ -1148,6 +1356,61 @@ Messaging is sequenced across three releases:
 
 ---
 
+## Admin — `/admin` (operator-only, implemented)
+
+Cross-tenant surfaces that only `UserRole.admin` may call. Coach- and
+player-tier users receive `403 FORBIDDEN` regardless of team membership.
+These endpoints bypass normal tenant scoping because their whole purpose is
+cross-tenant incident review and compliance evidence.
+
+### GET `/admin/audit/logs`
+
+Paginated view over the append-only audit log. The rows are immutable at the
+database level (a trigger refuses any `UPDATE`/`DELETE`), so this endpoint is
+strictly read-only.
+
+**Query params**
+
+| Name | Type | Notes |
+|---|---|---|
+| `team_id` | uuid | Filter by the tenant the row belongs to |
+| `actor_user_id` | uuid | Filter by the user who triggered the action |
+| `action` | string | Exact match on the dot-namespaced action identifier (e.g. `videos.upload.complete`) |
+| `resource_type` | string | e.g. `video`, `team`, `processing_job` |
+| `resource_id` | uuid | Filter by the specific resource touched |
+| `from_ts` | ISO-8601 | Inclusive lower bound on `created_at` |
+| `to_ts` | ISO-8601 | Exclusive upper bound on `created_at` |
+| `limit` | int, 1–200 | Page size (default 50) |
+| `cursor` | opaque string | Echoed from a prior `next_cursor` response |
+
+**Response**
+
+```json
+{
+  "items": [
+    {
+      "id": "…",
+      "created_at": "2026-04-16T20:58:55.000Z",
+      "action": "videos.upload.complete",
+      "actor_user_id": "…",
+      "actor_email": "coach@example.com",
+      "resource_type": "video",
+      "resource_id": "…",
+      "team_id": "…",
+      "ip_address": "10.0.0.1",
+      "user_agent": "…",
+      "request_id": "…",
+      "extra": {"checksum_sha256": "…"}
+    }
+  ],
+  "next_cursor": "…"
+}
+```
+
+Rows are returned newest-first (`created_at DESC, id DESC`); echo
+`next_cursor` back on the next request to page forward. `next_cursor` is
+`null` when there are no more rows.
+
 ## Common Patterns
 
 ### Pagination
@@ -1165,6 +1428,18 @@ All list endpoints use offset pagination at MVP:
 ```
 
 Default `per_page` is 20, max is 100. At scale, high-volume endpoints (events, notes) may switch to cursor-based keyset pagination on `(created_at, id)` — this will be a non-breaking addition (cursor param alongside page param).
+
+### CSRF — double-submit on cookie-authenticated mutations
+
+When the caller is authenticated via cookies, all mutating methods
+(`POST`, `PUT`, `PATCH`, `DELETE`) must echo the `nbu_csrf_token` cookie
+back in the `X-CSRF-Token` header. A missing or mismatched header is
+rejected with `403 CSRF_FAILED` before the router runs.
+
+Bearer-authenticated requests are CSRF-exempt by construction — a
+cross-origin browser attacker cannot set `Authorization` headers. The
+following paths are also exempt so the auth bootstrap still works:
+`/auth/login`, `/auth/register`, `/auth/refresh`.
 
 ### Error responses
 

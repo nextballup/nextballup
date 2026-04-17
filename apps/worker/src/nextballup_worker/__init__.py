@@ -1,9 +1,10 @@
 """nextballup_worker — Celery worker for NextBallUp processing pipeline.
 
-Phase 4 ships the `transcode` placeholder task path, beat-scheduled dispatch of
-PENDING jobs, stale-job recovery, and abandoned-upload cleanup. Real transcode
-/ CV work lands in subsequent phases — the runtime and control-plane shape is
-stable so those additions only add stages, not surgery.
+The worker currently materializes a browser-safe MP4 mezzanine for accepted
+uploads, plus beat-scheduled dispatch of PENDING jobs, stale-job recovery, and
+abandoned-upload cleanup. Real downstream CV stages still land in subsequent
+phases — the runtime and control-plane shape is stable so those additions only
+add stages, not surgery.
 """
 
 from __future__ import annotations
