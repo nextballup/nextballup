@@ -51,39 +51,57 @@ export default async function GamesPage({
             {statusFilter ? ` · ${STATUS_LABELS[statusFilter]}` : ""}
           </p>
         </div>
-        <nav aria-label="Filter by status" className="flex flex-wrap gap-1 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          <nav aria-label="Filter by status" className="flex flex-wrap gap-1 text-xs">
+            <Link
+              href="/games"
+              className={`rounded-full border px-3 py-1 transition ${
+                !statusFilter
+                  ? "border-[color:var(--color-nbu-text)]"
+                  : "border-[color:var(--color-nbu-border)] text-[color:var(--color-nbu-text-muted)]"
+              }`}
+            >
+              All
+            </Link>
+            {(Object.entries(STATUS_LABELS) as [GameStatus, string][]).map(
+              ([value, label]) => (
+                <Link
+                  key={value}
+                  href={`/games?status=${value}`}
+                  className={`rounded-full border px-3 py-1 transition ${
+                    statusFilter === value
+                      ? "border-[color:var(--color-nbu-text)]"
+                      : "border-[color:var(--color-nbu-border)] text-[color:var(--color-nbu-text-muted)]"
+                  }`}
+                >
+                  {label}
+                </Link>
+              ),
+            )}
+          </nav>
           <Link
-            href="/games"
-            className={`rounded-full border px-3 py-1 transition ${
-              !statusFilter
-                ? "border-[color:var(--color-nbu-text)]"
-                : "border-[color:var(--color-nbu-border)] text-[color:var(--color-nbu-text-muted)]"
-            }`}
+            href="/games/new"
+            className="rounded-md bg-[color:var(--color-nbu-text)] px-4 py-2 text-sm font-medium text-[color:var(--color-nbu-bg)] transition hover:opacity-90"
           >
-            All
+            + Create game
           </Link>
-          {(Object.entries(STATUS_LABELS) as [GameStatus, string][]).map(
-            ([value, label]) => (
-              <Link
-                key={value}
-                href={`/games?status=${value}`}
-                className={`rounded-full border px-3 py-1 transition ${
-                  statusFilter === value
-                    ? "border-[color:var(--color-nbu-text)]"
-                    : "border-[color:var(--color-nbu-border)] text-[color:var(--color-nbu-text-muted)]"
-                }`}
-              >
-                {label}
-              </Link>
-            ),
-          )}
-        </nav>
+        </div>
       </header>
 
       {list.games.length === 0 ? (
-        <p className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-4 py-8 text-center text-sm text-[color:var(--color-nbu-text-muted)]">
-          No games yet. A coach can create one from their team dashboard.
-        </p>
+        <div className="space-y-3 rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-4 py-8 text-center text-sm text-[color:var(--color-nbu-text-muted)]">
+          <p>No games yet.</p>
+          <p>
+            <Link href="/games/new" className="font-medium underline">
+              Create a game
+            </Link>{" "}
+            or{" "}
+            <Link href="/teams" className="font-medium underline">
+              manage your teams
+            </Link>
+            .
+          </p>
+        </div>
       ) : (
         <ul className="grid gap-3 sm:grid-cols-2">
           {list.games.map((game) => (

@@ -30,9 +30,11 @@ from nextballup_core.schemas.game import (
     GameSummary,
     UpdateGameRequest,
 )
+from nextballup_core.schemas.video import VideoListItem, VideoListResponse
 from nextballup_db.models.game import Game
 from nextballup_db.models.team import TeamMembership
 from nextballup_db.models.user import User
+from nextballup_db.models.video import Video
 
 router = APIRouter(prefix="/games", tags=["games"])
 
@@ -184,6 +186,43 @@ async def get_game(
     await set_tenant_context(session, game.team_id)
     await require_team_member(session, user=current_user, team_id=game.team_id)
     return GameSummary.model_validate(game)
+
+
+@router.get("/{game_id}/videos", response_model=VideoListResponse)
+async def list_game_videos(
+    game_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> VideoListResponse:
+    """List videos attached to a game. Any team member may read — this surface
+    does not issue signed playback URLs, so it is safe for every member."""
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    game = await _load_game(session, game_id)
+    if game is None:
+        raise NotFoundError("Game not found", code=ErrorCode.GAME_NOT_FOUND)
+    await set_tenant_context(session, game.team_id)
+    await require_team_member(session, user=current_user, team_id=game.team_id)
+
+    rows = await session.execute(
+        select(Video).where(Video.game_id == game.id).order_by(Video.created_at.desc())
+    )
+    videos = rows.scalars().all()
+    items = [
+        VideoListItem(
+            id=v.id,
+            filename=v.filename,
+            status=v.status,
+            file_size_bytes=v.file_size_bytes,
+            duration_seconds=v.duration_seconds,
+            camera_position=v.camera_position,
+            camera_height=v.camera_height,
+            created_at=v.created_at,
+        )
+        for v in videos
+    ]
+    return VideoListResponse(videos=items, total=len(items))
 
 
 @router.patch("/{game_id}", response_model=GameSummary)

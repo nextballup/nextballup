@@ -1,6 +1,8 @@
+import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { serverApiOptional } from "@/lib/api-server";
-import type { UserPublic } from "@/lib/contract";
+import { ACTIVE_TEAM_COOKIE, resolveActiveTeamId } from "@/lib/active-team";
+import type { TeamListResponse, UserPublic } from "@/lib/contract";
 import { AppShell } from "./app-shell";
 
 export default async function AppLayout({
@@ -16,5 +18,18 @@ export default async function AppLayout({
   if (!user) {
     redirect("/login");
   }
-  return <AppShell user={user}>{children}</AppShell>;
+
+  // Team list is tenant-aware on the backend and cheap (1 row/team). Loading
+  // it here lets every authenticated page share one picker state without
+  // re-fetching per route.
+  const teamList = await serverApiOptional<TeamListResponse>("/teams");
+  const teams = teamList?.teams ?? [];
+  const cookieValue = (await cookies()).get(ACTIVE_TEAM_COOKIE)?.value;
+  const activeTeamId = resolveActiveTeamId(cookieValue, teams);
+
+  return (
+    <AppShell user={user} teams={teams} activeTeamId={activeTeamId}>
+      {children}
+    </AppShell>
+  );
 }

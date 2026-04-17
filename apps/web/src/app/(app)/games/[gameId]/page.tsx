@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { serverApiOptional } from "@/lib/api-server";
 import type { GameSummary } from "@/lib/contract";
 import { GameEditForm } from "./game-edit-form";
+import { GameVideosList } from "./game-videos-list";
 
 export default async function GameDetailPage({
   params,
@@ -19,15 +20,20 @@ export default async function GameDetailPage({
 
   return (
     <section className="space-y-6">
+      <nav aria-label="Breadcrumb" className="flex flex-wrap gap-1 text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+        <Link href="/games" className="hover:underline">
+          All games
+        </Link>
+        <span>/</span>
+        <Link href={`/teams/${game.team_id}`} className="hover:underline">
+          Team
+        </Link>
+        <span>/</span>
+        <span className="text-[color:var(--color-nbu-text)]">Game</span>
+      </nav>
       <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <Link
-            href="/games"
-            className="text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)] hover:underline"
-          >
-            ← All games
-          </Link>
-          <h1 className="mt-2 text-2xl font-semibold tracking-tight">
+          <h1 className="text-2xl font-semibold tracking-tight">
             {game.is_home ? "vs" : "@"} {game.opponent_name ?? "(opponent TBD)"}
           </h1>
           <p className="text-sm text-[color:var(--color-nbu-text-muted)]">
@@ -76,6 +82,8 @@ export default async function GameDetailPage({
           </dd>
         </div>
       </dl>
+
+      <GameVideosList gameId={game.id} />
 
       <GameEditForm game={game} />
     </section>

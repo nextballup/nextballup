@@ -3,23 +3,33 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
+import { BrandLink } from "@/components/brand-link";
+import { TeamPicker } from "@/components/team-picker";
 import { apiVoid } from "@/lib/api-client";
-import type { UserPublic } from "@/lib/contract";
+import type { TeamListEntry, UserPublic } from "@/lib/contract";
 
-const NAV_ITEMS: Array<{ href: string; label: string }> = [
+const BASE_NAV_ITEMS: Array<{ href: string; label: string }> = [
   { href: "/games", label: "Games" },
+  { href: "/teams", label: "Teams" },
 ];
+const ADMIN_NAV_ITEM = { href: "/admin/audit", label: "Audit" };
 
 export function AppShell({
   user,
+  teams,
+  activeTeamId,
   children,
 }: {
   user: UserPublic;
+  teams: TeamListEntry[];
+  activeTeamId: string | null;
   children: React.ReactNode;
 }) {
   const router = useRouter();
   const pathname = usePathname();
   const [loggingOut, setLoggingOut] = useState(false);
+  const navItems =
+    user.role === "admin" ? [...BASE_NAV_ITEMS, ADMIN_NAV_ITEM] : BASE_NAV_ITEMS;
 
   async function handleLogout() {
     setLoggingOut(true);
@@ -39,13 +49,11 @@ export function AppShell({
   return (
     <div className="flex min-h-screen flex-col">
       <header className="border-b border-[color:var(--color-nbu-border)]">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3">
-          <div className="flex items-center gap-6">
-            <Link href="/games" className="text-lg font-semibold tracking-tight">
-              NextBallUp
-            </Link>
+        <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+          <div className="flex flex-wrap items-center gap-4">
+            <BrandLink href="/games" size="sm" />
             <nav aria-label="Primary" className="hidden gap-4 sm:flex">
-              {NAV_ITEMS.map((item) => {
+              {navItems.map((item) => {
                 const active =
                   pathname === item.href || pathname.startsWith(`${item.href}/`);
                 return (
@@ -64,12 +72,13 @@ export function AppShell({
               })}
             </nav>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <TeamPicker teams={teams} activeTeamId={activeTeamId} />
             <div className="hidden text-right text-xs sm:block">
               <div className="font-medium">{user.full_name}</div>
               <div className="text-[color:var(--color-nbu-text-muted)]">
                 {user.role}
-                {user.teams.length > 0 ? ` · ${user.teams.length} team${user.teams.length > 1 ? "s" : ""}` : ""}
+                {teams.length > 0 ? ` · ${teams.length} team${teams.length > 1 ? "s" : ""}` : ""}
               </div>
             </div>
             <button
@@ -82,6 +91,25 @@ export function AppShell({
             </button>
           </div>
         </div>
+        <nav aria-label="Primary-mobile" className="flex gap-4 border-t border-[color:var(--color-nbu-border)] px-4 py-2 text-sm sm:hidden">
+          {navItems.map((item) => {
+            const active =
+              pathname === item.href || pathname.startsWith(`${item.href}/`);
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                className={`transition ${
+                  active
+                    ? "font-semibold"
+                    : "text-[color:var(--color-nbu-text-muted)] hover:text-[color:var(--color-nbu-text)]"
+                }`}
+              >
+                {item.label}
+              </Link>
+            );
+          })}
+        </nav>
       </header>
       <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-6">{children}</main>
     </div>

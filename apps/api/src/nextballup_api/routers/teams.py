@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -42,10 +42,13 @@ from nextballup_core.schemas.team import (
     JoinTeamResponse,
     TeamCreatedResponse,
     TeamDetailResponse,
+    TeamListEntry,
+    TeamListResponse,
     TeamMembersResponse,
     TeamMemberSummary,
 )
 from nextballup_core.settings import Settings
+from nextballup_db.models.game import Game
 from nextballup_db.models.team import Team, TeamInvite, TeamMembership
 from nextballup_db.models.user import User
 
@@ -56,9 +59,16 @@ _PLAYER_SEAT_ROLES: frozenset[TeamRole] = frozenset({TeamRole.PLAYER, TeamRole.C
 _STAFF_SEAT_ROLES: frozenset[TeamRole] = frozenset(
     {TeamRole.HEAD_COACH, TeamRole.ASSISTANT_COACH, TeamRole.MANAGER}
 )
+_COACH_SEAT_ROLES: frozenset[TeamRole] = frozenset({TeamRole.HEAD_COACH, TeamRole.ASSISTANT_COACH})
 
 
-def _team_summary_fields(team: Team) -> dict[str, object]:
+def _can_view_invite_code(*, current_user: User, team_role: TeamRole | None) -> bool:
+    if current_user.role is UserRole.ADMIN:
+        return True
+    return team_role in _COACH_SEAT_ROLES
+
+
+def _team_summary_fields(team: Team, *, invite_code: str | None) -> dict[str, object]:
     return {
         "id": team.id,
         "name": team.name,
@@ -67,7 +77,7 @@ def _team_summary_fields(team: Team) -> dict[str, object]:
         "institution": team.institution,
         "institution_type": team.institution_type,
         "season": team.season,
-        "invite_code": team.invite_code,
+        "invite_code": invite_code,
     }
 
 
@@ -179,6 +189,92 @@ async def _load_team_with_memberships(session: AsyncSession, team_id: uuid.UUID)
     return result.scalar_one_or_none()
 
 
+@router.get("", response_model=TeamListResponse)
+async def list_my_teams(
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TeamListResponse:
+    """List teams the caller currently belongs to.
+
+    The team picker on the frontend is the only required caller, so we keep
+    the contract minimal: one entry per active membership, with member/game
+    counts and the caller's team role. `invite_code` is only disclosed to
+    coaches — players don't need to see codes they aren't allowed to hand
+    out.
+
+    RLS enforcement: `team_memberships_select_access` admits rows where
+    `user_id = app.current_user_id`, which `get_current_user` already set.
+    `teams_select_access` and `games_select_access` admit via the membership
+    EXISTS check, so we do *not* need to bind per-team `app.current_team_id`
+    to read the summary. Member counting does need per-team context (the
+    membership policy returns only self-rows otherwise), so that runs in a
+    small N+1 loop keyed by team id -- at typical user scales (1-5 teams)
+    the extra round-trips are negligible.
+    """
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+
+    my_memberships_stmt = (
+        select(TeamMembership, Team)
+        .join(Team, Team.id == TeamMembership.team_id)
+        .where(
+            TeamMembership.user_id == current_user.id,
+            TeamMembership.is_active.is_(True),
+            Team.is_active.is_(True),
+        )
+        .order_by(Team.name)
+    )
+    rows = (await session.execute(my_memberships_stmt)).all()
+
+    entries: list[TeamListEntry] = []
+    for membership, team in rows:
+        # Per-team context so team_memberships_select_access admits every
+        # active member of this team, not just self.
+        await set_tenant_context(session, team.id)
+        member_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(TeamMembership)
+                .where(
+                    TeamMembership.team_id == team.id,
+                    TeamMembership.is_active.is_(True),
+                )
+            )
+            or 0
+        )
+        game_count = int(
+            await session.scalar(
+                select(func.count()).select_from(Game).where(Game.team_id == team.id)
+            )
+            or 0
+        )
+        entries.append(
+            TeamListEntry(
+                id=team.id,
+                name=team.name,
+                sport=team.sport,
+                level=team.level,
+                institution=team.institution,
+                institution_type=team.institution_type,
+                season=team.season,
+                invite_code=(
+                    team.invite_code
+                    if _can_view_invite_code(
+                        current_user=current_user,
+                        team_role=membership.team_role,
+                    )
+                    else None
+                ),
+                my_team_role=membership.team_role,
+                member_count=member_count,
+                game_count=game_count,
+            )
+        )
+    await clear_tenant_context(session)
+    return TeamListResponse(teams=entries)
+
+
 @router.post(
     "",
     response_model=TeamCreatedResponse,
@@ -235,7 +331,7 @@ async def create_team(
     await session.refresh(team)
 
     return TeamCreatedResponse(
-        **_team_summary_fields(team),
+        **_team_summary_fields(team, invite_code=team.invite_code),
         created_at=team.created_at,
         member_count=1,
     )
@@ -477,7 +573,17 @@ async def join_team(
     await session.refresh(membership)
 
     return JoinTeamResponse(
-        **_team_summary_fields(team),
+        **_team_summary_fields(
+            team,
+            invite_code=(
+                team.invite_code
+                if _can_view_invite_code(
+                    current_user=current_user,
+                    team_role=membership.team_role,
+                )
+                else None
+            ),
+        ),
         membership=_member_summary(membership, current_user),
     )
 
@@ -500,8 +606,29 @@ async def get_team(
     members = [
         _member_summary(m, m.user) for m in full.memberships if m.is_active and m.user is not None
     ]
+    my_membership = next(
+        (
+            membership
+            for membership in full.memberships
+            if membership.user_id == current_user.id and membership.is_active
+        ),
+        None,
+    )
+    if my_membership is None:  # pragma: no cover -- guarded by require_team_member above
+        raise ForbiddenError("Membership required", code=ErrorCode.FORBIDDEN)
     return TeamDetailResponse(
-        **_team_summary_fields(full),
+        **_team_summary_fields(
+            full,
+            invite_code=(
+                full.invite_code
+                if _can_view_invite_code(
+                    current_user=current_user,
+                    team_role=my_membership.team_role,
+                )
+                else None
+            ),
+        ),
+        my_team_role=my_membership.team_role,
         members=members,
         member_count=len(members),
     )

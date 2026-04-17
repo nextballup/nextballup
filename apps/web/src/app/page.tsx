@@ -1,14 +1,27 @@
+import Image from "next/image";
 import Link from "next/link";
 
 export default function LandingPage() {
   return (
     <main className="flex min-h-screen items-center justify-center p-8">
       <div className="max-w-xl text-center">
-        <h1 className="mb-4 bg-gradient-to-br from-green-500 via-blue-500 to-purple-500 bg-clip-text text-5xl font-bold text-transparent">
+        <div className="mb-6 flex justify-center">
+          <div className="relative h-28 w-28">
+            <Image
+              src="/brand/logo-color-transparent.png"
+              alt="NextBallUp logo"
+              fill
+              priority
+              sizes="112px"
+              className="object-contain"
+            />
+          </div>
+        </div>
+        <h1 className="mb-4 text-5xl font-bold tracking-tight text-[color:var(--color-nbu-text)]">
           NextBallUp
         </h1>
         <p className="mb-8 text-lg text-[color:var(--color-nbu-text-muted)]">
-          Hidden impact metrics beyond box scores.
+          Upload, archive, and review game film with your team.
         </p>
         <div className="flex justify-center gap-4">
           <Link

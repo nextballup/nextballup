@@ -244,6 +244,7 @@ async def test_player_joins_team_via_default_invite_code(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["id"] == team["id"]
+    assert body["invite_code"] is None
     assert body["membership"]["jersey_number"] == 23
     assert body["membership"]["team_role"] == "player"
 
@@ -415,6 +416,8 @@ async def test_member_can_read_team_detail(client: AsyncClient) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["id"] == team["id"]
+    assert body["invite_code"] == team["invite_code"]
+    assert body["my_team_role"] == "head_coach"
     assert body["member_count"] == 1
     assert len(body["members"]) == 1
     assert body["members"][0]["team_role"] == "head_coach"
@@ -428,6 +431,29 @@ async def test_non_member_cannot_read_team_detail(client: AsyncClient) -> None:
     await _register(client, _coach_payload("snoop-detail@example.com"))
     response = await client.get(f"{API}/teams/{team['id']}")
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_player_member_can_read_team_detail_without_invite_code(client: AsyncClient) -> None:
+    coach = _coach_payload("detail-owner@example.com")
+    await _register(client, coach)
+    team = (await client.post(f"{API}/teams", json=_team_create_body())).json()
+
+    player = _player_payload("detail-player@example.com")
+    await _register(client, player)
+    join = await client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 14},
+    )
+    assert join.status_code == 200, join.text
+
+    response = await client.get(f"{API}/teams/{team['id']}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == team["id"]
+    assert body["my_team_role"] == "player"
+    assert body["invite_code"] is None
+    assert body["member_count"] == 2
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -551,6 +577,108 @@ async def test_two_coaches_cannot_access_each_others_teams(
 
 
 # ---- Independent client to verify no fixture cross-contamination ----------
+
+
+# ---- GET /teams -----------------------------------------------------------
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_list_my_teams_returns_teams_with_role_and_counts(
+    client: AsyncClient,
+) -> None:
+    coach = _coach_payload("list-coach@example.com")
+    await _register(client, coach)
+    team = (await client.post(f"{API}/teams", json=_team_create_body())).json()
+
+    await _register(client, _player_payload("list-player@example.com"))
+    join = await client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 7},
+    )
+    assert join.status_code == 200, join.text
+
+    await _login(client, coach["email"], coach["password"])
+    response = await client.get(f"{API}/teams")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["teams"]) == 1
+    entry = body["teams"][0]
+    assert entry["id"] == team["id"]
+    assert entry["my_team_role"] == "head_coach"
+    assert entry["member_count"] == 2
+    assert entry["game_count"] == 0
+    # Coaches see the team's invite code.
+    assert entry["invite_code"] == team["invite_code"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_list_my_teams_hides_invite_code_from_players(client: AsyncClient) -> None:
+    coach = _coach_payload("hide-coach@example.com")
+    await _register(client, coach)
+    team = (await client.post(f"{API}/teams", json=_team_create_body())).json()
+
+    player = _player_payload("hide-player@example.com")
+    await _register(client, player)
+    join = await client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 11},
+    )
+    assert join.status_code == 200
+
+    # Player now lists their teams — should not see the invite_code.
+    await _login(client, player["email"], player["password"])
+    response = await client.get(f"{API}/teams")
+    assert response.status_code == 200
+    entry = response.json()["teams"][0]
+    assert entry["my_team_role"] == "player"
+    assert entry["invite_code"] is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_list_my_teams_returns_empty_for_team_less_user(client: AsyncClient) -> None:
+    await _register(client, _player_payload("solo-player@example.com"))
+    response = await client.get(f"{API}/teams")
+    assert response.status_code == 200
+    assert response.json() == {"teams": []}
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_list_my_teams_requires_authentication(client: AsyncClient) -> None:
+    client.cookies.clear()
+    response = await client.get(f"{API}/teams")
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_list_my_teams_does_not_leak_other_teams(client: AsyncClient) -> None:
+    coach_a = _coach_payload("leaky-coach-a@example.com")
+    await _register(client, coach_a)
+    await client.post(f"{API}/teams", json=_team_create_body(name="Team A"))
+
+    coach_b = _coach_payload("leaky-coach-b@example.com")
+    await _register(client, coach_b)
+    response = await client.get(f"{API}/teams")
+    # Coach B just registered and hasn't created/joined a team yet.
+    assert response.status_code == 200
+    assert response.json() == {"teams": []}
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_list_my_teams_works_under_force_rls(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    coach = _coach_payload("list-force-coach@example.com")
+    await _register(client, coach)
+    team = (await client.post(f"{API}/teams", json=_team_create_body(name="Force RLS List"))).json()
+    await _force_team_rls(db_session)
+
+    await _login(client, coach["email"], coach["password"])
+    response = await client.get(f"{API}/teams")
+    assert response.status_code == 200
+    teams = response.json()["teams"]
+    assert len(teams) == 1
+    assert teams[0]["id"] == team["id"]
+    assert teams[0]["member_count"] == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")

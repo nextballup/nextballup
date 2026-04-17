@@ -81,10 +81,11 @@ class TeamSummary(BaseModel):
     institution: str | None
     institution_type: InstitutionType
     season: str
-    invite_code: str
+    invite_code: str | None
 
 
 class TeamDetailResponse(TeamSummary):
+    my_team_role: TeamRole
     members: list[TeamMemberSummary]
     member_count: int
 
@@ -96,3 +97,26 @@ class TeamMembersResponse(BaseModel):
 
 class JoinTeamResponse(TeamSummary):
     membership: TeamMemberSummary
+
+
+class TeamListEntry(BaseModel):
+    """Entry in `GET /teams` — includes the caller's role-in-team + counts.
+
+    `invite_code` is only populated when the caller is a coach on that team.
+    Players don't need to see codes they aren't allowed to hand out."""
+
+    id: uuid.UUID
+    name: str
+    sport: Sport
+    level: TeamLevel
+    institution: str | None
+    institution_type: InstitutionType
+    season: str
+    invite_code: str | None
+    my_team_role: TeamRole
+    member_count: int
+    game_count: int
+
+
+class TeamListResponse(BaseModel):
+    teams: list[TeamListEntry]

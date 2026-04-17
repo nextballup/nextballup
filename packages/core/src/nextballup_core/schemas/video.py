@@ -108,3 +108,59 @@ class VideoStatusResponse(BaseModel):
     stage: str | None
     progress_percent: int
     stages: dict[str, ProcessingStageStatus]
+
+
+class VideoListItem(BaseModel):
+    """Lightweight row in `GET /games/{id}/videos`.
+
+    The summary deliberately omits signed playback URLs: those require a full
+    auth+storage round-trip and should only be issued on demand from
+    `GET /videos/{id}`.
+    """
+
+    id: uuid.UUID
+    filename: str
+    status: VideoStatus
+    file_size_bytes: int | None = None
+    duration_seconds: float | None = None
+    camera_position: CameraPosition | None = None
+    camera_height: CameraHeight | None = None
+    created_at: datetime
+
+
+class VideoListResponse(BaseModel):
+    videos: list[VideoListItem]
+    total: int
+
+
+class PlaybackVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, max_length=4096)
+
+
+class PlaybackVerifyResponse(BaseModel):
+    """Minimal proof the caller's playback token is still tied to a live
+    session + membership. Clients treat a 200 as 'keep playing' and a 401 as
+    'drop the stream and re-auth'."""
+
+    video_id: uuid.UUID
+    expires_at: datetime
+
+
+class RequeueProcessingRequest(BaseModel):
+    """Admin-only request to reset a processing job back to PENDING so the
+    beat dispatcher picks it back up. The `stage` argument is required so
+    operators don't accidentally requeue every failed stage for a video —
+    the recovery story for each stage is different."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str = Field(min_length=1, max_length=64)
+
+
+class RequeueProcessingResponse(BaseModel):
+    job_id: uuid.UUID
+    stage: str
+    status: str
+    requeued_at: datetime
