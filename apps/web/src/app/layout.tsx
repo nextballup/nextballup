@@ -4,7 +4,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "NextBallUp",
-  description: "AI vision platform for basketball player analysis.",
+  description: "Video archive and review platform for basketball teams.",
 };
 
 export default function RootLayout({

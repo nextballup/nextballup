@@ -17,6 +17,7 @@ from nextballup_worker.errors import (
     PermanentProcessingError,
     TransientProcessingError,
 )
+from nextballup_worker.routing import queue_for_stage
 from nextballup_worker.runtime import (
     cleanup_abandoned_uploads,
     dispatch_pending_jobs,
@@ -143,6 +144,10 @@ def _ensure_runtime_broker_configured() -> None:
         raise RuntimeError(
             "CELERY_BROKER_URL must be configured before starting a worker or beat process"
         )
+    # Fail before the worker ever dequeues a job if the runtime DB role is
+    # misconfigured. In staging/production, `runtime_database_url()` refuses
+    # to fall back to the owner role because that would weaken RLS.
+    settings.runtime_database_url()
 
 
 @worker_init.connect
@@ -203,11 +208,7 @@ def dispatch_pending_jobs_task() -> list[str]:
     celery_app_local = celery_app  # local binding so mypy narrows once
 
     def _enqueue(pending_id: uuid.UUID, stage: ProcessingJobStage) -> str:
-        queue = settings.celery_transcode_queue
-        if stage is not ProcessingJobStage.TRANSCODE:
-            # Phase 4 only dispatches the transcode stage. Later phases will
-            # route by stage to dedicated GPU/CPU queues.
-            queue = settings.celery_task_default_queue
+        queue = queue_for_stage(stage, settings)
         async_result = celery_app_local.send_task(
             _TRANSCODE_NAME,
             args=[str(pending_id)],

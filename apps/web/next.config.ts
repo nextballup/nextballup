@@ -14,25 +14,11 @@ import type { NextConfig } from "next";
  * etc.). Local default matches `docker compose up -d`.
  */
 const apiUpstream = process.env.API_UPSTREAM_URL ?? "http://localhost:8000";
-const isDev = process.env.NODE_ENV !== "production";
+// CSP is emitted per-request by `src/middleware.ts` so it can include a
+// cryptographically-random nonce that Next's runtime scripts pick up. The
+// static headers below are everything CSP-adjacent that does NOT need
+// per-request variance.
 const securityHeaders = [
-  {
-    key: "Content-Security-Policy",
-    value: [
-      "default-src 'self'",
-      "base-uri 'self'",
-      "font-src 'self' data: https:",
-      "form-action 'self'",
-      "frame-ancestors 'none'",
-      "img-src 'self' data: blob: https:",
-      "media-src 'self' blob: https:",
-      "object-src 'none'",
-      `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
-      "style-src 'self' 'unsafe-inline'",
-      `connect-src 'self' https:${isDev ? " ws: wss:" : ""}`,
-      "worker-src 'self' blob:",
-    ].join("; "),
-  },
   {
     key: "Referrer-Policy",
     value: "strict-origin-when-cross-origin",
@@ -48,6 +34,10 @@ const securityHeaders = [
   {
     key: "Permissions-Policy",
     value: "camera=(), microphone=(), geolocation=()",
+  },
+  {
+    key: "Cross-Origin-Opener-Policy",
+    value: "same-origin",
   },
 ];
 

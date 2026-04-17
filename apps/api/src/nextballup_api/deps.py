@@ -25,7 +25,12 @@ def get_app_settings() -> Settings:
 
 
 def _extract_token(request: Request, settings: Settings) -> str:
-    cookie = request.cookies.get(settings.cookie_access_name)
+    # Prefer the `__Host-`-prefixed cookie when the deployment has opted in;
+    # fall back to the bare name so an in-flight migration (prefix flipped
+    # while users have existing sessions) doesn't mass-logout clients.
+    cookie = request.cookies.get(f"__Host-{settings.cookie_access_name}") or request.cookies.get(
+        settings.cookie_access_name
+    )
     if cookie:
         return cookie
     auth_header = request.headers.get("authorization") or ""

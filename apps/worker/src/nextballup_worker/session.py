@@ -19,7 +19,7 @@ async def worker_session(settings: Settings | None = None) -> AsyncIterator[Asyn
     holding idle connections between tasks.
     """
     resolved = settings or get_settings()
-    engine = create_async_engine(resolved.database_url, poolclass=NullPool)
+    engine = create_async_engine(resolved.runtime_database_url(), poolclass=NullPool)
     sessionmaker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     try:
         async with sessionmaker() as session:

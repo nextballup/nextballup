@@ -27,10 +27,14 @@ def _build_engine(database_url: str, **kwargs: Any) -> AsyncEngine:
 
 
 def get_engine() -> AsyncEngine:
+    """Runtime engine. Uses the CRUD-only `DATABASE_URL_RUNTIME` when set so
+    the app process can't accidentally (or maliciously, via SQL injection) run
+    DDL against the owning user. Alembic keeps using `DATABASE_URL` directly
+    for migrations."""
     global _engine
     if _engine is None:
         settings = get_settings()
-        _engine = _build_engine(settings.database_url)
+        _engine = _build_engine(settings.runtime_database_url())
     return _engine
 
 

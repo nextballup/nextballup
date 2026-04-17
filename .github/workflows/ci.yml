@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (ruff, mypy, pytest)
+    runs-on: ubuntu-latest
+    # A live Postgres is required: the test suite applies Alembic migrations
+    # against `nextballup_test`, which creates RLS policies, triggers, and a
+    # runtime role. There is no in-memory substitute.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: nextballup
+          POSTGRES_PASSWORD: nextballup_dev
+          POSTGRES_DB: nextballup
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U nextballup"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      # Mirror the values conftest.py sets; harmless outside pytest because
+      # the app code only reads these when it actually connects.
+      DATABASE_URL: postgresql+asyncpg://nextballup:nextballup_dev@localhost:5432/nextballup
+      DATABASE_URL_SYNC: postgresql://nextballup:nextballup_dev@localhost:5432/nextballup
+      PGPASSWORD: nextballup_dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Bootstrap `nextballup_test` database and required extensions
+        # The dev `init-db.sql` runs inside the Postgres container at first
+        # start; in CI we invoke the same DDL against the hosted service.
+        # Kept in sync by hand — if init-db.sql grows new extensions or
+        # triggers, this block must follow.
+        run: |
+          psql -h localhost -U nextballup -d nextballup <<'SQL'
+          CREATE DATABASE nextballup_test;
+          SQL
+          for db in nextballup nextballup_test; do
+            psql -h localhost -U nextballup -d "$db" <<'SQL'
+          CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+          CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+          CREATE EXTENSION IF NOT EXISTS "btree_gist";
+          CREATE OR REPLACE FUNCTION prevent_audit_mutation()
+          RETURNS TRIGGER AS $fn$
+          BEGIN
+              RAISE EXCEPTION 'Audit log entries cannot be modified or deleted (SOC 2 control)';
+          END;
+          $fn$ LANGUAGE plpgsql;
+          SQL
+          done
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy packages apps tests
+
+      - name: Pytest
+        run: uv run pytest -q
+
+  frontend:
+    name: Frontend (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.9.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build
+        # Build verifies the production bundle is producible — catches
+        # regressions that lint/typecheck don't (CSS rebasing, Next.js
+        # static-analysis constraints, etc).
+        run: pnpm build
+        env:
+          # The build does not need to resolve a live upstream; any
+          # plausibly-shaped URL keeps the Next.js rewrites valid.
+          API_UPSTREAM_URL: http://127.0.0.1:8000
+
+  security-python:
+    name: Security (pip-audit)
+    runs-on: ubuntu-latest
+    # Dependency vulnerability scan against the locked Python workspace. We
+    # run against the resolved lock rather than the raw pyproject so a
+    # transitive CVE can't slip through unchecked.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run pip-audit
+        # `--skip-editable` keeps pip-audit from trying to look up our own
+        # first-party workspace packages on PyPI (they aren't published).
+        # We still audit every third-party dep resolved into the venv.
+        run: uv run pip-audit --skip-editable --progress-spinner off
+
+  security-node:
+    name: Security (pnpm audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.9.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm audit (high severity)
+        # `--audit-level high` mirrors what pnpm suggests as a CI gate; we
+        # keep the gate at high/critical so informational advisories (which
+        # are noisy and rarely actionable) don't block every PR. Dev-only
+        # deps are excluded — they don't ship to users.
+        run: pnpm audit --audit-level high --prod
+
+  security-secrets:
+    name: Security (gitleaks)
+    runs-on: ubuntu-latest
+    # Full-history scan on push, commit-range scan on PRs. The action fails
+    # the job on any detected secret so a leaked token never reaches main.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -82,31 +82,49 @@ class UserPublic(BaseModel):
 
 
 class RegisterResponse(BaseModel):
-    """Response shape for /auth/register per API_SPEC.md."""
+    """Response shape for /auth/register.
+
+    Tokens are delivered exclusively via httpOnly cookies (see
+    `set_auth_cookies`) — never in the JSON body. Surfacing tokens in JSON
+    would let a compromised renderer, extension, or logger exfiltrate a
+    live session even though the cookie itself is httpOnly.
+    """
 
     id: uuid.UUID
     email: EmailStr
     full_name: str
     role: UserRole
     created_at: datetime
-    access_token: str
-    refresh_token: str
 
 
 class LoginResponse(BaseModel):
-    """Response shape for /auth/login per API_SPEC.md."""
+    """Response shape for /auth/login.
 
-    access_token: str
-    refresh_token: str
+    Cookie-only transport: the browser picks up the access and refresh
+    cookies from ``Set-Cookie`` and never sees the JWT itself. Non-browser
+    API clients can read the same cookies off the response.
+    """
+
     user: UserPublic
 
 
 class RefreshRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    """Refresh is cookie-only; the body is required but has no fields.
 
-    refresh_token: str | None = None
+    We still accept a JSON body because browsers that fire XHR/fetch POSTs
+    with `Content-Type: application/json` send an empty object, and keeping
+    the model makes future extension (device binding, step-up hints)
+    cheap. A legacy JSON refresh_token is rejected by `extra="forbid"`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class RefreshResponse(BaseModel):
-    access_token: str
-    refresh_token: str
+    """Successful refresh rotates tokens into the cookie jar.
+
+    The body is intentionally minimal — the browser doesn't need tokens
+    echoed back to know the call succeeded.
+    """
+
+    refreshed_at: datetime

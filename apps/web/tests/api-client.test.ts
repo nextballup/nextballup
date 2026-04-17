@@ -64,7 +64,7 @@ describe("apiJson", () => {
         return HttpResponse.json({ id: "abc", status: "processed" });
       }),
       http.post("/api/v1/auth/refresh", () =>
-        HttpResponse.json({ access_token: "a", refresh_token: "r" }),
+        HttpResponse.json({ refreshed_at: "2026-04-16T00:00:00Z" }),
       ),
     );
     const response = await apiJson<{ id: string; status: string }>(
@@ -93,5 +93,43 @@ describe("apiJson", () => {
       }),
     ).rejects.toBeInstanceOf(ApiError);
     expect(loginCalls).toBe(1);
+  });
+
+  it("mirrors the CSRF cookie into X-CSRF-Token on mutating requests", async () => {
+    const original = document.cookie;
+    // jsdom cookie jar: set directly so readCsrfCookie can see it.
+    document.cookie = "nbu_csrf_token=abc-csrf-123";
+    let seenCsrf: string | null = null;
+    server.use(
+      http.patch("/api/v1/games/g1", ({ request }) => {
+        seenCsrf = request.headers.get("X-CSRF-Token");
+        return HttpResponse.json({ id: "g1", status: "scheduled" });
+      }),
+    );
+    try {
+      await apiJson("/games/g1", { method: "PATCH", json: { status: "scheduled" } });
+      expect(seenCsrf).toBe("abc-csrf-123");
+    } finally {
+      document.cookie = "nbu_csrf_token=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+      // Restore any prior cookies (e.g. if tests later add auth cookies).
+      if (original) document.cookie = original;
+    }
+  });
+
+  it("does not attach X-CSRF-Token on GET requests", async () => {
+    document.cookie = "nbu_csrf_token=should-not-leak";
+    let seenCsrf: string | null | undefined = undefined;
+    server.use(
+      http.get("/api/v1/games/g2", ({ request }) => {
+        seenCsrf = request.headers.get("X-CSRF-Token");
+        return HttpResponse.json({ id: "g2" });
+      }),
+    );
+    try {
+      await apiJson("/games/g2");
+      expect(seenCsrf).toBeNull();
+    } finally {
+      document.cookie = "nbu_csrf_token=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+    }
   });
 });

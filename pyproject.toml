@@ -1,7 +1,7 @@
 [project]
 name = "nextballup"
 version = "0.1.0"
-description = "AI vision platform for basketball player analysis — hidden impact metrics beyond box scores"
+description = "Production-minded basketball film archive and review platform foundation"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = { text = "Proprietary" }

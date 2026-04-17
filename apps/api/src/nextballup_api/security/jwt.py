@@ -96,6 +96,8 @@ def create_refresh_token(
 def create_playback_token(
     *,
     subject: uuid.UUID,
+    role: UserRole,
+    session_version: int,
     video_id: uuid.UUID,
     team_id: uuid.UUID,
     expires_in: timedelta | None = None,
@@ -103,10 +105,10 @@ def create_playback_token(
 ) -> tuple[str, datetime]:
     """Mint a short-lived JWT scoped to a single video for the given user.
 
-    The presigned storage URL is the actual access boundary; this token is the
-    forward-compat hook for a future `/videos/{id}/playback/verify` endpoint
-    that will let session-aware revocation gate playback. We emit it now so
-    clients can store it next to the URL and the API contract stays stable.
+    `sv` (session_version) + `role` are included so the verify endpoint can
+    cross-check them against the live user record; a subsequent logout bumps
+    session_version and invalidates any still-live playback token without
+    having to revoke presigned URLs individually.
     """
     settings = settings or get_settings()
     ttl = expires_in or timedelta(seconds=settings.playback_token_expire_seconds)
@@ -114,6 +116,8 @@ def create_playback_token(
     expires_at = now + ttl
     claims: dict[str, Any] = {
         "sub": str(subject),
+        "role": role.value,
+        "sv": session_version,
         "type": "playback",
         "aud": settings.playback_token_audience,
         "vid": str(video_id),
@@ -162,13 +166,15 @@ def decode_token(
         raise AuthenticationError("Malformed token id")
     if not isinstance(decoded.get("iat"), int):
         raise AuthenticationError("Malformed token issue time")
-    # session_version is only present on access/refresh tokens; playback
-    # tokens carry vid/tid instead.
-    if expected_type in ("access", "refresh") and not isinstance(decoded.get("sv"), int):
+    # All token types now carry `sv`; playback adds vid/tid/role for the
+    # verify endpoint to cross-check against the live user + membership row.
+    if not isinstance(decoded.get("sv"), int):
         raise AuthenticationError("Malformed session version")
     if expected_type == "playback":
         if not isinstance(decoded.get("vid"), str):
             raise AuthenticationError("Malformed playback subject")
         if not isinstance(decoded.get("tid"), str):
             raise AuthenticationError("Malformed playback tenant")
+        if not isinstance(decoded.get("role"), str):
+            raise AuthenticationError("Malformed playback role")
     return decoded
