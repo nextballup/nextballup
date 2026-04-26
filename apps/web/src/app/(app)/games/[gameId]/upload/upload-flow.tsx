@@ -91,6 +91,19 @@ export function UploadFlow({ gameId }: { gameId: string }) {
       return;
     }
 
+    let checksum: string | undefined;
+    if (file.size <= CHECKSUM_MAX_BYTES && typeof crypto?.subtle?.digest === "function") {
+      setPhase({ kind: "hashing", percent: 0 });
+      try {
+        const computedChecksum = await computeSha256Hex(file, (percent) =>
+          setPhase({ kind: "hashing", percent }),
+        );
+        checksum = computedChecksum ?? undefined;
+      } catch {
+        checksum = undefined;
+      }
+    }
+
     setPhase({ kind: "presigning" });
     let presign: CreateUploadResponse;
     try {
@@ -101,6 +114,7 @@ export function UploadFlow({ gameId }: { gameId: string }) {
           filename: file.name,
           file_size_bytes: file.size,
           content_type: contentType,
+          ...(checksum ? { checksum_sha256: checksum } : {}),
           camera_position: cameraPosition,
           camera_height: cameraHeight,
         },
@@ -117,7 +131,9 @@ export function UploadFlow({ gameId }: { gameId: string }) {
     }
 
     setPhase({ kind: "uploading", percent: 0 });
-    let completePayload: Record<string, unknown> = {};
+    let completePayload: Record<string, unknown> = checksum
+      ? { checksum_sha256: checksum }
+      : {};
 
     if (presign.upload_method === "PUT") {
       if (!presign.upload_url) {
@@ -185,26 +201,6 @@ export function UploadFlow({ gameId }: { gameId: string }) {
         message: `Unsupported upload method "${presign.upload_method}".`,
       });
       return;
-    }
-
-    // Storage upload succeeded. Before finalizing, compute a SHA-256 over the
-    // file so the backend has a client-attested integrity tag alongside the
-    // S3 ETag + size check. Skipped for very large files (see
-    // CHECKSUM_MAX_BYTES): WebCrypto has no streaming digest API, and loading
-    // a multi-GB video into a single ArrayBuffer is not safe in a browser tab.
-    if (file.size <= CHECKSUM_MAX_BYTES && typeof crypto?.subtle?.digest === "function") {
-      setPhase({ kind: "hashing", percent: 0 });
-      try {
-        const checksum = await computeSha256Hex(file, (percent) =>
-          setPhase({ kind: "hashing", percent }),
-        );
-        if (checksum) {
-          completePayload = { ...completePayload, checksum_sha256: checksum };
-        }
-      } catch {
-        // Hashing is best-effort; a failure here should not fail the upload.
-        // The backend's size + ETag checks remain the binding integrity floor.
-      }
     }
 
     setPhase({ kind: "finalizing" });
@@ -415,6 +411,10 @@ function phaseBodyLabel(phase: Phase): string {
 
 type PutResult = { success: true } | { success: false; message?: string };
 
+function clampPercent(value: number): number {
+  return Math.max(0, Math.min(100, value));
+}
+
 function uploadViaPut({
   url,
   headers,
@@ -437,7 +437,7 @@ function uploadViaPut({
     }
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
-        onProgress(Math.round((event.loaded / event.total) * 100));
+        onProgress(clampPercent(Math.round((event.loaded / event.total) * 100)));
       }
     };
     xhr.onload = () => {
@@ -500,10 +500,7 @@ async function uploadMultipart({
 
   const report = () => {
     const loaded = loadedByIndex.reduce((a, b) => a + b, 0);
-    const percent = Math.max(
-      0,
-      Math.min(100, Math.round((loaded / totalBytes) * 100)),
-    );
+    const percent = clampPercent(Math.round((loaded / totalBytes) * 100));
     onProgress(percent, `Uploading ${sortedParts.length} parts to storage`);
   };
 
@@ -529,7 +526,7 @@ async function uploadMultipart({
         body: slice,
         pool,
         onProgress: (loaded) => {
-          loadedByIndex[i] = loaded;
+          loadedByIndex[i] = Math.max(0, Math.min(loaded, slice.size));
           report();
         },
       });

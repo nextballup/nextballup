@@ -1,17 +1,7 @@
 import Link from "next/link";
 import { serverApiOptional } from "@/lib/api-server";
-import type { VideoListResponse, VideoStatus } from "@/lib/contract";
-
-const STATUS_LABELS: Record<VideoStatus, string> = {
-  pending_upload: "Awaiting upload",
-  uploading: "Uploading",
-  uploaded: "Uploaded",
-  transcoding: "Transcoding",
-  queued: "Queued",
-  processing: "Processing",
-  processed: "Ready",
-  failed: "Failed",
-};
+import type { VideoListResponse } from "@/lib/contract";
+import { PLAYBACK_STATUS_LABELS } from "@/lib/video-status";
 
 function formatBytes(bytes: number | null): string {
   if (bytes == null) return "—";
@@ -75,7 +65,7 @@ export async function GameVideosList({ gameId }: { gameId: string }) {
                 </div>
               </div>
               <span className="rounded-full border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
-                {STATUS_LABELS[video.status] ?? video.status}
+                {PLAYBACK_STATUS_LABELS[video.playback_status] ?? video.playback_status}
               </span>
             </li>
           ))}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import nextballup_api.routers.auth as auth_router
 import pytest
 from fastapi import Response
 from httpx import AsyncClient
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.settings import Settings
 from nextballup_db.models.audit import AuditLog
+from nextballup_db.models.auth import RefreshSession
 from nextballup_db.models.user import User
 
 API = "/api/v1"
@@ -243,6 +245,22 @@ async def test_me_accepts_bearer_token(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_me_rejects_cookie_and_bearer_ambiguity(client: AsyncClient) -> None:
+    payload = _register_payload("ambiguous-auth@example.com")
+    register = await client.post(f"{API}/auth/register", json=payload)
+    assert register.status_code == 201
+    access_token = register.cookies.get("nbu_access_token")
+    assert access_token
+
+    response = await client.get(
+        f"{API}/auth/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == ErrorCode.UNAUTHENTICATED
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_me_rejects_unauthenticated_request(client: AsyncClient) -> None:
     response = await client.get(f"{API}/auth/me")
     assert response.status_code == 401
@@ -267,6 +285,8 @@ async def test_refresh_rotates_tokens_from_cookie(
     assert register.status_code == 201
     original_refresh = register.cookies.get("nbu_refresh_token")
     assert original_refresh
+    user = await db_session.scalar(select(User).where(User.email == payload["email"]))
+    assert user is not None
 
     response = await client.post(f"{API}/auth/refresh", json={})
     assert response.status_code == 200
@@ -287,6 +307,74 @@ async def test_refresh_rotates_tokens_from_cookie(
 
     actions = await _audit_actions(db_session, str(payload["email"]))
     assert AuditAction.USER_REFRESH_SUCCEEDED in actions
+
+    sessions = (
+        (
+            await db_session.execute(
+                select(RefreshSession)
+                .where(RefreshSession.user_id == user.id)
+                .order_by(RefreshSession.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(sessions) == 2
+    rotated = [row for row in sessions if row.revoked_reason == "rotated"]
+    active = [row for row in sessions if row.revoked_at is None]
+    assert len(rotated) == 1
+    assert rotated[0].revoked_at is not None
+    assert len(active) == 1
+
+    # Replaying the consumed cookie must fail even though the JWT has not
+    # expired and the user's session_version has not changed.
+    client.cookies.clear()
+    client.cookies.set("nbu_refresh_token", original_refresh)
+    replay = await client.post(f"{API}/auth/refresh", json={})
+    assert replay.status_code == 401
+
+    await db_session.refresh(user)
+    assert user.session_version == 2
+    replay_sessions = (
+        (await db_session.execute(select(RefreshSession).where(RefreshSession.user_id == user.id)))
+        .scalars()
+        .all()
+    )
+    assert all(row.revoked_at is not None for row in replay_sessions)
+    assert any(row.revoked_reason == "replay_detected" for row in replay_sessions)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_refresh_rolls_back_rotation_when_token_issue_fails(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _register_payload("refresh-issue-failure@example.com")
+    register = await client.post(f"{API}/auth/register", json=payload)
+    assert register.status_code == 201
+    user = await db_session.scalar(select(User).where(User.email == payload["email"]))
+    assert user is not None
+    user_id = user.id
+    original_session = await db_session.scalar(
+        select(RefreshSession).where(RefreshSession.user_id == user_id)
+    )
+    assert original_session is not None
+
+    def fail_issue_tokens(*args: object, **kwargs: object) -> tuple[str, str, str, object]:
+        raise RuntimeError("token signing unavailable")
+
+    monkeypatch.setattr(auth_router, "_issue_tokens", fail_issue_tokens)
+    with pytest.raises(RuntimeError, match="token signing unavailable"):
+        await client.post(f"{API}/auth/refresh", json={})
+
+    await db_session.refresh(original_session)
+    assert original_session.revoked_at is None
+    assert original_session.revoked_reason is None
+    sessions = (
+        (await db_session.execute(select(RefreshSession).where(RefreshSession.user_id == user_id)))
+        .scalars()
+        .all()
+    )
+    assert len(sessions) == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")

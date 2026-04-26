@@ -59,6 +59,8 @@ class Game(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     periods: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
     period_length_minutes: Mapped[int] = mapped_column(Integer, default=8, nullable=False)
+    shot_clock_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    shot_clock_seconds: Mapped[int | None] = mapped_column(Integer)
     score_team: Mapped[int | None] = mapped_column(Integer)
     score_opponent: Mapped[int | None] = mapped_column(Integer)
     notes: Mapped[str | None] = mapped_column(String(2000))

@@ -9,6 +9,8 @@ operator tools pointed at the bare origin, etc.).
 
 from __future__ import annotations
 
+import json
+
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
@@ -20,6 +22,18 @@ def _hsts_value() -> str:
     # 180 days + preload-eligible values. `includeSubDomains` is safe because
     # the API is never served on a parent domain shared with unaware sites.
     return "max-age=15552000; includeSubDomains"
+
+
+def _report_to_value(request: Request) -> str:
+    endpoint = str(request.url.replace(path="/api/v1/_csp-report", query=""))
+    return json.dumps(
+        {
+            "group": "csp-endpoint",
+            "max_age": 10886400,
+            "endpoints": [{"url": endpoint}],
+        },
+        separators=(",", ":"),
+    )
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -46,8 +60,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # document origin, so a tight CSP is essentially free insurance.
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; "
+            "report-uri /api/v1/_csp-report; report-to csp-endpoint",
         )
+        response.headers.setdefault("Report-To", _report_to_value(request))
         # Cross-origin isolation for the API origin.
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
         response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")

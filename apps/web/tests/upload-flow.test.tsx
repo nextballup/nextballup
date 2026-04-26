@@ -10,6 +10,8 @@ vi.mock("next/navigation", () => ({
 }));
 
 class MockXHR {
+  static overReportBytes = 0;
+  static delayLoad = false;
   upload = { onprogress: null as null | ((e: ProgressEvent) => void) };
   status = 0;
   onload: null | (() => void) = null;
@@ -22,10 +24,18 @@ class MockXHR {
       { lengthComputable: true, loaded: 50, total: 100 } as ProgressEvent,
     );
     this.upload.onprogress?.(
-      { lengthComputable: true, loaded: 100, total: 100 } as ProgressEvent,
+      {
+        lengthComputable: true,
+        loaded: 100 + MockXHR.overReportBytes,
+        total: 100,
+      } as ProgressEvent,
     );
     this.status = 200;
-    this.onload?.();
+    if (MockXHR.delayLoad) {
+      window.setTimeout(() => this.onload?.(), 25);
+    } else {
+      this.onload?.();
+    }
   }
   abort() {
     this.onabort?.();
@@ -40,6 +50,8 @@ class MockXHR {
 class MultipartMockXHR {
   static calls: Array<{ url: string; partNumber?: number }> = [];
   static withheldEtag = false;
+  static overReportBytes = 0;
+  static delayLoad = false;
   upload = { onprogress: null as null | ((e: ProgressEvent) => void) };
   status = 0;
   onload: null | (() => void) = null;
@@ -64,10 +76,18 @@ class MultipartMockXHR {
   send(body: Blob) {
     const size = body.size;
     this.upload.onprogress?.(
-      { lengthComputable: true, loaded: size, total: size } as ProgressEvent,
+      {
+        lengthComputable: true,
+        loaded: size + MultipartMockXHR.overReportBytes,
+        total: size,
+      } as ProgressEvent,
     );
     this.status = 200;
-    this.onload?.();
+    if (MultipartMockXHR.delayLoad) {
+      window.setTimeout(() => this.onload?.(), 25);
+    } else {
+      this.onload?.();
+    }
   }
   abort() {
     this.onabort?.();
@@ -146,6 +166,55 @@ describe("UploadFlow", () => {
     await user.click(screen.getByRole("button", { name: /start upload/i }));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/storage isn't configured/i);
+  });
+
+  it("clamps single-PUT progress when storage over-reports bytes", async () => {
+    const originalXHR = window.XMLHttpRequest;
+    MockXHR.overReportBytes = 10_000;
+    MockXHR.delayLoad = true;
+    window.XMLHttpRequest = MockXHR as unknown as typeof XMLHttpRequest;
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            id: "single-over-report-video",
+            upload_method: "PUT",
+            upload_url: "https://signed.storage.test/single-over-report-video",
+            upload_headers: { "Content-Type": "video/mp4" },
+            upload_id: null,
+            part_size_bytes: null,
+            part_urls: null,
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          { status: 201 },
+        ),
+      ),
+      http.post("/api/v1/videos/single-over-report-video/complete", () =>
+        HttpResponse.json({
+          id: "single-over-report-video",
+          status: "queued",
+          estimated_processing_minutes: 45,
+          job_id: "job-1",
+        }),
+      ),
+    );
+
+    const user = userEvent.setup({ applyAccept: false });
+    render(<UploadFlow gameId="g1" />);
+    const file = new File([new Uint8Array(128)], "over-report.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+
+    await screen.findByText("100%");
+    expect(screen.queryByText(/-\d+%/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/(?:10[1-9]|[2-9]\d{2,})%/)).not.toBeInTheDocument();
+    await screen.findByText(/Upload complete/i);
+
+    MockXHR.overReportBytes = 0;
+    MockXHR.delayLoad = false;
+    window.XMLHttpRequest = originalXHR;
   });
 
   it("rejects files above the hard 10 GB upload cap without hitting the API", async () => {
@@ -231,6 +300,8 @@ describe("UploadFlow", () => {
     const originalXHR = window.XMLHttpRequest;
     MultipartMockXHR.calls = [];
     MultipartMockXHR.withheldEtag = false;
+    MultipartMockXHR.overReportBytes = 0;
+    MultipartMockXHR.delayLoad = false;
     window.XMLHttpRequest = MultipartMockXHR as unknown as typeof XMLHttpRequest;
 
     let completionBody: unknown = null;
@@ -292,27 +363,33 @@ describe("UploadFlow", () => {
     window.XMLHttpRequest = originalXHR;
   });
 
-  it("computes a SHA-256 checksum and forwards it to /complete after the upload", async () => {
+  it("computes a SHA-256 checksum and sends it through initiation and completion", async () => {
     const originalXHR = window.XMLHttpRequest;
     window.XMLHttpRequest = MockXHR as unknown as typeof XMLHttpRequest;
 
     let completionBody: Record<string, unknown> | null = null;
+    let initiationBody: Record<string, unknown> | null = null;
     server.use(
-      http.post("/api/v1/videos/upload", () =>
-        HttpResponse.json(
+      http.post("/api/v1/videos/upload", async ({ request }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        initiationBody = body;
+        return HttpResponse.json(
           {
             id: "checksum-video",
             upload_method: "PUT",
             upload_url: "https://signed.storage.test/checksum-video",
-            upload_headers: { "Content-Type": "video/mp4" },
+            upload_headers: {
+              "Content-Type": "video/mp4",
+              "x-amz-meta-nbu-sha256": String(body.checksum_sha256),
+            },
             upload_id: null,
             part_size_bytes: null,
             part_urls: null,
             expires_at: new Date(Date.now() + 3_600_000).toISOString(),
           },
           { status: 201 },
-        ),
-      ),
+        );
+      }),
       http.post("/api/v1/videos/checksum-video/complete", async ({ request }) => {
         completionBody = (await request.json()) as Record<string, unknown>;
         return HttpResponse.json({
@@ -335,6 +412,10 @@ describe("UploadFlow", () => {
     await screen.findByText(/Upload complete/i);
 
     // SHA-256 of eight 0x00 bytes.
+    expect(initiationBody).toMatchObject({
+      checksum_sha256:
+        "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+    });
     expect(completionBody).toMatchObject({
       checksum_sha256:
         "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
@@ -350,6 +431,8 @@ describe("UploadFlow", () => {
     const originalXHR = window.XMLHttpRequest;
     MultipartMockXHR.calls = [];
     MultipartMockXHR.withheldEtag = false;
+    MultipartMockXHR.overReportBytes = 0;
+    MultipartMockXHR.delayLoad = false;
     window.XMLHttpRequest = MultipartMockXHR as unknown as typeof XMLHttpRequest;
 
     let completionBody: Record<string, unknown> | null = null;
@@ -405,6 +488,8 @@ describe("UploadFlow", () => {
     const originalXHR = window.XMLHttpRequest;
     MultipartMockXHR.calls = [];
     MultipartMockXHR.withheldEtag = true;
+    MultipartMockXHR.overReportBytes = 0;
+    MultipartMockXHR.delayLoad = false;
     window.XMLHttpRequest = MultipartMockXHR as unknown as typeof XMLHttpRequest;
 
     server.use(
@@ -437,6 +522,60 @@ describe("UploadFlow", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/ETag/i);
 
+    window.XMLHttpRequest = originalXHR;
+  });
+
+  it("clamps multipart progress when a storage client over-reports part bytes", async () => {
+    const originalXHR = window.XMLHttpRequest;
+    MultipartMockXHR.calls = [];
+    MultipartMockXHR.withheldEtag = false;
+    MultipartMockXHR.overReportBytes = 10_000;
+    MultipartMockXHR.delayLoad = true;
+    window.XMLHttpRequest = MultipartMockXHR as unknown as typeof XMLHttpRequest;
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            id: "over-report-video",
+            upload_method: "MULTIPART",
+            upload_url: null,
+            upload_headers: null,
+            upload_id: "mpid-over-report",
+            part_size_bytes: 64,
+            part_urls: [
+              { part_number: 1, url: "https://signed/1?partNumber=1" },
+              { part_number: 2, url: "https://signed/2?partNumber=2" },
+            ],
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          { status: 201 },
+        ),
+      ),
+      http.post("/api/v1/videos/over-report-video/complete", () =>
+        HttpResponse.json({
+          id: "over-report-video",
+          status: "queued",
+          estimated_processing_minutes: 45,
+          job_id: "job-1",
+        }),
+      ),
+    );
+
+    const user = userEvent.setup({ applyAccept: false });
+    render(<UploadFlow gameId="g1" />);
+    const file = new File([new Uint8Array(128)], "over-report.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+
+    await screen.findByText("100%");
+    expect(screen.queryByText(/-\d+%/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/(?:10[1-9]|[2-9]\d{2,})%/)).not.toBeInTheDocument();
+    await screen.findByText(/Upload complete/i);
+
+    MultipartMockXHR.overReportBytes = 0;
+    MultipartMockXHR.delayLoad = false;
     window.XMLHttpRequest = originalXHR;
   });
 });

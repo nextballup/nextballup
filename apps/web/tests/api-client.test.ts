@@ -50,6 +50,34 @@ describe("apiJson", () => {
     });
   });
 
+  it("surfaces Retry-After on rate-limited responses", async () => {
+    server.use(
+      http.post("/api/v1/auth/login", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "RATE_LIMITED",
+              message: "Too many attempts",
+            },
+          },
+          { status: 429, headers: { "Retry-After": "7" } },
+        ),
+      ),
+    );
+
+    await expect(
+      apiJson("/auth/login", {
+        method: "POST",
+        json: { email: "x", password: "y" },
+        noRefreshOn401: true,
+      }),
+    ).rejects.toMatchObject({
+      code: "RATE_LIMITED",
+      status: 429,
+      retryAfterMs: 7000,
+    });
+  });
+
   it("auto-retries once on 401 after a successful refresh", async () => {
     let videoCalls = 0;
     server.use(
@@ -72,6 +100,41 @@ describe("apiJson", () => {
     );
     expect(response.id).toBe("abc");
     expect(videoCalls).toBe(2);
+  });
+
+  it("re-reads the CSRF cookie before retrying a mutating request after refresh", async () => {
+    document.cookie = "nbu_csrf_token=csrf-before-refresh";
+    let updateCalls = 0;
+    const seenHeaders: string[] = [];
+    server.use(
+      http.patch("/api/v1/games/g-refresh", ({ request }) => {
+        seenHeaders.push(request.headers.get("X-CSRF-Token") ?? "");
+        updateCalls += 1;
+        if (updateCalls === 1) {
+          return HttpResponse.json(
+            { error: { code: "UNAUTHENTICATED", message: "expired" } },
+            { status: 401 },
+          );
+        }
+        return HttpResponse.json({ id: "g-refresh", status: "scheduled" });
+      }),
+      http.post("/api/v1/auth/refresh", () => {
+        document.cookie = "nbu_csrf_token=csrf-after-refresh";
+        return HttpResponse.json({ refreshed_at: "2026-04-19T00:00:00Z" });
+      }),
+    );
+    try {
+      await apiJson("/games/g-refresh", {
+        method: "PATCH",
+        json: { status: "scheduled" },
+      });
+      expect(seenHeaders).toEqual([
+        "csrf-before-refresh",
+        "csrf-after-refresh",
+      ]);
+    } finally {
+      document.cookie = "nbu_csrf_token=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+    }
   });
 
   it("does not auto-refresh login's own 401", async () => {

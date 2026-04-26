@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nextballup_core.constants import ErrorCode
 from nextballup_core.enums import TeamRole, UserRole
 from nextballup_core.errors import ForbiddenError, NotFoundError
+from nextballup_core.settings import Settings
 from nextballup_db.models.team import Team, TeamMembership
 from nextballup_db.models.user import User
 
@@ -24,9 +25,29 @@ def require_user_role(user: User, *roles: UserRole) -> None:
         )
 
 
+def require_verified_account(user: User, *, settings: Settings) -> None:
+    """Gate sensitive tenant mutations until account ownership is verified.
+
+    Tests and local development can opt out through settings, but staging and
+    production default to verified-only coach/admin workflows so a disposable
+    email string cannot immediately create teams, issue invites, or ingest film.
+    """
+    if not settings.should_require_verified_email_for_sensitive_actions():
+        return
+    if user.role is UserRole.ADMIN:
+        return
+    if user.is_verified:
+        return
+    raise ForbiddenError(
+        "Email verification is required before this action",
+        code=ErrorCode.FORBIDDEN,
+        details={"reason": "email_unverified"},
+    )
+
+
 async def get_team_or_404(session: AsyncSession, team_id: uuid.UUID) -> Team:
     team = await session.get(Team, team_id)
-    if team is None or not team.is_active:
+    if team is None or not team.is_active or team.deleted_at is not None:
         raise NotFoundError("Team not found", code=ErrorCode.TEAM_NOT_FOUND)
     return team
 

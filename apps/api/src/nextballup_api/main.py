@@ -15,12 +15,16 @@ from nextballup_api.middleware.request_id import RequestIDMiddleware, current_re
 from nextballup_api.middleware.security_headers import SecurityHeadersMiddleware
 from nextballup_api.routers import admin as admin_router
 from nextballup_api.routers import auth as auth_router
+from nextballup_api.routers import csp as csp_router
 from nextballup_api.routers import games as games_router
 from nextballup_api.routers import health as health_router
+from nextballup_api.routers import mfa as mfa_router
 from nextballup_api.routers import teams as teams_router
 from nextballup_api.routers import videos as videos_router
 from nextballup_api.security.csrf import CSRF_HEADER
 from nextballup_core.constants import REQUEST_ID_HEADER
+from nextballup_core.demo_preview import validate_demo_preview_runtime
+from nextballup_core.logging import install_log_redaction_filter
 from nextballup_core.settings import get_settings
 from nextballup_db.engine import dispose_engine
 
@@ -44,14 +48,17 @@ class JsonLogFormatter(logging.Formatter):
 def _configure_logging(level: str) -> None:
     root = logging.getLogger()
     root.setLevel(level)
+    install_log_redaction_filter(root)
     formatter = JsonLogFormatter()
     if not root.handlers:
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
+        install_log_redaction_filter(root)
         root.addHandler(stream_handler)
         return
     for existing_handler in root.handlers:
         existing_handler.setFormatter(formatter)
+    install_log_redaction_filter(root)
 
 
 def _validate_startup_secrets() -> None:
@@ -79,12 +86,40 @@ def _validate_startup_secrets() -> None:
                 "COOKIE_HOST_PREFIX must be true in staging/production "
                 "(required for __Host- cookie isolation)"
             )
+        if not settings.redis_url:
+            failures.append(
+                "REDIS_URL must be configured in staging/production "
+                "(fail-closed; auth/upload/team-join abuse controls require Redis)"
+            )
+        if not settings.mfa_secret_key or len(settings.mfa_secret_key.encode("utf-8")) < 32:
+            failures.append(
+                "MFA_SECRET_KEY must be configured to at least 32 UTF-8 bytes in staging/production"
+            )
+        if settings.email_delivery_provider in {"logging", "noop"}:
+            failures.append(
+                "EMAIL_DELIVERY_PROVIDER must be a registered production provider "
+                "in staging/production"
+            )
+        if settings.billing_provider == "stub":
+            failures.append(
+                "BILLING_PROVIDER must be a real registered provider in staging/production"
+            )
+        if settings.observability_metrics_enabled and not settings.observability_metrics_token:
+            failures.append(
+                "OBSERVABILITY_METRICS_TOKEN must be configured when metrics are enabled"
+            )
         if settings.cookie_domain is not None:
             failures.append(
                 "COOKIE_DOMAIN must be unset in staging/production when using __Host- cookies"
             )
         if failures:
             raise RuntimeError(" / ".join(failures))
+    if settings.cv_demo_preview_enabled and settings.app_env not in ("development", "test"):
+        raise RuntimeError(
+            "CV_DEMO_PREVIEW_ENABLED is only allowed in development/test "
+            "(fail-closed; do not shell out to the sibling training repo in staging/production)"
+        )
+    validate_demo_preview_runtime(settings, startup=True)
 
 
 @asynccontextmanager
@@ -142,10 +177,12 @@ def create_app() -> FastAPI:
     app.include_router(health_router.router)
     app.include_router(health_router.router, prefix=API_PREFIX)
     app.include_router(auth_router.router, prefix=API_PREFIX)
+    app.include_router(mfa_router.router, prefix=API_PREFIX)
     app.include_router(teams_router.router, prefix=API_PREFIX)
     app.include_router(games_router.router, prefix=API_PREFIX)
     app.include_router(videos_router.router, prefix=API_PREFIX)
     app.include_router(admin_router.router, prefix=API_PREFIX)
+    app.include_router(csp_router.router, prefix=API_PREFIX)
 
     return app
 

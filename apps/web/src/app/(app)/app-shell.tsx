@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { BrandLink } from "@/components/brand-link";
 import { TeamPicker } from "@/components/team-picker";
 import { apiVoid } from "@/lib/api-client";
@@ -26,6 +27,7 @@ export function AppShell({
   children: React.ReactNode;
 }) {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const pathname = usePathname();
   const [loggingOut, setLoggingOut] = useState(false);
   const navItems =
@@ -40,8 +42,8 @@ export function AppShell({
       });
     } finally {
       // Whether the API call succeeds or fails (e.g. token already expired),
-      // we hard-navigate to /login so the server layout re-bootstraps the
-      // session and clears any cached user state.
+      // clear client-side cached data before navigating to the login shell.
+      queryClient.clear();
       router.replace("/login");
     }
   }

@@ -13,6 +13,9 @@ contract:
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any
 
 import pytest
@@ -21,7 +24,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_core.constants import AuditAction
+from nextballup_core.enums import TeamRole
 from nextballup_db.models.audit import AuditLog
+from nextballup_db.models.auth import RefreshSession
+from nextballup_db.models.email_verification import EmailVerificationToken
+from nextballup_db.models.mfa import MfaRecoveryCode, UserTotpSecret
 from nextballup_db.models.team import TeamMembership
 from nextballup_db.models.user import User
 
@@ -76,6 +83,11 @@ async def test_export_returns_profile_memberships_and_audits(
     assert body["user"]["phone"] == "555-1234"
     assert body["user"]["institution"] == "Lincoln High"
     assert body["user"]["role"] == "coach"
+    assert body["user"]["height_inches"] is None
+    assert body["user"]["weight_lbs"] is None
+    assert body["user"]["position"] is None
+    assert body["user"]["graduation_year"] is None
+    assert body["user"]["handedness"] is None
     # Consent fields must surface so the user can see their own consent state.
     assert body["user"]["biometric_consent"] is False
     assert body["user"]["parental_consent_on_file"] is False
@@ -89,6 +101,20 @@ async def test_export_returns_profile_memberships_and_audits(
     audit_actions = {event["action"] for event in body["audit_events"]}
     assert AuditAction.USER_REGISTER_SUCCEEDED in audit_actions
     assert AuditAction.TEAM_CREATED in audit_actions
+    assert len(body["refresh_sessions"]) >= 1
+    assert body["email_verification_tokens"] == []
+    assert body["mfa"] == {
+        "enrolled": False,
+        "confirmed_at": None,
+        "disabled_at": None,
+        "last_used_at": None,
+        "recovery_codes_total": 0,
+        "recovery_codes_unused": 0,
+    }
+    assert body["billing_accounts_owned"] == []
+    assert body["usage_events_for_member_teams"] == []
+    assert body["team_privacy_consents_recorded"] == []
+    assert body["csp_reports_attributed"] == []
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -150,12 +176,12 @@ async def test_delete_anonymizes_user_row_and_revokes_sessions(
 ) -> None:
     await _register(client, _coach_payload("gone@example.com"))
     me_before = (await client.get(f"{API}/auth/me")).json()
-    user_id = me_before["id"]
+    user_id = uuid.UUID(me_before["id"])
 
     response = await client.delete(f"{API}/auth/me")
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["user_id"] == user_id
+    assert body["user_id"] == str(user_id)
     assert "deleted_at" in body
 
     # Subsequent calls must 401 — session_version has moved past the token's.
@@ -170,10 +196,18 @@ async def test_delete_anonymizes_user_row_and_revokes_sessions(
     assert user.phone is None
     assert user.institution is None
     assert user.is_active is False
+    assert user.parental_consent_on_file is False
+    assert user.date_of_birth_verified is False
     # Password hash must not match any bcrypt digest — the user can never
     # log back in. We verify shape, not exact value, so changing the
     # sentinel is a single-point edit.
     assert not user.password_hash.startswith("$2")
+    active_refresh_sessions = await db_session.scalar(
+        select(RefreshSession)
+        .where(RefreshSession.user_id == user_id, RefreshSession.revoked_at.is_(None))
+        .limit(1)
+    )
+    assert active_refresh_sessions is None
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -197,20 +231,87 @@ async def test_delete_deactivates_team_memberships(
     )
     assert memberships, "team should still have the historical membership row"
     assert all(m.is_active is False for m in memberships)
+    assert all(m.team_role == TeamRole.PLAYER for m in memberships)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_delete_invalidates_pending_email_verification_tokens(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _register(client, _coach_payload("delete-token@example.com"))
+    user_id = uuid.UUID((await client.get(f"{API}/auth/me")).json()["id"])
+    token = EmailVerificationToken(
+        user_id=user_id,
+        token_hash=sha256(b"delete-token").hexdigest(),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
+        requested_ip="127.0.0.1",
+        requested_user_agent="pytest",
+    )
+    db_session.add(token)
+    await db_session.commit()
+
+    response = await client.delete(f"{API}/auth/me")
+    assert response.status_code == 200, response.text
+
+    stored = await db_session.scalar(
+        select(EmailVerificationToken).where(EmailVerificationToken.id == token.id)
+    )
+    assert stored is not None
+    assert stored.used_at is not None
+    assert stored.requested_ip is None
+    assert stored.requested_user_agent is None
+    assert stored.confirmed_ip is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_delete_removes_mfa_credentials(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _register(client, _coach_payload("delete-mfa@example.com"))
+    user_id = uuid.UUID((await client.get(f"{API}/auth/me")).json()["id"])
+    db_session.add(
+        UserTotpSecret(
+            user_id=user_id,
+            secret_ciphertext="nonce.ciphertext",
+            cipher="aes-gcm-pbkdf2",
+            issuer_label="NextBallUp",
+            account_label="delete-mfa@example.com",
+            confirmed_at=datetime.now(tz=UTC),
+        )
+    )
+    db_session.add(MfaRecoveryCode(user_id=user_id, code_hash=sha256(b"recovery").hexdigest()))
+    await db_session.commit()
+
+    response = await client.delete(f"{API}/auth/me")
+    assert response.status_code == 200, response.text
+
+    assert (
+        await db_session.scalar(select(UserTotpSecret).where(UserTotpSecret.user_id == user_id))
+        is None
+    )
+    assert (
+        await db_session.scalar(select(MfaRecoveryCode).where(MfaRecoveryCode.user_id == user_id))
+        is None
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_delete_emits_audit_entry(client: AsyncClient, db_session: AsyncSession) -> None:
     await _register(client, _coach_payload("audit-delete@example.com"))
+    user_id = uuid.UUID((await client.get(f"{API}/auth/me")).json()["id"])
     response = await client.delete(f"{API}/auth/me")
     assert response.status_code == 200
 
     actions = (
         await db_session.execute(
-            select(AuditLog.action).where(AuditLog.actor_email == "audit-delete@example.com")
+            select(AuditLog.action, AuditLog.actor_email).where(
+                AuditLog.actor_user_id == user_id,
+                AuditLog.action == AuditAction.USER_ACCOUNT_DELETED,
+            )
         )
     ).all()
-    assert any(row[0] == AuditAction.USER_ACCOUNT_DELETED for row in actions)
+    assert actions
+    assert actions[-1][1] == f"deleted+{user_id}@nextballup.invalid"
 
 
 @pytest.mark.asyncio(loop_scope="session")

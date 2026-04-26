@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
+from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
+import filetype  # type: ignore[import-untyped]
 from anyio import to_thread
 from nextballup_api.storage import (
     StorageFailureError,
@@ -30,6 +35,7 @@ from nextballup_worker.errors import PermanentProcessingError, TransientProcessi
 class BrowserMezzanineArtifact:
     mezzanine_key: str
     storage_etag: str | None
+    output_sha256: str
     output_size_bytes: int
     duration_seconds: float | None
     width: int | None
@@ -48,9 +54,29 @@ class _ProbeResult:
     codec: str | None = None
 
 
+_MEDIA_ENV_ALLOWLIST = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL")
+_MEDIA_ENV_DENY_PREFIXES = (
+    "AWS_",
+    "DATABASE_",
+    "JWT_",
+    "OPENAI_",
+    "REDIS_",
+    "S3_",
+    "SECRET",
+)
+_MAGIC_PROBE_BYTES = 8 * 1024
+
+
 def _build_ffmpeg_command(
-    *, binary: str, input_path: Path, output_path: Path
+    *,
+    binary: str,
+    input_path: Path,
+    output_path: Path,
+    threads: int | None = None,
 ) -> list[str]:
+    thread_args: list[str] = []
+    if threads is not None:
+        thread_args = ["-threads", str(threads)]
     return [
         binary,
         "-nostdin",
@@ -74,6 +100,7 @@ def _build_ffmpeg_command(
         "-dn",
         "-c:v",
         "libx264",
+        *thread_args,
         "-preset",
         "veryfast",
         "-crf",
@@ -90,9 +117,7 @@ def _build_ffmpeg_command(
     ]
 
 
-def _build_avconvert_command(
-    *, binary: str, input_path: Path, output_path: Path
-) -> list[str]:
+def _build_avconvert_command(*, binary: str, input_path: Path, output_path: Path) -> list[str]:
     return [
         binary,
         "--source",
@@ -105,16 +130,181 @@ def _build_avconvert_command(
     ]
 
 
+def _media_subprocess_env() -> dict[str, str]:
+    """Return a minimal environment for untrusted media tooling."""
+    clean: dict[str, str] = {}
+    for key in _MEDIA_ENV_ALLOWLIST:
+        value = os.environ.get(key)
+        if value:
+            clean[key] = value
+    for key in list(clean):
+        if key.upper().startswith(_MEDIA_ENV_DENY_PREFIXES):
+            clean.pop(key, None)
+    return clean
+
+
+def _media_preexec_fn(settings: Settings) -> Callable[[], None] | None:
+    if not settings.worker_media_subprocess_sandbox or os.name != "posix":
+        return None
+
+    def _apply_limits() -> None:
+        os.setsid()
+        try:
+            import resource
+        except ImportError:  # pragma: no cover - resource is POSIX-only.
+            return
+
+        if settings.worker_media_max_cpu_seconds > 0:
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (
+                    settings.worker_media_max_cpu_seconds,
+                    settings.worker_media_max_cpu_seconds,
+                ),
+            )
+        if settings.worker_media_max_output_bytes > 0:
+            resource.setrlimit(
+                resource.RLIMIT_FSIZE,
+                (
+                    settings.worker_media_max_output_bytes,
+                    settings.worker_media_max_output_bytes,
+                ),
+            )
+        resource.setrlimit(
+            resource.RLIMIT_NOFILE,
+            (
+                settings.worker_media_max_open_files,
+                settings.worker_media_max_open_files,
+            ),
+        )
+
+    return _apply_limits
+
+
+def _media_subprocess_kwargs(settings: Settings, *, cwd: Path) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": _media_subprocess_env(),
+    }
+    preexec_fn = _media_preexec_fn(settings)
+    if preexec_fn is not None:
+        kwargs["preexec_fn"] = preexec_fn
+    return kwargs
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _detect_file_mime(path: Path) -> str | None:
+    with path.open("rb") as handle:
+        kind = filetype.guess(handle.read(_MAGIC_PROBE_BYTES))
+    mime = getattr(kind, "mime", None)
+    return mime.lower() if isinstance(mime, str) else None
+
+
+def _declared_mime(content_type: str | None) -> str | None:
+    if content_type is None:
+        return None
+    value = content_type.split(";", 1)[0].strip().lower()
+    return value or None
+
+
+def _validate_downloaded_content_type(path: Path, *, declared_content_type: str | None) -> None:
+    declared = _declared_mime(declared_content_type)
+    if declared is None:
+        return
+    detected = _detect_file_mime(path)
+    if detected != declared:
+        raise PermanentProcessingError(
+            "Uploaded object MIME type does not match the declared content type",
+            code=ErrorCode.PROCESSING_CONTENT_TYPE_MISMATCH,
+            details={
+                "declared_content_type": declared,
+                "detected_content_type": detected,
+            },
+        )
+
+
+def _is_ffmpeg_command(cmd: list[str], settings: Settings) -> bool:
+    binary_name = Path(cmd[0]).name if cmd else ""
+    return binary_name == Path(settings.worker_ffmpeg_binary).name or binary_name == "ffmpeg"
+
+
+def _container_path_arg(arg: str, *, cwd: Path) -> str:
+    try:
+        path = Path(arg)
+        if not path.is_absolute():
+            return arg
+        relative = path.resolve().relative_to(cwd.resolve())
+    except (OSError, ValueError):
+        return arg
+    return str(Path("/work") / relative)
+
+
+def _build_containerized_ffmpeg_command(
+    *,
+    cmd: list[str],
+    settings: Settings,
+    cwd: Path,
+) -> list[str]:
+    translated_args = [_container_path_arg(arg, cwd=cwd) for arg in cmd[1:]]
+    return [
+        settings.worker_media_container_runtime,
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--cpus",
+        str(settings.worker_media_container_cpus),
+        "--memory",
+        settings.worker_media_container_memory,
+        "--pids-limit",
+        str(settings.worker_media_container_pids_limit),
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--user",
+        settings.worker_media_container_user,
+        "--tmpfs",
+        f"/tmp:rw,nosuid,nodev,noexec,size={settings.worker_media_container_tmpfs_size}",
+        "-v",
+        f"{cwd.resolve()}:/work:rw",
+        "--workdir",
+        "/work",
+        settings.worker_media_container_image,
+        settings.worker_media_container_binary,
+        *translated_args,
+    ]
+
+
 def _run_subprocess(
-    *, cmd: list[str], timeout_seconds: int, unavailable_code: str
+    *,
+    cmd: list[str],
+    timeout_seconds: int,
+    unavailable_code: str,
+    settings: Settings,
+    cwd: Path,
 ) -> None:
+    subprocess_cmd = cmd
+    subprocess_kwargs = _media_subprocess_kwargs(settings, cwd=cwd)
+    if settings.worker_media_container_sandbox_enabled and _is_ffmpeg_command(cmd, settings):
+        subprocess_cmd = _build_containerized_ffmpeg_command(cmd=cmd, settings=settings, cwd=cwd)
+        subprocess_kwargs = {"cwd": str(cwd), "env": _media_subprocess_env()}
     try:
         subprocess.run(
-            cmd,
+            subprocess_cmd,
             check=True,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            **subprocess_kwargs,
         )
     except FileNotFoundError as exc:
         raise PermanentProcessingError(
@@ -169,6 +359,7 @@ def _probe_output_sync(output_path: Path, settings: Settings) -> _ProbeResult:
             capture_output=True,
             text=True,
             timeout=min(settings.worker_transcode_timeout_seconds, 120),
+            **_media_subprocess_kwargs(settings, cwd=output_path.parent),
         )
         payload = json.loads(result.stdout or "{}")
     except (FileNotFoundError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -239,6 +430,19 @@ async def create_browser_mezzanine(
                 "Failed to download uploaded object for transcoding",
                 code=ErrorCode.PROCESSING_STORAGE_FAILURE,
             ) from exc
+        if video.checksum_sha256:
+            actual_sha256 = await to_thread.run_sync(lambda: _sha256_file(input_path))
+            if actual_sha256 != video.checksum_sha256.lower():
+                raise PermanentProcessingError(
+                    "Downloaded uploaded object SHA-256 does not match the recorded digest",
+                    code=ErrorCode.PROCESSING_CHECKSUM_MISMATCH,
+                )
+        await to_thread.run_sync(
+            lambda: _validate_downloaded_content_type(
+                input_path,
+                declared_content_type=video.content_type,
+            )
+        )
 
         transcoder, binaries = _select_transcoder(settings)
         if transcoder == "ffmpeg":
@@ -248,9 +452,12 @@ async def create_browser_mezzanine(
                         binary=binaries[0],
                         input_path=input_path,
                         output_path=output_path,
+                        threads=settings.worker_ffmpeg_threads,
                     ),
                     timeout_seconds=settings.worker_transcode_timeout_seconds,
                     unavailable_code=ErrorCode.PROCESSING_TRANSCODER_UNAVAILABLE,
+                    settings=settings,
+                    cwd=tempdir_path,
                 )
             )
         else:
@@ -263,6 +470,8 @@ async def create_browser_mezzanine(
                     ),
                     timeout_seconds=settings.worker_transcode_timeout_seconds,
                     unavailable_code=ErrorCode.PROCESSING_TRANSCODER_UNAVAILABLE,
+                    settings=settings,
+                    cwd=tempdir_path,
                 )
             )
 
@@ -279,6 +488,7 @@ async def create_browser_mezzanine(
                 code=ErrorCode.PROCESSING_TRANSCODE_FAILED,
             )
 
+        output_sha256 = await to_thread.run_sync(lambda: _sha256_file(output_path))
         probe = await to_thread.run_sync(lambda: _probe_output_sync(output_path, settings))
 
         try:
@@ -287,6 +497,7 @@ async def create_browser_mezzanine(
                 key=mezzanine_key,
                 source=str(output_path),
                 content_type="video/mp4",
+                metadata={"nbu-output-sha256": output_sha256},
             )
             metadata = await storage_head_object(presigner, key=mezzanine_key)
         except StorageFailureError as exc:
@@ -314,6 +525,7 @@ async def create_browser_mezzanine(
         return BrowserMezzanineArtifact(
             mezzanine_key=mezzanine_key,
             storage_etag=normalized_etag,
+            output_sha256=output_sha256,
             output_size_bytes=stored_size,
             duration_seconds=probe.duration_seconds,
             width=probe.width,

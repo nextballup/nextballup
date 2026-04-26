@@ -39,6 +39,7 @@ API = "/api/v1"
 class FakeStorage:
     def __init__(self) -> None:
         self.object_sizes: dict[str, int] = {}
+        self.object_metadata: dict[str, dict[str, str]] = {}
         self.pending_multiparts: dict[str, tuple[str, int]] = {}
         self.aborted_multiparts: list[dict[str, str]] = []
         self.completed_multiparts: list[dict[str, Any]] = []
@@ -48,7 +49,12 @@ class FakeStorage:
         return True
 
     def presign_upload(
-        self, *, key: str, content_type: str, file_size_bytes: int
+        self,
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
     ) -> PresignedUpload:
         if file_size_bytes <= 1_073_741_824:
             self.object_sizes[key] = file_size_bytes
@@ -77,12 +83,19 @@ class FakeStorage:
         self.aborted_multiparts.append({"key": key, "upload_id": upload_id})
         self.pending_multiparts.pop(upload_id, None)
 
+    def delete_object(self, *, key: str) -> None:
+        self.object_sizes.pop(key, None)
+
     def head_object(self, *, key: str) -> dict[str, Any] | None:
         size = self.object_sizes.get(key)
         if size is None:
             return None
         synthetic_md5 = (key.encode("utf-8").hex().ljust(32, "0"))[:32]
-        return {"ContentLength": size, "ETag": f'"{synthetic_md5}"'}
+        return {
+            "ContentLength": size,
+            "ETag": f'"{synthetic_md5}"',
+            "Metadata": self.object_metadata.get(key, {}),
+        }
 
     def presign_get(
         self, *, key: str, expires_in: int, response_content_type: str | None = None
@@ -95,8 +108,16 @@ class FakeStorage:
     def download_file(self, *, key: str, destination: str) -> None:
         Path(destination).write_bytes(b"fake-video")
 
-    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+    def upload_file(
+        self,
+        *,
+        key: str,
+        source: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         self.object_sizes[key] = Path(source).stat().st_size
+        self.object_metadata[key] = dict(metadata or {})
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -463,6 +484,42 @@ async def test_playback_falls_back_to_mezzanine_when_hls_key_is_stale(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_playback_refuses_mezzanine_with_mismatched_output_digest(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+) -> None:
+    team_id, video_id, _ = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="playback-digest-mismatch@example.com",
+    )
+    video = await db_session.get(Video, video_id)
+    assert video is not None
+    assert video.storage_key_mezzanine is not None
+    assert video.storage_output_sha256 == "b" * 64
+    fake_storage.object_metadata[video.storage_key_mezzanine] = {"nbu-output-sha256": "c" * 64}
+
+    response = await storage_client.get(f"{API}/videos/{video_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["playback_url"] is None
+    assert body["playback_token"] is None
+    assert body["playback_format"] is None
+
+    issued = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_PLAYBACK_ISSUED,
+            AuditLog.team_id == team_id,
+        )
+    )
+    assert issued == 0
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_missing_playback_object_returns_no_playback_fields_and_no_issue_audit(
     storage_client: AsyncClient,
     db_session: AsyncSession,
@@ -602,6 +659,34 @@ async def test_list_games_excludes_other_teams(
     body = response.json()
     assert body["total"] == 1
     assert body["games"][0]["team_id"] == team_b["id"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_deleted_team_hides_games_from_game_routes(
+    storage_client: AsyncClient,
+) -> None:
+    await storage_client.post(f"{API}/auth/register", json=_coach("deleted-games@example.com"))
+    team = (await storage_client.post(f"{API}/teams", json=_team_body())).json()
+    game = (await storage_client.post(f"{API}/games", json=_game_body(team["id"]))).json()
+
+    deleted = await storage_client.delete(f"{API}/teams/{team['id']}")
+    assert deleted.status_code == 204, deleted.text
+
+    list_all = await storage_client.get(f"{API}/games")
+    assert list_all.status_code == 200, list_all.text
+    assert list_all.json()["games"] == []
+
+    list_team = await storage_client.get(f"{API}/games?team_id={team['id']}")
+    assert list_team.status_code == 404
+
+    detail = await storage_client.get(f"{API}/games/{game['id']}")
+    assert detail.status_code == 404
+
+    videos = await storage_client.get(f"{API}/games/{game['id']}/videos")
+    assert videos.status_code == 404
+
+    patch = await storage_client.patch(f"{API}/games/{game['id']}", json={"score_team": 9})
+    assert patch.status_code == 404
 
 
 @pytest.mark.asyncio(loop_scope="session")

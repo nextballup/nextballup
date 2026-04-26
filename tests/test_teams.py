@@ -5,11 +5,12 @@ from typing import Any, cast
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_db.models.audit import AuditLog
-from nextballup_db.models.team import TeamInvite, TeamMembership
+from nextballup_db.models.team import Team, TeamInvite, TeamMembership
 
 API = "/api/v1"
 
@@ -661,6 +662,104 @@ async def test_list_my_teams_does_not_leak_other_teams(client: AsyncClient) -> N
     # Coach B just registered and hasn't created/joined a team yet.
     assert response.status_code == 200
     assert response.json() == {"teams": []}
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_soft_delete_team_hides_data_and_preserves_admin_audit_context(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    coach = _coach_payload("soft-delete-coach@example.com")
+    await _register(client, coach)
+    team = (await client.post(f"{API}/teams", json=_team_create_body())).json()
+
+    deleted = await client.delete(f"{API}/teams/{team['id']}")
+    assert deleted.status_code == 204, deleted.text
+
+    list_response = await client.get(f"{API}/teams")
+    assert list_response.status_code == 200, list_response.text
+    assert list_response.json() == {"teams": []}
+
+    detail = await client.get(f"{API}/teams/{team['id']}")
+    assert detail.status_code == 404
+
+    await db_session.execute(text("SELECT set_config('app.current_user_role', 'admin', true)"))
+    await db_session.execute(text("SELECT set_config('app.include_deleted', 'true', true)"))
+    row = await db_session.scalar(select(Team).where(Team.id == team["id"]))
+    assert row is not None
+    assert row.deleted_at is not None
+    audit = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.team_id == team["id"],
+            AuditLog.action == AuditAction.TEAM_DELETED,
+        )
+    )
+    assert audit is not None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_soft_delete_team_is_idempotent(client: AsyncClient) -> None:
+    await _register(client, _coach_payload("soft-delete-idempotent@example.com"))
+    team = (await client.post(f"{API}/teams", json=_team_create_body())).json()
+
+    first = await client.delete(f"{API}/teams/{team['id']}")
+    assert first.status_code == 204, first.text
+    second = await client.delete(f"{API}/teams/{team['id']}")
+    assert second.status_code == 204, second.text
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_player_cannot_soft_delete_team(client: AsyncClient) -> None:
+    coach = _coach_payload("soft-delete-deny-coach@example.com")
+    await _register(client, coach)
+    team = (await client.post(f"{API}/teams", json=_team_create_body())).json()
+
+    player = _player_payload("soft-delete-deny-player@example.com")
+    await _register(client, player)
+    joined = await client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 9},
+    )
+    assert joined.status_code == 200, joined.text
+
+    denied = await client.delete(f"{API}/teams/{team['id']}")
+    assert denied.status_code == 403, denied.text
+
+    await _login(client, coach["email"], coach["password"])
+    detail = await client.get(f"{API}/teams/{team['id']}")
+    assert detail.status_code == 200, detail.text
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_deleted_team_blocks_direct_db_writes_under_rls(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    await _register(client, _coach_payload("deleted-team-rls-write@example.com"))
+    team = (await client.post(f"{API}/teams", json=_team_create_body())).json()
+    deleted = await client.delete(f"{API}/teams/{team['id']}")
+    assert deleted.status_code == 204, deleted.text
+
+    await db_session.execute(
+        text("SELECT set_config('app.current_team_id', :team_id, true)"),
+        {"team_id": team["id"]},
+    )
+    with pytest.raises(DBAPIError):
+        await db_session.execute(
+            text(
+                """
+                INSERT INTO games (
+                    team_id, opponent_name, game_type, date, status,
+                    periods, period_length_minutes
+                )
+                VALUES (
+                    :id, 'RLS blocked', 'regular_season', '2026-11-01',
+                    'scheduled', 4, 8
+                )
+                """
+            ),
+            {"id": team["id"]},
+        )
+    await db_session.rollback()
 
 
 @pytest.mark.asyncio(loop_scope="session")

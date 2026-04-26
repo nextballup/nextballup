@@ -1,0 +1,39 @@
+# Hardened transcode worker example.
+#
+# This file is intentionally an override/example, not part of local default
+# docker-compose.yml. It documents the production posture expected for the
+# transcode worker and enables the worker's per-FFmpeg container sandbox.
+
+services:
+  worker-transcode:
+    image: nextballup-worker:latest
+    command:
+      - uv
+      - run
+      - celery
+      - -A
+      - nextballup_worker.celery_app
+      - worker
+      - -Q
+      - nextballup.transcode
+      - --concurrency=1
+    environment:
+      APP_ENV: production
+      WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED: "true"
+      WORKER_MEDIA_CONTAINER_IMAGE: nextballup-ffmpeg-sandbox:6.1
+      WORKER_MEDIA_CONTAINER_RUNTIME: docker
+      WORKER_MEDIA_CONTAINER_CPUS: "2.0"
+      WORKER_MEDIA_CONTAINER_MEMORY: 8g
+      WORKER_MEDIA_CONTAINER_PIDS_LIMIT: "128"
+      WORKER_MEDIA_CONTAINER_TMPFS_SIZE: 512m
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=2g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 10g
+    cpus: 3
+    restart: unless-stopped

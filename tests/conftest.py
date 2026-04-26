@@ -187,10 +187,14 @@ def _stub_browser_mezzanine_transcode(monkeypatch: pytest.MonkeyPatch) -> None:
         object_sizes = getattr(presigner, "object_sizes", None)
         if isinstance(object_sizes, dict):
             object_sizes[mezzanine_key] = output_size
+        object_metadata = getattr(presigner, "object_metadata", None)
+        if isinstance(object_metadata, dict):
+            object_metadata[mezzanine_key] = {"nbu-output-sha256": "b" * 64}
         synthetic_etag = (mezzanine_key.encode("utf-8").hex().ljust(32, "0"))[:32]
         return BrowserMezzanineArtifact(
             mezzanine_key=mezzanine_key,
             storage_etag=synthetic_etag,
+            output_sha256="b" * 64,
             output_size_bytes=output_size,
             duration_seconds=42.0,
             width=1920,

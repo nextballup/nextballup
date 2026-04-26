@@ -38,6 +38,14 @@ Not checked in yet:
 - Richer analytics/clips/metrics surfaces beyond the current auth / team /
   video / game / playback foundation
 
+Dev-only bridge available:
+
+- The processed-video page can optionally shell out to the sibling training
+  repo and render a local annotated MP4 overlay preview from a prototype
+  RF-DETR checkpoint. This is gated behind `CV_DEMO_PREVIEW_ENABLED`, only
+  allowed in `development`/`test`, and is intentionally not the production
+  inference path.
+
 ## Bootstrap
 
 ### Prerequisites
@@ -80,7 +88,7 @@ uv run uvicorn nextballup_api.main:app --reload --host 127.0.0.1 --port 8000
 
 # Run the Celery worker (needs CELERY_BROKER_URL=redis://127.0.0.1:6379/1 in .env)
 uv run celery -A nextballup_worker.celery_app worker --loglevel=info \
-  --queues=nextballup.default,nextballup.transcode,nextballup.maintenance
+  --queues=nextballup.default,nextballup.transcode,nextballup.maintenance,nextballup.cpu
 
 # Run Celery beat (periodic dispatch + stale-job / abandoned-upload cleanup)
 uv run celery -A nextballup_worker.celery_app beat --loglevel=info
@@ -88,6 +96,30 @@ uv run celery -A nextballup_worker.celery_app beat --loglevel=info
 # Run tests (uses the nextballup_test DB created by infra/scripts/init-db.sql)
 uv run pytest
 ```
+
+### Optional local detector preview
+
+If the sibling training repo already has a usable local checkpoint, you can
+turn on a dev-only overlay preview on the processed video page:
+
+```bash
+export CV_DEMO_PREVIEW_ENABLED=true
+export CV_DEMO_TRAINING_REPO_ROOT=../nextballup-vision-training
+export CV_DEMO_CONFIG_PATH=../nextballup-vision-training/configs/experiments/basketball/detect/rfdetr_demo_local_overfit_v1.yaml
+export CV_DEMO_CHECKPOINT_PATH=../nextballup-vision-training/runs/bb_detect_rfdetr_demo_local_overfit_v1/demo-01/checkpoints/checkpoint_best_total.pth
+```
+
+The backend will download the processed mezzanine locally, run the sibling
+`scripts/local_demo_infer.py`, and serve the generated annotated MP4 back from
+`/api/v1/videos/{id}/demo-preview/artifact`. This stays same-origin and
+artifact-backed, but it is still a local developer bridge rather than the
+long-term runtime/export path.
+
+When this bridge is enabled, the paths above are resolved relative to the repo
+root if they are not absolute, and the worker must consume the
+`nextballup.cpu` queue so queued preview jobs do not stall silently.
+Generated preview artifacts are local-only and are pruned by the maintenance
+cleanup pass after `CV_DEMO_RETENTION_SECONDS` (default: 72 hours).
 
 ### Frontend (`apps/web`)
 

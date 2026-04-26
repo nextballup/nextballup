@@ -26,6 +26,8 @@ function scheduledGame(overrides: Partial<GameSummary> = {}): GameSummary {
     notes: null,
     periods: 4,
     period_length_minutes: 8,
+    shot_clock_enabled: false,
+    shot_clock_seconds: null,
     created_at: "2026-04-15T00:00:00Z",
     ...overrides,
   };

@@ -5,8 +5,11 @@ from typing import Any
 
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import worker_process_init, worker_ready
 
+from nextballup_core.logging import install_log_redaction_filter
 from nextballup_core.settings import Settings, get_settings
+from nextballup_worker.observability import start_worker_metrics_server
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,7 @@ def _resolve_backend(settings: Settings) -> str | None:
 
 
 def create_celery_app(settings: Settings | None = None) -> Celery:
+    install_log_redaction_filter()
     resolved = settings or get_settings()
     app = Celery(
         "nextballup_worker",
@@ -63,7 +67,24 @@ def _beat_schedule(settings: Settings) -> dict[str, Any]:
             "schedule": max(60, settings.worker_cleanup_interval_seconds),
             "options": {"queue": settings.celery_maintenance_queue},
         },
+        "retry-raw-video-storage-deletes": {
+            "task": "nextballup_worker.tasks.retry_raw_video_storage_deletes_task",
+            "schedule": max(60, settings.worker_cleanup_interval_seconds),
+            "options": {"queue": settings.celery_maintenance_queue},
+        },
     }
+
+
+def _start_child_worker_metrics(**_: object) -> None:
+    start_worker_metrics_server()
+
+
+def _start_solo_worker_metrics(**_: object) -> None:
+    start_worker_metrics_server()
+
+
+worker_process_init.connect(_start_child_worker_metrics, weak=False)
+worker_ready.connect(_start_solo_worker_metrics, weak=False)
 
 
 # Module-level singleton so `celery -A nextballup_worker.celery_app worker`

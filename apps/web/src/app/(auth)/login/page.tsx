@@ -5,29 +5,44 @@ import Link from "next/link";
 import { useState, type FormEvent } from "react";
 import { apiJson } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
+import { useRetryAfterGate } from "@/lib/retry-after";
 import type { LoginResponse } from "@/app/(auth)/types";
 
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [mfaCode, setMfaCode] = useState("");
+  const [mfaRequired, setMfaRequired] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { retryAfterSeconds, retryBlocked, startRetryAfter } = useRetryAfterGate();
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (retryBlocked) return;
     setSubmitting(true);
     setError(null);
     try {
       await apiJson<LoginResponse>("/auth/login", {
         method: "POST",
-        json: { email, password },
+        json: {
+          email,
+          password,
+          ...(mfaCode ? { mfa_code: mfaCode } : {}),
+        },
         noRefreshOn401: true,
       });
       router.replace("/games");
     } catch (err) {
       if (err instanceof ApiError) {
-        setError(err.message);
+        if (err.code === "MFA_REQUIRED") {
+          setMfaRequired(true);
+          setError("Enter your authenticator or recovery code.");
+        } else {
+          setError(err.message);
+        }
+        startRetryAfter(err.retryAfterMs);
       } else {
         setError("Unable to sign in. Please try again.");
       }
@@ -56,6 +71,21 @@ export default function LoginPage() {
             className="w-full rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 outline-none focus:border-[color:var(--color-nbu-text)]"
           />
         </label>
+        {mfaRequired && (
+          <label className="block space-y-1">
+            <span className="text-sm font-medium">Authenticator or recovery code</span>
+            <input
+              type="text"
+              required
+              autoComplete="one-time-code"
+              minLength={4}
+              maxLength={32}
+              value={mfaCode}
+              onChange={(e) => setMfaCode(e.target.value)}
+              className="w-full rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 outline-none focus:border-[color:var(--color-nbu-text)]"
+            />
+          </label>
+        )}
         <label className="block space-y-1">
           <span className="text-sm font-medium">Password</span>
           <input
@@ -75,10 +105,14 @@ export default function LoginPage() {
         )}
         <button
           type="submit"
-          disabled={submitting}
+          disabled={submitting || retryBlocked}
           className="w-full rounded-md bg-[color:var(--color-nbu-text)] px-4 py-2 text-sm font-medium text-[color:var(--color-nbu-bg)] transition hover:opacity-90 disabled:opacity-50"
         >
-          {submitting ? "Signing in…" : "Sign in"}
+          {retryBlocked
+            ? `Try again in ${retryAfterSeconds}s`
+            : submitting
+              ? "Signing in…"
+              : "Sign in"}
         </button>
       </form>
       <p className="text-center text-sm text-[color:var(--color-nbu-text-muted)]">

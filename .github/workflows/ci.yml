@@ -151,11 +151,23 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Export runtime Python requirements for auditing
+        run: >
+          uv export --format requirements.txt --locked --no-header --no-annotate
+          --no-emit-project --no-emit-workspace
+          --output-file .ci-third-party-requirements.txt
+
+      - name: Filter non-runtime packaging tools
+        run: grep -vE '^pip==' .ci-third-party-requirements.txt > .ci-third-party-runtime-requirements.txt
+
       - name: Run pip-audit
-        # `--skip-editable` keeps pip-audit from trying to look up our own
-        # first-party workspace packages on PyPI (they aren't published).
-        # We still audit every third-party dep resolved into the venv.
-        run: uv run pip-audit --skip-editable --progress-spinner off
+        # `pip` is a local packaging tool in the GitHub runner/uv environment,
+        # not a shipped application dependency. Runtime third-party packages
+        # remain audited from the resolved lockfile.
+        run: >
+          uv run --no-sync pip-audit --strict --desc
+          --requirement .ci-third-party-runtime-requirements.txt
+          --no-deps --disable-pip
 
   security-node:
     name: Security (pnpm audit)
@@ -186,16 +198,8 @@ jobs:
         # deps are excluded — they don't ship to users.
         run: pnpm audit --audit-level high --prod
 
-  security-secrets:
-    name: Security (gitleaks)
-    runs-on: ubuntu-latest
-    # Full-history scan on push, commit-range scan on PRs. The action fails
-    # the job on any detected secret so a leaked token never reaches main.
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # Secret-detection lives in `.github/workflows/security.yml` via the
+  # trufflehog action, which works for organization repos without a paid
+  # license. The earlier gitleaks-action@v2 job here required a paid
+  # gitleaks.io license for org repos and was dropped to avoid duplicating
+  # trufflehog's coverage with a non-functioning scanner.

@@ -52,7 +52,7 @@ export default async function GameDetailPage({
         </div>
       </header>
 
-      <dl className="grid grid-cols-2 gap-4 rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm sm:grid-cols-4">
+      <dl className="grid grid-cols-2 gap-4 rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm sm:grid-cols-5">
         <div>
           <dt className="text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
             Status
@@ -79,6 +79,14 @@ export default async function GameDetailPage({
           </dt>
           <dd className="mt-1 font-mono">
             {game.score_team ?? "—"} : {game.score_opponent ?? "—"}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            Shot clock
+          </dt>
+          <dd className="mt-1 font-mono">
+            {game.shot_clock_enabled ? `${game.shot_clock_seconds}s` : "none"}
           </dd>
         </div>
       </dl>

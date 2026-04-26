@@ -6,12 +6,14 @@ import { apiJson } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
 import {
   CV_PIPELINE_STAGES,
+  type GenerateDemoPreviewResponse,
   IMPLEMENTED_PIPELINE_STAGES,
   VIDEO_TERMINAL_STATUSES,
   type UserRole,
   type VideoDetailResponse,
   type VideoStatusResponse,
 } from "@/lib/contract";
+import { PLAYBACK_STATUS_LABELS } from "@/lib/video-status";
 
 const POLL_INTERVAL_MS = 3_000;
 // Refresh the video detail (and the signed playback URL it carries) a bit
@@ -38,7 +40,10 @@ export function VideoPlaybackView({
     refetchInterval: (query) => {
       const current = query.state.data;
       if (!current) return POLL_INTERVAL_MS;
-      if (VIDEO_TERMINAL_STATUSES.includes(current.status)) {
+      if (
+        VIDEO_TERMINAL_STATUSES.includes(current.status) &&
+        !isDemoPreviewActive(current.demo_preview_status)
+      ) {
         return false;
       }
       return POLL_INTERVAL_MS;
@@ -84,6 +89,7 @@ export function VideoPlaybackView({
   return (
     <div className="space-y-4">
       <PlaybackPanel video={video} />
+      <DemoPreviewPanel video={video} viewerRole={viewerRole} />
       <MetadataPanel video={video} />
       <ProcessingPanel
         status={statusQuery.data}
@@ -91,6 +97,111 @@ export function VideoPlaybackView({
         viewerRole={viewerRole}
       />
     </div>
+  );
+}
+
+function DemoPreviewPanel({
+  video,
+  viewerRole,
+}: {
+  video: VideoDetailResponse;
+  viewerRole: UserRole | null;
+}) {
+  const queryClient = useQueryClient();
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const canRequest = viewerRole === "coach" || viewerRole === "admin";
+  const previewStatus = video.demo_preview_status;
+  const previewBusy = isDemoPreviewActive(previewStatus);
+  const mutation = useMutation<GenerateDemoPreviewResponse>({
+    mutationFn: async () =>
+      apiJson<GenerateDemoPreviewResponse>(`/videos/${video.id}/demo-preview`, {
+        method: "POST",
+        json: {},
+      }),
+    onSuccess: () => {
+      setErrorMessage(null);
+      queryClient.refetchQueries({ queryKey: ["video", video.id] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage("Unable to generate the local demo preview.");
+      }
+    },
+  });
+  const previewUrl = video.demo_preview_url;
+  const generatedAt = video.demo_preview_generated_at;
+  const previewRenderUrl = previewUrl ? withVersionParam(previewUrl, generatedAt) : null;
+  const resolvedErrorMessage =
+    errorMessage ??
+    (previewStatus === "failed" ? video.demo_preview_error_message : null);
+  useEffect(() => {
+    if (previewUrl && generatedAt) {
+      setErrorMessage(null);
+    }
+  }, [generatedAt, previewUrl]);
+  if (!video.demo_preview_enabled && !previewUrl) {
+    return null;
+  }
+  return (
+    <section
+      data-testid="demo-preview-panel"
+      className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm"
+    >
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="space-y-1">
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            Local model preview
+          </h2>
+          <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
+            Dev-only overlay rendered by the sibling training repo checkpoint.
+            This is for internal sanity checks, not production inference.
+          </p>
+          {generatedAt ? (
+            <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
+              Last generated: {new Date(generatedAt).toLocaleString()}
+            </p>
+          ) : null}
+        </div>
+        {video.demo_preview_enabled && canRequest ? (
+          <button
+            type="button"
+            onClick={() => mutation.mutate()}
+            disabled={mutation.isPending || previewBusy || video.status !== "processed"}
+            data-testid="generate-demo-preview"
+            className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-3 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+          >
+            {mutation.isPending
+              ? "Queueing preview…"
+              : previewBusy
+                ? "Generating preview…"
+              : previewUrl
+                ? "Regenerate local overlay"
+                : "Generate local overlay"}
+          </button>
+        ) : null}
+      </div>
+      {previewBusy ? (
+        <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
+          The preview job is queued in the worker and will appear automatically
+          when rendering finishes.
+        </p>
+      ) : null}
+      {previewRenderUrl ? (
+        <VideoPlayer key={previewRenderUrl} url={previewRenderUrl} format="mp4" />
+      ) : (
+        <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-5 text-xs text-[color:var(--color-nbu-text-muted)]">
+          Generate a local overlay preview from the processed mezzanine to test
+          the current prototype detector inside the platform.
+        </div>
+      )}
+      {resolvedErrorMessage ? (
+        <p role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
+          {resolvedErrorMessage}
+        </p>
+      ) : null}
+    </section>
   );
 }
 
@@ -136,7 +247,9 @@ function MetadataPanel({ video }: { video: VideoDetailResponse }) {
         <dt className="text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
           Status
         </dt>
-        <dd className="mt-1 font-medium">{video.status}</dd>
+        <dd className="mt-1 font-medium">
+          {PLAYBACK_STATUS_LABELS[video.playback_status] ?? video.playback_status}
+        </dd>
       </div>
       <div>
         <dt className="text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
@@ -315,6 +428,16 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)}GB`;
+}
+
+function withVersionParam(url: string, generatedAt: string | null): string {
+  if (!generatedAt) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}v=${encodeURIComponent(generatedAt)}`;
+}
+
+function isDemoPreviewActive(status: string): boolean {
+  return status === "queued" || status === "running";
 }
 
 // ---- Player ---------------------------------------------------------------

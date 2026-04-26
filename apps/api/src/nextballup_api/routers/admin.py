@@ -65,6 +65,7 @@ async def list_audit_logs(
     current_user: User = Depends(get_current_user),
     team_id: uuid.UUID | None = Query(default=None),
     actor_user_id: uuid.UUID | None = Query(default=None),
+    actor_email: str | None = Query(default=None, max_length=255),
     action: str | None = Query(
         default=None,
         max_length=80,
@@ -97,6 +98,8 @@ async def list_audit_logs(
         filters.append(AuditLog.team_id == team_id)
     if actor_user_id is not None:
         filters.append(AuditLog.actor_user_id == actor_user_id)
+    if actor_email is not None:
+        filters.append(AuditLog.actor_email == actor_email)
     if action is not None:
         filters.append(AuditLog.action == action)
     if resource_type is not None:
@@ -148,6 +151,7 @@ async def list_audit_logs(
             "filters": {
                 "team_id": str(team_id) if team_id is not None else None,
                 "actor_user_id": str(actor_user_id) if actor_user_id is not None else None,
+                "actor_email": actor_email,
                 "action": action,
                 "resource_type": resource_type,
                 "resource_id": str(resource_id) if resource_id is not None else None,

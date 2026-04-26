@@ -50,6 +50,7 @@ class AuditLog(Base, UUIDPrimaryKeyMixin):
     __table_args__ = (
         Index("ix_audit_logs_action_created_at", "action", "created_at"),
         Index("ix_audit_logs_actor_created_at", "actor_user_id", "created_at"),
+        Index("ix_audit_logs_actor_email_created_at", "actor_email", "created_at"),
         Index("ix_audit_logs_team_created_at", "team_id", "created_at"),
         Index("ix_audit_logs_resource", "resource_type", "resource_id"),
     )

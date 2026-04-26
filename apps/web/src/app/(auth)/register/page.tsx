@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useState, type FormEvent } from "react";
 import { apiJson } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
+import { useRetryAfterGate } from "@/lib/retry-after";
 import type { RegisterResponse } from "@/app/(auth)/types";
 
 type Role = "coach" | "player";
@@ -21,9 +22,11 @@ export default function RegisterPage() {
   const [institution, setInstitution] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { retryAfterSeconds, retryBlocked, startRetryAfter } = useRetryAfterGate();
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (retryBlocked) return;
     setSubmitting(true);
     setError(null);
     try {
@@ -42,6 +45,7 @@ export default function RegisterPage() {
     } catch (err) {
       if (err instanceof ApiError) {
         setError(err.message);
+        startRetryAfter(err.retryAfterMs);
       } else {
         setError("Unable to create account. Please try again.");
       }
@@ -138,10 +142,14 @@ export default function RegisterPage() {
         )}
         <button
           type="submit"
-          disabled={submitting}
+          disabled={submitting || retryBlocked}
           className="w-full rounded-md bg-[color:var(--color-nbu-text)] px-4 py-2 text-sm font-medium text-[color:var(--color-nbu-bg)] transition hover:opacity-90 disabled:opacity-50"
         >
-          {submitting ? "Creating account…" : "Create account"}
+          {retryBlocked
+            ? `Try again in ${retryAfterSeconds}s`
+            : submitting
+              ? "Creating account…"
+              : "Create account"}
         </button>
       </form>
       <p className="text-center text-sm text-[color:var(--color-nbu-text-muted)]">

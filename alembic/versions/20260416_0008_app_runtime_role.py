@@ -102,6 +102,7 @@ def downgrade() -> None:
         f"REVOKE SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM {APP_ROLE};"
     )
     bind.exec_driver_sql(f"REVOKE USAGE ON SCHEMA public FROM {APP_ROLE};")
+    bind.exec_driver_sql(f"DROP OWNED BY {APP_ROLE};")
     bind.exec_driver_sql(
         f"""
         DO $$
@@ -109,6 +110,9 @@ def downgrade() -> None:
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{APP_ROLE}') THEN
                 DROP ROLE {APP_ROLE};
             END IF;
+        EXCEPTION
+            WHEN dependent_objects_still_exist THEN
+                RAISE NOTICE 'Skipping DROP ROLE {APP_ROLE}; the cluster role still has dependencies outside this database.';
         END
         $$;
         """

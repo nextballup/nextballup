@@ -1,0 +1,15 @@
+- kind: raw_video
+  retention_source: RAW_VIDEO_RETENTION_DAYS
+  retention_unit: days
+  justification: "Runtime-configured raw source retention."
+  deletion_action: cleanup_expired_raw_videos
+- kind: email_verification_token
+  retention_source: EMAIL_VERIFICATION_TOKEN_TTL_MINUTES
+  retention_unit: minutes
+  justification: "Hash-only verification tokens are deleted after use or expiry."
+  deletion_action: cleanup_email_verification_tokens
+- kind: csp_report
+  retention_source: CSP_REPORT_RETENTION_DAYS
+  retention_unit: days
+  justification: "Diagnostic CSP reports carry IP/User-Agent data and are pruned after the configured window."
+  deletion_action: cleanup_expired_csp_reports

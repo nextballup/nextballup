@@ -3,9 +3,11 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_db.models.audit import AuditLog
+from nextballup_db.models.video import Video
 from nextballup_worker.tenant import WORKER_ACTOR_EMAIL
 
 
@@ -41,3 +43,10 @@ async def write_worker_audit(
     session.add(entry)
     await session.flush()
     return entry
+
+
+async def originating_user_extra(session: AsyncSession, *, video_id: uuid.UUID) -> dict[str, str]:
+    uploader_id = await session.scalar(select(Video.uploaded_by).where(Video.id == video_id))
+    if uploader_id is None:
+        return {}
+    return {"originating_user_id": str(uploader_id)}

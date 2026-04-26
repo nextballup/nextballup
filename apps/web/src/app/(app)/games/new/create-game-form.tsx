@@ -37,6 +37,8 @@ export function CreateGameForm({
   const [isHome, setIsHome] = useState(true);
   const [periods, setPeriods] = useState(4);
   const [periodLength, setPeriodLength] = useState(8);
+  const [shotClockEnabled, setShotClockEnabled] = useState(false);
+  const [shotClockSeconds, setShotClockSeconds] = useState(30);
   const [notes, setNotes] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -58,6 +60,8 @@ export function CreateGameForm({
           is_home: isHome,
           periods,
           period_length_minutes: periodLength,
+          shot_clock_enabled: shotClockEnabled,
+          shot_clock_seconds: shotClockEnabled ? shotClockSeconds : null,
           notes: notes.trim() || null,
         },
       });
@@ -199,6 +203,30 @@ export function CreateGameForm({
               setPeriodLength(Number.parseInt(e.target.value, 10) || 8)
             }
             className="w-full rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 font-mono outline-none focus:border-[color:var(--color-nbu-text)]"
+          />
+        </label>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={shotClockEnabled}
+            onChange={(e) => setShotClockEnabled(e.target.checked)}
+          />
+          <span>Shot clock</span>
+        </label>
+        <label className="block space-y-1 text-sm">
+          <span className="text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            Shot clock (sec)
+          </span>
+          <input
+            type="number"
+            min={1}
+            max={35}
+            disabled={!shotClockEnabled}
+            value={shotClockSeconds}
+            onChange={(e) =>
+              setShotClockSeconds(Number.parseInt(e.target.value, 10) || 30)
+            }
+            className="w-full rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 font-mono outline-none focus:border-[color:var(--color-nbu-text)] disabled:opacity-50"
           />
         </label>
         <label className="block space-y-1 text-sm sm:col-span-2">
