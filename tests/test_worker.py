@@ -1796,6 +1796,7 @@ async def test_finalize_demo_preview_failure_marks_state_and_audits(
     storage_client: AsyncClient,
     db_session: AsyncSession,
     fake_storage: FakeWorkerStorage,
+    demo_preview_env: dict[str, Path],
 ) -> None:
     team_id, video_id, job_id = await _seed_queued_video(
         storage_client, coach_email="worker-demo-preview-fail@example.com"
