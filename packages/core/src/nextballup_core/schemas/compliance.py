@@ -30,6 +30,11 @@ class UserProfileExport(BaseModel):
     phone: str | None = None
     institution: str | None = None
     avatar_url: str | None = None
+    height_inches: int | None = None
+    weight_lbs: int | None = None
+    position: str | None = None
+    graduation_year: int | None = None
+    handedness: str | None = None
     is_active: bool
     is_verified: bool
     biometric_consent: bool
@@ -78,6 +83,85 @@ class AuditEventExport(BaseModel):
     extra: dict[str, Any] | None
 
 
+class RefreshSessionExport(BaseModel):
+    id: uuid.UUID
+    created_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    revoked_reason: str | None
+    replaced_by_session_id: uuid.UUID | None
+    ip_address: str | None
+    user_agent: str | None
+
+
+class EmailVerificationTokenExport(BaseModel):
+    id: uuid.UUID
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None
+    requested_ip: str | None
+    requested_user_agent: str | None
+    confirmed_ip: str | None
+
+
+class MfaEnrollmentExport(BaseModel):
+    enrolled: bool
+    confirmed_at: datetime | None
+    disabled_at: datetime | None
+    last_used_at: datetime | None
+    recovery_codes_total: int
+    recovery_codes_unused: int
+
+
+class BillingAccountExport(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: str
+    billing_email: str | None
+    deleted_at: datetime | None
+    created_at: datetime
+
+
+class UsageEventExport(BaseModel):
+    id: uuid.UUID
+    billing_account_id: uuid.UUID
+    team_id: uuid.UUID | None
+    event_key: str
+    quantity: int
+    occurred_at: datetime
+    event_metadata: dict[str, Any] | None
+
+
+class TeamPrivacyConsentExport(BaseModel):
+    id: uuid.UUID
+    team_id: uuid.UUID
+    label: str
+    consent_source: str
+    covers_video_uploads: bool
+    covers_cv_processing: bool
+    commercial_ml_training_allowed: bool
+    minors_authorized: bool
+    athlete_pii_authorized: bool
+    evidence_uri: str | None
+    evidence_sha256: str | None
+    effective_at: datetime
+    expires_at: datetime | None
+    revoked_at: datetime | None
+
+
+class CspReportExport(BaseModel):
+    id: uuid.UUID
+    received_at: datetime
+    document_uri: str | None
+    violated_directive: str | None
+    blocked_uri: str | None
+    source_file: str | None
+    line_number: int | None
+    column_number: int | None
+    user_agent: str | None
+    reporter_ip: str | None
+
+
 class UserDataExport(BaseModel):
     """Top-level envelope returned by GET /auth/me/export."""
 
@@ -86,6 +170,13 @@ class UserDataExport(BaseModel):
     team_memberships: list[TeamMembershipExport]
     videos_uploaded: list[VideoSummaryExport]
     audit_events: list[AuditEventExport]
+    refresh_sessions: list[RefreshSessionExport]
+    email_verification_tokens: list[EmailVerificationTokenExport]
+    mfa: MfaEnrollmentExport
+    billing_accounts_owned: list[BillingAccountExport]
+    usage_events_for_member_teams: list[UsageEventExport]
+    team_privacy_consents_recorded: list[TeamPrivacyConsentExport]
+    csp_reports_attributed: list[CspReportExport]
 
 
 class AccountDeleteResponse(BaseModel):

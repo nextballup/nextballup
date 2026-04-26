@@ -5,7 +5,7 @@ from datetime import date as _date
 from datetime import datetime
 from datetime import time as _time
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nextballup_core.enums import GameStatus, GameType
 
@@ -22,7 +22,17 @@ class CreateGameRequest(BaseModel):
     is_home: bool = True
     periods: int = Field(default=4, ge=1, le=10)
     period_length_minutes: int = Field(default=8, ge=1, le=60)
+    shot_clock_enabled: bool = False
+    shot_clock_seconds: int | None = Field(default=None, ge=1, le=35)
     notes: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _validate_shot_clock(self) -> CreateGameRequest:
+        if self.shot_clock_enabled and self.shot_clock_seconds is None:
+            raise ValueError("shot_clock_seconds is required when shot_clock_enabled is true")
+        if not self.shot_clock_enabled and self.shot_clock_seconds is not None:
+            raise ValueError("shot_clock_seconds must be null when shot_clock_enabled is false")
+        return self
 
 
 class GameSummary(BaseModel):
@@ -42,6 +52,8 @@ class GameSummary(BaseModel):
     notes: str | None = None
     periods: int
     period_length_minutes: int
+    shot_clock_enabled: bool
+    shot_clock_seconds: int | None = None
     created_at: datetime
 
 
@@ -70,7 +82,17 @@ class UpdateGameRequest(BaseModel):
     is_home: bool | None = None
     periods: int | None = Field(default=None, ge=1, le=10)
     period_length_minutes: int | None = Field(default=None, ge=1, le=60)
+    shot_clock_enabled: bool | None = None
+    shot_clock_seconds: int | None = Field(default=None, ge=1, le=35)
     notes: str | None = Field(default=None, max_length=2000)
     score_team: int | None = Field(default=None, ge=0, le=999)
     score_opponent: int | None = Field(default=None, ge=0, le=999)
     status: GameStatus | None = None
+
+    @model_validator(mode="after")
+    def _validate_shot_clock_patch(self) -> UpdateGameRequest:
+        if self.shot_clock_enabled is True and self.shot_clock_seconds is None:
+            raise ValueError("shot_clock_seconds is required when enabling the shot clock")
+        if self.shot_clock_enabled is False and self.shot_clock_seconds is not None:
+            raise ValueError("shot_clock_seconds must be null when disabling the shot clock")
+        return self

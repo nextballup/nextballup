@@ -7,8 +7,11 @@ RLS-gated INSERTs go through the audited code paths.
 
 from __future__ import annotations
 
+import os
+import stat
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -25,13 +28,22 @@ from nextballup_worker.errors import (
 from nextballup_worker.runtime import (
     claim_job,
     cleanup_abandoned_uploads,
+    cleanup_email_verification_tokens,
+    cleanup_expired_raw_videos,
     complete_job,
     dispatch_pending_jobs,
+    execute_cv_stage,
+    execute_demo_preview,
     execute_transcode,
     fail_job,
+    finalize_demo_preview_failure,
     recover_stale_jobs,
     release_job_for_retry,
+    retry_raw_video_storage_deletes,
     touch_heartbeat,
+)
+from nextballup_worker.runtime.media import (
+    create_browser_mezzanine as real_create_browser_mezzanine,
 )
 from nextballup_worker.tasks import _ensure_runtime_broker_configured
 from nextballup_worker.tenant import clear_worker_context, set_worker_operator_role
@@ -39,17 +51,28 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_core.constants import AuditAction, ErrorCode
+from nextballup_core.demo_preview import (
+    cleanup_expired_demo_previews,
+    mark_demo_preview_running,
+    resolve_demo_preview,
+    resolve_demo_preview_state,
+)
 from nextballup_core.enums import (
     ProcessingJobStage,
     ProcessingJobStatus,
     UploadMethod,
     VideoStatus,
 )
-from nextballup_core.settings import Settings, reload_settings
+from nextballup_core.errors import ConflictError, ServiceUnavailableError
+from nextballup_core.settings import Settings, get_settings, reload_settings
 from nextballup_db.models.audit import AuditLog
+from nextballup_db.models.email_verification import EmailVerificationToken
+from nextballup_db.models.user import User
 from nextballup_db.models.video import ProcessingJob, Video
 
 API = "/api/v1"
+_MP4_PAYLOAD = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+_PNG_PAYLOAD = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
 
 
 # ---- Fake storage ---------------------------------------------------------
@@ -60,18 +83,27 @@ class FakeWorkerStorage:
 
     def __init__(self) -> None:
         self.object_sizes: dict[str, int] = {}
+        self.object_metadata: dict[str, dict[str, str]] = {}
         self.pending_multiparts: dict[str, tuple[str, int]] = {}
         self.aborted_multiparts: list[dict[str, str]] = []
         self.completed_multiparts: list[dict[str, Any]] = []
+        self.download_payload = _MP4_PAYLOAD + b"fake-video"
         # Toggle to simulate object gone missing mid-pipeline.
         self.drop_keys: set[str] = set()
         self.head_fail_keys: set[str] = set()
+        self.delete_fail_keys: set[str] = set()
+        self.abort_fail_upload_ids: set[str] = set()
 
     def is_configured(self) -> bool:
         return True
 
     def presign_upload(
-        self, *, key: str, content_type: str, file_size_bytes: int
+        self,
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
     ) -> PresignedUpload:
         if file_size_bytes <= 1_073_741_824:
             self.object_sizes[key] = file_size_bytes
@@ -97,8 +129,19 @@ class FakeWorkerStorage:
             self.object_sizes[key] = size
 
     def abort_multipart(self, *, key: str, upload_id: str) -> None:
+        if upload_id in self.abort_fail_upload_ids:
+            from nextballup_api.storage import StorageFailureError
+
+            raise StorageFailureError("Simulated multipart abort failure", details={"key": key})
         self.aborted_multiparts.append({"key": key, "upload_id": upload_id})
         self.pending_multiparts.pop(upload_id, None)
+
+    def delete_object(self, *, key: str) -> None:
+        if key in self.delete_fail_keys:
+            from nextballup_api.storage import StorageFailureError
+
+            raise StorageFailureError("Simulated delete failure", details={"key": key})
+        self.object_sizes.pop(key, None)
 
     def head_object(self, *, key: str) -> dict[str, Any] | None:
         if key in self.head_fail_keys:
@@ -114,7 +157,11 @@ class FakeWorkerStorage:
         # treats it as a single-part upload (matches how MinIO returns it
         # for files under the multipart threshold).
         synthetic_md5 = (key.encode("utf-8").hex().ljust(32, "0"))[:32]
-        return {"ContentLength": size, "ETag": f'"{synthetic_md5}"'}
+        return {
+            "ContentLength": size,
+            "ETag": f'"{synthetic_md5}"',
+            "Metadata": self.object_metadata.get(key, {}),
+        }
 
     def presign_get(
         self, *, key: str, expires_in: int, response_content_type: str | None = None
@@ -123,10 +170,18 @@ class FakeWorkerStorage:
         return f"https://fake-storage.test/{key}?X-Get=1&exp={expires_in}{ct_param}"
 
     def download_file(self, *, key: str, destination: str) -> None:
-        Path(destination).write_bytes(b"fake-video")
+        Path(destination).write_bytes(self.download_payload)
 
-    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+    def upload_file(
+        self,
+        *,
+        key: str,
+        source: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         self.object_sizes[key] = Path(source).stat().st_size
+        self.object_metadata[key] = dict(metadata or {})
 
 
 # ---- Fixtures -------------------------------------------------------------
@@ -169,6 +224,40 @@ async def storage_client(
         app.dependency_overrides.clear()
 
 
+@pytest.fixture()
+def demo_preview_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[dict[str, Path]]:
+    training_root = tmp_path / "training"
+    script_path = training_root / "scripts" / "local_demo_infer.py"
+    config_path = training_root / "configs" / "demo.yaml"
+    checkpoint_path = training_root / "checkpoints" / "demo.pth"
+    preview_root = tmp_path / "demo_previews"
+
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    script_path.write_text("print('stub demo infer')\n", encoding="utf-8")
+    config_path.write_text("id: demo\n", encoding="utf-8")
+    checkpoint_path.write_bytes(b"checkpoint")
+
+    monkeypatch.setenv("CV_DEMO_PREVIEW_ENABLED", "true")
+    monkeypatch.setenv("CV_DEMO_PREVIEW_ROOT", str(preview_root))
+    monkeypatch.setenv("CV_DEMO_TRAINING_REPO_ROOT", str(training_root))
+    monkeypatch.setenv("CV_DEMO_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("CV_DEMO_CHECKPOINT_PATH", str(checkpoint_path))
+
+    reload_settings()
+    try:
+        yield {
+            "training_root": training_root,
+            "preview_root": preview_root,
+            "config_path": config_path,
+            "checkpoint_path": checkpoint_path,
+        }
+    finally:
+        reload_settings()
+
+
 # ---- Helpers --------------------------------------------------------------
 
 
@@ -205,6 +294,13 @@ def _game_body(team_id: str) -> dict[str, Any]:
         "period_length_minutes": 8,
         "notes": "District opener",
     }
+
+
+def _shot_clock_game_body(team_id: str) -> dict[str, Any]:
+    body = _game_body(team_id)
+    body["shot_clock_enabled"] = True
+    body["shot_clock_seconds"] = 30
+    return body
 
 
 def _upload_body(game_id: str, **overrides: Any) -> dict[str, Any]:
@@ -274,6 +370,62 @@ async def _count_actions(session: AsyncSession, *, team_id: uuid.UUID, action: s
     )
     await clear_worker_context(session)
     return int(count or 0)
+
+
+# ---- retention cleanup ----------------------------------------------------
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_cleanup_email_verification_tokens_prunes_used_or_expired_tokens(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    email = "email-token-cleanup@example.com"
+    response = await storage_client.post(f"{API}/auth/register", json=_coach(email))
+    assert response.status_code == 201, response.text
+    user = await db_session.scalar(select(User).where(User.email == email))
+    assert user is not None
+    now = datetime.now(tz=UTC)
+    expired = EmailVerificationToken(
+        user_id=user.id,
+        token_hash="1" * 64,
+        expires_at=now - timedelta(days=8),
+        created_at=now - timedelta(days=8),
+    )
+    used = EmailVerificationToken(
+        user_id=user.id,
+        token_hash="2" * 64,
+        expires_at=now + timedelta(minutes=30),
+        used_at=now,
+        created_at=now - timedelta(minutes=5),
+    )
+    active = EmailVerificationToken(
+        user_id=user.id,
+        token_hash="3" * 64,
+        expires_at=now + timedelta(minutes=30),
+        created_at=now - timedelta(minutes=5),
+    )
+    db_session.add_all([expired, used, active])
+    await db_session.flush()
+
+    pruned = await cleanup_email_verification_tokens(
+        db_session,
+        settings=Settings(),
+        request_id="test.email_token_cleanup",
+    )
+    assert pruned == 2
+    remaining = await db_session.scalars(
+        select(EmailVerificationToken.token_hash).where(
+            EmailVerificationToken.token_hash.in_(["1" * 64, "2" * 64, "3" * 64])
+        )
+    )
+    assert set(remaining.all()) == {"3" * 64}
+    audit = await db_session.scalar(
+        select(AuditLog).where(AuditLog.action == AuditAction.USER_EMAIL_VERIFICATION_TOKENS_PRUNED)
+    )
+    assert audit is not None
+    assert (audit.extra or {}).get("count") == 2
+    assert (audit.extra or {}).get("criterion") == "used_or_expired"
 
 
 # ---- claim_job ------------------------------------------------------------
@@ -419,12 +571,16 @@ async def test_execute_transcode_happy_path(
     assert verification["content_length"] == 250 * 1024 * 1024
     assert verification["client_checksum_present"] is True
     assert job.result_metadata["transcode_mode"] == "test-stub"
+    assert job.result_metadata["output_sha256"] == "b" * 64
     assert job.result_metadata["outputs"]["mezzanine"].startswith(f"mezzanine/{team_id}/")
 
     video = await _load_video(db_session, video_id)
     assert video.status is VideoStatus.PROCESSED
     assert video.storage_key_mezzanine is not None
     assert video.storage_key_mezzanine != video.storage_key_raw
+    assert video.storage_output_sha256 == "b" * 64
+    assert video.raw_retention_expires_at is not None
+    assert video.uploaded_by is not None
 
     # Audit lifecycle: STARTED + COMPLETED must both be present for the team.
     assert (
@@ -433,12 +589,171 @@ async def test_execute_transcode_happy_path(
         )
         == 1
     )
+    await set_worker_operator_role(db_session)
+    completed_audit = await db_session.scalar(
+        select(AuditLog)
+        .where(
+            AuditLog.team_id == team_id,
+            AuditLog.action == AuditAction.VIDEO_PROCESSING_COMPLETED,
+        )
+        .order_by(AuditLog.created_at.desc())
+    )
+    await clear_worker_context(db_session)
+    assert completed_audit is not None
+    assert completed_audit.extra is not None
+    assert completed_audit.extra["originating_user_id"] == str(video.uploaded_by)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_transcode_legacy_video_without_uploader_still_audits(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="legacy-no-uploader-coach@example.com"
+    )
+    await set_worker_operator_role(db_session)
+    await db_session.execute(update(Video).where(Video.id == video_id).values(uploaded_by=None))
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    result = await execute_transcode(db_session, job_id=job_id, storage=fake_storage)
+
+    assert result.status == "completed"
+    await set_worker_operator_role(db_session)
+    completed_audit = await db_session.scalar(
+        select(AuditLog)
+        .where(
+            AuditLog.team_id == team_id,
+            AuditLog.action == AuditAction.VIDEO_PROCESSING_COMPLETED,
+        )
+        .order_by(AuditLog.created_at.desc())
+    )
+    await clear_worker_context(db_session)
+    assert completed_audit is not None
+    assert completed_audit.extra is not None
+    assert "originating_user_id" not in completed_audit.extra
     assert (
         await _count_actions(
             db_session, team_id=team_id, action=AuditAction.VIDEO_PROCESSING_COMPLETED
         )
         == 1
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_transcode_queues_detection_when_cv_pipeline_enabled(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="cv-queue-coach@example.com"
+    )
+    settings = get_settings().model_copy(update={"cv_pipeline_enabled": True})
+
+    result = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        storage=fake_storage,
+        settings=settings,
+    )
+    assert result.status == "completed"
+
+    detection = await db_session.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video_id,
+            ProcessingJob.stage == ProcessingJobStage.DETECTION,
+        )
+    )
+    assert detection is not None
+    assert detection.team_id == team_id
+    assert detection.status is ProcessingJobStatus.PENDING
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_cv_stage_fails_closed_without_active_model_artifact(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    _, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="cv-artifact-required@example.com"
+    )
+    settings = get_settings().model_copy(update={"cv_pipeline_enabled": True})
+    await execute_transcode(db_session, job_id=job_id, storage=fake_storage, settings=settings)
+    detection = await db_session.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video_id,
+            ProcessingJob.stage == ProcessingJobStage.DETECTION,
+        )
+    )
+    assert detection is not None
+
+    result = await execute_cv_stage(db_session, job_id=detection.id, settings=settings)
+
+    assert result.status == "failed"
+    assert result.error_code == ErrorCode.CV_MODEL_ARTIFACT_REQUIRED
+    failed = await _load_job(db_session, detection.id)
+    assert failed.status is ProcessingJobStatus.FAILED
+    video = await _load_video(db_session, video_id)
+    assert video.status is VideoStatus.PROCESSED
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_cv_stage_contract_mode_preserves_shot_clock_optionality(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    await storage_client.post(f"{API}/auth/register", json=_coach("cv-shot-clock@example.com"))
+    team = (await storage_client.post(f"{API}/teams", json=_team_body())).json()
+    game = (
+        await storage_client.post(f"{API}/games", json=_shot_clock_game_body(team["id"]))
+    ).json()
+    upload = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()
+    complete = (
+        await storage_client.post(
+            f"{API}/videos/{upload['id']}/complete",
+            json={"checksum_sha256": "a" * 64},
+        )
+    ).json()
+    video_id = uuid.UUID(complete["id"])
+    settings = get_settings().model_copy(
+        update={"cv_pipeline_enabled": True, "cv_require_model_artifacts": False}
+    )
+    await execute_transcode(
+        db_session,
+        job_id=uuid.UUID(complete["job_id"]),
+        storage=fake_storage,
+        settings=settings,
+    )
+    detection = await db_session.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video_id,
+            ProcessingJob.stage == ProcessingJobStage.DETECTION,
+        )
+    )
+    assert detection is not None
+
+    result = await execute_cv_stage(db_session, job_id=detection.id, settings=settings)
+    assert result.status == "completed"
+
+    completed = await _load_job(db_session, detection.id)
+    assert completed.result_metadata is not None
+    assert completed.result_metadata["contract_only"] is True
+    assert completed.result_metadata["shot_clock"] == {"enabled": True, "seconds": 30}
+    tracking = await db_session.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video_id,
+            ProcessingJob.stage == ProcessingJobStage.TRACKING,
+        )
+    )
+    assert tracking is not None
+    assert tracking.status is ProcessingJobStatus.PENDING
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -543,6 +858,53 @@ async def test_execute_transcode_size_mismatch_is_permanent(
     assert result.status == "failed"
     assert result.retryable is False
     assert result.error_code == ErrorCode.PROCESSING_SIZE_MISMATCH
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_transcode_content_type_mismatch_is_permanent_and_audited(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="content-type-mismatch-coach@example.com"
+    )
+    await set_worker_operator_role(db_session)
+    await db_session.execute(update(Video).where(Video.id == video_id).values(checksum_sha256=None))
+    await db_session.commit()
+    await clear_worker_context(db_session)
+    fake_storage.download_payload = _PNG_PAYLOAD
+    monkeypatch.setattr(
+        "nextballup_worker.runtime.transcode.create_browser_mezzanine",
+        real_create_browser_mezzanine,
+    )
+
+    result = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        storage=fake_storage,
+    )
+
+    assert result.status == "failed"
+    assert result.retryable is False
+    assert result.error_code == ErrorCode.PROCESSING_CONTENT_TYPE_MISMATCH
+    job = await _load_job(db_session, job_id)
+    assert job.status is ProcessingJobStatus.FAILED
+    video = await _load_video(db_session, video_id)
+    assert video.status is VideoStatus.FAILED
+    audit = await db_session.scalar(
+        select(AuditLog)
+        .where(
+            AuditLog.team_id == team_id,
+            AuditLog.action == AuditAction.VIDEO_PROCESSING_FAILED,
+        )
+        .order_by(AuditLog.created_at.desc())
+    )
+    assert audit is not None
+    assert audit.extra is not None
+    assert audit.extra["declared_content_type"] == "video/mp4"
+    assert audit.extra["detected_content_type"] == "image/png"
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -731,6 +1093,43 @@ async def test_cleanup_abandoned_uploads_aborts_multipart_and_marks_failed(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_cleanup_abandoned_uploads_marks_failed_when_multipart_abort_fails(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    await storage_client.post(f"{API}/auth/register", json=_coach("abort-fail@example.com"))
+    team = (await storage_client.post(f"{API}/teams", json=_team_body())).json()
+    game = (await storage_client.post(f"{API}/games", json=_game_body(team["id"]))).json()
+    initiate = (
+        await storage_client.post(
+            f"{API}/videos/upload",
+            json=_upload_body(game["id"], file_size_bytes=2 * 1024 * 1024 * 1024),
+        )
+    ).json()
+    video_id = uuid.UUID(initiate["id"])
+    video_before = await _load_video(db_session, video_id)
+    assert video_before.upload_id is not None
+    fake_storage.abort_fail_upload_ids.add(video_before.upload_id)
+
+    await set_worker_operator_role(db_session)
+    await db_session.execute(
+        update(Video)
+        .where(Video.id == video_id)
+        .values(upload_expires_at=datetime.now(tz=UTC) - timedelta(hours=2))
+    )
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    abandoned = await cleanup_abandoned_uploads(db_session, storage=fake_storage)
+
+    assert str(video_id) in abandoned
+    video_after = await _load_video(db_session, video_id)
+    assert video_after.status is VideoStatus.FAILED
+    assert video_after.upload_id is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_cleanup_abandoned_uploads_skips_fresh_windows(
     storage_client: AsyncClient,
     db_session: AsyncSession,
@@ -749,6 +1148,131 @@ async def test_cleanup_abandoned_uploads_skips_fresh_windows(
     )
     assert initiate["id"] not in abandoned
     assert fake_storage.aborted_multiparts == []
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_cleanup_expired_raw_videos_deletes_terminal_source_object(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="raw-retention-coach@example.com"
+    )
+    result = await execute_transcode(db_session, job_id=job_id, storage=fake_storage)
+    assert result.status == "completed"
+
+    video_before = await _load_video(db_session, video_id)
+    raw_key = video_before.storage_key_raw
+    assert raw_key is not None
+    assert raw_key in fake_storage.object_sizes
+
+    await set_worker_operator_role(db_session)
+    await db_session.execute(
+        update(Video)
+        .where(Video.id == video_id)
+        .values(raw_retention_expires_at=datetime.now(tz=UTC) - timedelta(seconds=1))
+    )
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    deleted = await cleanup_expired_raw_videos(db_session, storage=fake_storage)
+    assert str(video_id) in deleted
+    assert raw_key not in fake_storage.object_sizes
+
+    video_after = await _load_video(db_session, video_id)
+    assert video_after.raw_delete_requested_at is not None
+    assert video_after.raw_storage_deleted_at is not None
+    assert video_after.raw_deleted_at is not None
+    assert video_after.raw_delete_reason == "retention_expired"
+    assert video_after.storage_key_raw is None
+    assert video_after.storage_etag is None
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_RAW_OBJECT_DELETED,
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_cleanup_expired_raw_videos_retries_when_storage_delete_fails(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="raw-delete-failure-coach@example.com"
+    )
+    result = await execute_transcode(db_session, job_id=job_id, storage=fake_storage)
+    assert result.status == "completed"
+
+    video_before = await _load_video(db_session, video_id)
+    raw_key = video_before.storage_key_raw
+    assert raw_key is not None
+    fake_storage.delete_fail_keys.add(raw_key)
+
+    await set_worker_operator_role(db_session)
+    await db_session.execute(
+        update(Video)
+        .where(Video.id == video_id)
+        .values(raw_retention_expires_at=datetime.now(tz=UTC) - timedelta(seconds=1))
+    )
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    first = await cleanup_expired_raw_videos(db_session, storage=fake_storage)
+    assert str(video_id) not in first
+    assert raw_key in fake_storage.object_sizes
+    video_after_failure = await _load_video(db_session, video_id)
+    assert video_after_failure.raw_delete_requested_at is not None
+    assert video_after_failure.raw_delete_failed_at is not None
+    assert video_after_failure.raw_storage_deleted_at is None
+    assert video_after_failure.raw_deleted_at is None
+    assert video_after_failure.raw_delete_reason == "retention_expired"
+    assert video_after_failure.storage_key_raw == raw_key
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_RAW_OBJECT_DELETE_FAILED,
+        )
+        == 1
+    )
+
+    fake_storage.delete_fail_keys.remove(raw_key)
+    second = await retry_raw_video_storage_deletes(db_session, storage=fake_storage)
+    assert str(video_id) in second
+    assert raw_key not in fake_storage.object_sizes
+    video_after_retry = await _load_video(db_session, video_id)
+    assert video_after_retry.raw_delete_requested_at is not None
+    assert video_after_retry.raw_storage_deleted_at is not None
+    assert video_after_retry.raw_deleted_at is not None
+    assert video_after_retry.raw_delete_failed_at is None
+    assert video_after_retry.raw_delete_reason == "retention_expired"
+    assert video_after_retry.storage_key_raw is None
+    assert video_after_retry.storage_etag is None
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_RAW_OBJECT_DELETED,
+        )
+        == 1
+    )
+
+    third = await retry_raw_video_storage_deletes(db_session, storage=fake_storage)
+    assert str(video_id) not in third
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_RAW_OBJECT_DELETED,
+        )
+        == 1
+    )
 
 
 # ---- dispatch_pending_jobs ----------------------------------------------
@@ -955,6 +1479,59 @@ def test_worker_startup_requires_runtime_db_role_in_production(
         reload_settings()
 
 
+def test_worker_startup_requires_media_sandbox_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://localhost:6379/1")
+    monkeypatch.setenv(
+        "DATABASE_URL_RUNTIME",
+        "postgresql+asyncpg://nextballup_app:nextballup_app_pw@localhost:5432/nextballup",
+    )
+    monkeypatch.setenv("WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED", "false")
+    monkeypatch.setenv("WORKER_MEDIA_MAX_CPU_SECONDS", "7200")
+    monkeypatch.setenv("WORKER_MEDIA_MAX_OUTPUT_BYTES", "107374182400")
+    reload_settings()
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED must be true",
+        ):
+            _ensure_runtime_broker_configured()
+    finally:
+        monkeypatch.setenv("APP_ENV", "test")
+        monkeypatch.delenv("DATABASE_URL_RUNTIME", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_MAX_CPU_SECONDS", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_MAX_OUTPUT_BYTES", raising=False)
+        reload_settings()
+
+
+def test_worker_startup_requires_demo_preview_dependencies_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    training_root = tmp_path / "training"
+    training_root.mkdir()
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://localhost:6379/1")
+    monkeypatch.setenv("CV_DEMO_PREVIEW_ENABLED", "true")
+    monkeypatch.setenv("CV_DEMO_TRAINING_REPO_ROOT", str(training_root))
+    monkeypatch.setenv("CV_DEMO_CONFIG_PATH", str(training_root / "missing.yaml"))
+    monkeypatch.setenv("CV_DEMO_CHECKPOINT_PATH", str(training_root / "missing.pth"))
+    reload_settings()
+    try:
+        with pytest.raises(RuntimeError, match="dependencies are not available"):
+            _ensure_runtime_broker_configured()
+    finally:
+        monkeypatch.setenv("APP_ENV", "test")
+        monkeypatch.delenv("CV_DEMO_PREVIEW_ENABLED", raising=False)
+        monkeypatch.delenv("CV_DEMO_TRAINING_REPO_ROOT", raising=False)
+        monkeypatch.delenv("CV_DEMO_CONFIG_PATH", raising=False)
+        monkeypatch.delenv("CV_DEMO_CHECKPOINT_PATH", raising=False)
+        reload_settings()
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_worker_session_uses_runtime_database_url(
     monkeypatch: pytest.MonkeyPatch,
@@ -1058,6 +1635,261 @@ async def test_dead_letter_marks_terminal_failed_after_manual_fail(
     assert terminal.status is ProcessingJobStatus.FAILED
     assert "max retries exhausted" in (terminal.error_message or "")
     assert (terminal.result_metadata or {}).get("attempt") == 3
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_demo_preview_completes_and_updates_video_detail(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="worker-demo-preview@example.com"
+    )
+    transcode = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        celery_task_id="celery-transcode-demo-preview",
+        storage=fake_storage,
+    )
+    assert transcode.status == "completed"
+
+    def _fake_runner(*, settings: Any, input_path: Path, output_path: Path) -> None:
+        assert input_path.is_file()
+        output_path.write_bytes(b"annotated-preview")
+
+    monkeypatch.setattr("nextballup_core.demo_preview._run_demo_preview_inference", _fake_runner)
+
+    result = await execute_demo_preview(
+        db_session,
+        video_id=video_id,
+        celery_task_id="celery-demo-preview",
+        settings=get_settings(),
+        storage=fake_storage,
+    )
+    assert result.status == "completed"
+
+    preview_path = demo_preview_env["preview_root"] / str(video_id) / "demo-preview.annotated.mp4"
+    assert preview_path.is_file()
+    assert preview_path.read_bytes() == b"annotated-preview"
+
+    detail = await storage_client.get(f"{API}/videos/{video_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["demo_preview_status"] == "completed"
+    assert body["demo_preview_url"] == f"/api/v1/videos/{video_id}/demo-preview/artifact"
+    assert body["demo_preview_generated_at"] is not None
+    assert body["demo_preview_error_message"] is None
+
+    artifact = await storage_client.get(f"{API}/videos/{video_id}/demo-preview/artifact")
+    assert artifact.status_code == 200, artifact.text
+    assert artifact.headers["cache-control"] == "private, no-store, max-age=0"
+    assert artifact.content == b"annotated-preview"
+
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_DEMO_PREVIEW_GENERATED,
+        )
+        >= 1
+    )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_demo_preview_does_not_mark_running_before_lock_acquisition(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="worker-demo-preview-lock-order@example.com"
+    )
+    transcode = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        celery_task_id="celery-transcode-demo-preview-lock-order",
+        storage=fake_storage,
+    )
+    assert transcode.status == "completed"
+
+    async def _check_state_before_render(**kwargs: Any) -> Any:
+        state = resolve_demo_preview_state(settings=get_settings(), video_id=video_id)
+        assert state.status != "running"
+        raise ServiceUnavailableError(
+            "synthetic preview failure",
+            code=ErrorCode.DEMO_PREVIEW_FAILED,
+        )
+
+    monkeypatch.setattr(
+        "nextballup_worker.runtime.demo_preview.render_demo_preview_artifact",
+        _check_state_before_render,
+    )
+
+    result = await execute_demo_preview(
+        db_session,
+        video_id=video_id,
+        celery_task_id="celery-demo-preview-lock-order",
+        settings=get_settings(),
+        storage=fake_storage,
+    )
+    assert result.status == "failed"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_demo_preview_in_progress_duplicate_is_skipped(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="worker-demo-preview-duplicate@example.com"
+    )
+    transcode = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        celery_task_id="celery-transcode-demo-preview-duplicate",
+        storage=fake_storage,
+    )
+    assert transcode.status == "completed"
+
+    mark_demo_preview_running(
+        settings=get_settings(),
+        video_id=video_id,
+        task_id="winning-task",
+    )
+
+    async def _raise_in_progress(**kwargs: Any) -> Any:
+        raise ConflictError(
+            "A local demo preview is already being generated for this video",
+            code=ErrorCode.DEMO_PREVIEW_IN_PROGRESS,
+        )
+
+    monkeypatch.setattr(
+        "nextballup_worker.runtime.demo_preview.render_demo_preview_artifact",
+        _raise_in_progress,
+    )
+
+    result = await execute_demo_preview(
+        db_session,
+        video_id=video_id,
+        celery_task_id="celery-demo-preview-duplicate",
+        settings=get_settings(),
+        storage=fake_storage,
+    )
+    assert result.status == "skipped"
+
+    detail = await storage_client.get(f"{API}/videos/{video_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["demo_preview_status"] == "running"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_finalize_demo_preview_failure_marks_state_and_audits(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="worker-demo-preview-fail@example.com"
+    )
+    transcode = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        celery_task_id="celery-transcode-demo-preview-fail",
+        storage=fake_storage,
+    )
+    assert transcode.status == "completed"
+
+    result = await finalize_demo_preview_failure(
+        db_session,
+        video_id=video_id,
+        celery_task_id="celery-demo-preview-fail",
+        settings=get_settings(),
+        error_code=ErrorCode.DEMO_PREVIEW_MACHINE_BUSY,
+        error_message="demo preview retries exhausted",
+    )
+
+    assert result.status == "failed"
+
+    detail = await storage_client.get(f"{API}/videos/{video_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["demo_preview_status"] == "failed"
+    assert body["demo_preview_error_message"] == "demo preview retries exhausted"
+
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_DEMO_PREVIEW_FAILED,
+        )
+        >= 1
+    )
+
+
+def test_cleanup_expired_demo_previews_prunes_old_preview_dirs(
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    old_video_id = uuid.uuid4()
+    fresh_video_id = uuid.uuid4()
+
+    old_dir = demo_preview_env["preview_root"] / str(old_video_id)
+    old_dir.mkdir(parents=True, exist_ok=True)
+    (old_dir / "demo-preview.annotated.mp4").write_bytes(b"old-preview")
+
+    fresh_dir = demo_preview_env["preview_root"] / str(fresh_video_id)
+    fresh_dir.mkdir(parents=True, exist_ok=True)
+    (fresh_dir / "demo-preview.annotated.mp4").write_bytes(b"fresh-preview")
+
+    stale_timestamp = time.time() - (settings.cv_demo_retention_seconds + 60)
+    os.utime(old_dir, (stale_timestamp, stale_timestamp))
+    os.utime(old_dir / "demo-preview.annotated.mp4", (stale_timestamp, stale_timestamp))
+
+    cleaned = cleanup_expired_demo_previews(settings=settings)
+
+    assert str(old_video_id) in cleaned
+    assert not old_dir.exists()
+    assert fresh_dir.exists()
+
+
+def test_resolve_demo_preview_repairs_legacy_permissions(
+    demo_preview_env: dict[str, Path],
+) -> None:
+    settings = get_settings()
+    preview_root = demo_preview_env["preview_root"]
+    preview_root.mkdir(parents=True, exist_ok=True)
+    preview_root.chmod(0o755)
+
+    video_id = uuid.uuid4()
+    preview_dir = preview_root / str(video_id)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview_dir.chmod(0o755)
+
+    preview_path = preview_dir / "demo-preview.annotated.mp4"
+    preview_path.write_bytes(b"preview")
+    preview_path.chmod(0o644)
+
+    state_path = preview_dir / "demo-preview.state.json"
+    state_path.write_text('{"status":"completed"}\n', encoding="utf-8")
+    state_path.chmod(0o644)
+
+    artifact = resolve_demo_preview(settings=settings, video_id=video_id)
+
+    assert artifact is not None
+    assert stat.S_IMODE(preview_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(preview_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(preview_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
 
 
 # Unused local symbol suppression

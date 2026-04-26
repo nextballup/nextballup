@@ -8,6 +8,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_core.enums import ProcessingJobStatus, VideoStatus
+from nextballup_core.observability import WORKER_JOBS_FAILED_TOTAL
 from nextballup_db.models.video import ProcessingJob, Video
 
 
@@ -124,7 +125,10 @@ async def fail_job(
         .returning(ProcessingJob)
         .execution_options(populate_existing=True)
     )
-    return result.scalar_one_or_none()
+    job = result.scalar_one_or_none()
+    if job is not None:
+        WORKER_JOBS_FAILED_TOTAL.labels(stage=job.stage.value, error_code=error_code).inc()
+    return job
 
 
 async def release_job_for_retry(

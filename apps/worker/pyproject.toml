@@ -9,6 +9,7 @@ dependencies = [
     "nextballup-clips",
     "celery[redis]>=5.4,<5.7",
     "boto3>=1.35",
+    "filetype>=1.2,<2",
     "redis>=5.0,<6",
 ]
 

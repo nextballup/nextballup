@@ -47,7 +47,6 @@ async def test_app_role_has_crud_on_tenant_tables(db_session: AsyncSession) -> N
         "games",
         "videos",
         "processing_jobs",
-        "audit_logs",
     ]
     for table in tables:
         privs = {
@@ -67,6 +66,66 @@ async def test_app_role_has_crud_on_tenant_tables(db_session: AsyncSession) -> N
         )
         # Defense-in-depth: the role must NOT have DDL-ish grants.
         assert "TRUNCATE" not in privs, f"nextballup_app should not have TRUNCATE on {table}"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_app_role_has_append_only_table_grants(db_session: AsyncSession) -> None:
+    for table in ("audit_logs", "csp_reports", "usage_events"):
+        privs = {
+            row[0]
+            for row in (
+                await db_session.execute(
+                    text(
+                        "SELECT privilege_type FROM information_schema.table_privileges "
+                        "WHERE grantee = 'nextballup_app' AND table_name = :tbl"
+                    ),
+                    {"tbl": table},
+                )
+            ).all()
+        }
+        assert {"SELECT", "INSERT"}.issubset(privs), (
+            f"nextballup_app is missing append-only grants on {table}: {privs}"
+        )
+        assert "UPDATE" not in privs
+        assert "DELETE" not in privs
+        assert "TRUNCATE" not in privs
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_app_role_cannot_mutate_cv_model_artifact_catalog(
+    db_session: AsyncSession,
+) -> None:
+    privs = {
+        row[0]
+        for row in (
+            await db_session.execute(
+                text(
+                    "SELECT privilege_type FROM information_schema.table_privileges "
+                    "WHERE grantee = 'nextballup_app' AND table_name = 'cv_model_artifacts'"
+                )
+            )
+        ).all()
+    }
+    assert "SELECT" in privs
+    assert "INSERT" not in privs
+    assert "UPDATE" not in privs
+    assert "DELETE" not in privs
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_app_role_can_execute_csp_report_prune_function(
+    db_session: AsyncSession,
+) -> None:
+    can_execute = await db_session.scalar(
+        text(
+            "SELECT has_function_privilege("
+            "'nextballup_app', "
+            "'nextballup_prune_csp_reports(timestamp with time zone)', "
+            "'EXECUTE'"
+            ")"
+        )
+    )
+    assert can_execute is True
 
 
 def test_runtime_database_url_requires_explicit_runtime_role_in_production() -> None:

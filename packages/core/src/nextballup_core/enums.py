@@ -109,3 +109,52 @@ class ProcessingJobStatus(StrEnum):
 class UploadMethod(StrEnum):
     PUT = "PUT"
     MULTIPART = "MULTIPART"
+
+
+class ModelArtifactStatus(StrEnum):
+    CANDIDATE = "candidate"
+    ACTIVE = "active"
+    RETIRED = "retired"
+    BLOCKED = "blocked"
+
+
+class VideoEventType(StrEnum):
+    SHOT_ATTEMPT = "shot_attempt"
+    SHOT_MADE = "shot_made"
+    REBOUND = "rebound"
+    PASS = "pass"
+
+
+class ReviewStatus(StrEnum):
+    MACHINE_ONLY = "machine_only"
+    NEEDS_REVIEW = "needs_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class BillingAccountStatus(StrEnum):
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    CLOSED = "closed"
+
+
+class SubscriptionStatus(StrEnum):
+    TRIALING = "trialing"
+    ACTIVE = "active"
+    PAST_DUE = "past_due"
+    CANCELED = "canceled"
+    INCOMPLETE = "incomplete"
+
+
+class PlanCode(StrEnum):
+    """Stable plan identifiers seeded by migration 0012.
+
+    The integer tier on the row drives capability comparisons; the code is
+    used by humans and seed scripts. Adding a new plan adds a value here and
+    a row in the seed migration.
+    """
+
+    FREE = "free"
+    STARTER = "starter"
+    PRO = "pro"
+    ENTERPRISE = "enterprise"

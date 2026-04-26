@@ -28,6 +28,7 @@ const devLocalStorageOrigins = isDev
 
 export function middleware(request: NextRequest) {
   const nonce = base64Nonce();
+  const cspReportUrl = new URL("/api/v1/_csp-report", request.url).toString();
   const csp = [
     "default-src 'self'",
     "base-uri 'self'",
@@ -45,6 +46,8 @@ export function middleware(request: NextRequest) {
     "style-src 'self' 'unsafe-inline'",
     `connect-src 'self' https:${isDev ? ` ws: wss: ${devLocalStorageOrigins.join(" ")}` : ""}`,
     "worker-src 'self' blob:",
+    "report-uri /api/v1/_csp-report",
+    "report-to csp-endpoint",
   ].join("; ");
 
   const requestHeaders = new Headers(request.headers);
@@ -53,6 +56,14 @@ export function middleware(request: NextRequest) {
 
   const response = NextResponse.next({ request: { headers: requestHeaders } });
   response.headers.set("Content-Security-Policy", csp);
+  response.headers.set(
+    "Report-To",
+    JSON.stringify({
+      group: "csp-endpoint",
+      max_age: 10886400,
+      endpoints: [{ url: cspReportUrl }],
+    }),
+  );
   return response;
 }
 

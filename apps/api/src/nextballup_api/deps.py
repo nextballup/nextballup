@@ -31,10 +31,13 @@ def _extract_token(request: Request, settings: Settings) -> str:
     cookie = request.cookies.get(f"__Host-{settings.cookie_access_name}") or request.cookies.get(
         settings.cookie_access_name
     )
+    auth_header = request.headers.get("authorization") or ""
+    has_bearer = auth_header.lower().startswith("bearer ")
+    if cookie and has_bearer:
+        raise AuthenticationError("Ambiguous authentication credentials")
     if cookie:
         return cookie
-    auth_header = request.headers.get("authorization") or ""
-    if auth_header.lower().startswith("bearer "):
+    if has_bearer:
         return auth_header.split(" ", 1)[1].strip()
     raise AuthenticationError("Missing authentication credentials")
 
@@ -71,4 +74,29 @@ async def get_current_user(
     user = result.scalar_one_or_none()
     if user is None:  # pragma: no cover - guarded by the earlier point lookup
         raise AuthenticationError("User is no longer active")
+    return user
+
+
+async def get_optional_current_user(
+    request: Request,
+    session: AsyncSession,
+    settings: Settings,
+) -> User | None:
+    """Best-effort auth binding for anonymous-compatible endpoints.
+
+    CSP report ingestion must remain anonymous-safe, but when a valid access
+    cookie is present we attach the user id so subject exports/deletion can
+    find those diagnostic rows without over-broad IP/User-Agent matching.
+    """
+    try:
+        token = _extract_token(request, settings)
+        claims = decode_token(token, expected_type="access", settings=settings)
+        user_id = uuid.UUID(claims["sub"])
+    except Exception:
+        return None
+    await set_user_context(session, user_id)
+    user = await session.get(User, user_id)
+    if user is None or not user.is_active or claims.get("sv") != user.session_version:
+        return None
+    await set_user_role_context(session, user.role)
     return user

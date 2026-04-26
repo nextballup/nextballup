@@ -26,6 +26,7 @@ def _build_claims(
     token_type: TokenType,
     expires_in: timedelta,
     settings: Settings,
+    jti: str | None = None,
 ) -> dict[str, Any]:
     now = _now_utc()
     return {
@@ -37,7 +38,7 @@ def _build_claims(
         "iss": settings.jwt_issuer,
         "iat": int(now.timestamp()),
         "exp": int((now + expires_in).timestamp()),
-        "jti": str(uuid.uuid4()),
+        "jti": jti or str(uuid.uuid4()),
     }
 
 
@@ -74,6 +75,7 @@ def create_refresh_token(
     session_version: int,
     team_ids: list[uuid.UUID] | None = None,
     settings: Settings | None = None,
+    jti: str | None = None,
 ) -> str:
     settings = settings or get_settings()
     claims = _build_claims(
@@ -84,6 +86,7 @@ def create_refresh_token(
         token_type="refresh",
         expires_in=timedelta(days=settings.refresh_token_expire_days),
         settings=settings,
+        jti=jti,
     )
     encoded: str = jwt.encode(
         claims,

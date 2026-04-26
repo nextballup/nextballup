@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_core.constants import AuditAction
 from nextballup_core.enums import ProcessingJobStage, ProcessingJobStatus
+from nextballup_core.observability import WORKER_JOBS_DISPATCHED_TOTAL
 from nextballup_core.settings import Settings, get_settings
 from nextballup_db.models.video import ProcessingJob
 from nextballup_worker.audit import write_worker_audit
@@ -90,6 +91,7 @@ async def dispatch_pending_jobs(
             },
         )
         await session.commit()
+        WORKER_JOBS_DISPATCHED_TOTAL.labels(stage=job.stage.value).inc()
         dispatched.append(str(job.id))
     await clear_worker_context(session)
     return dispatched

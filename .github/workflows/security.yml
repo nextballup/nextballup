@@ -28,10 +28,12 @@ jobs:
           uv export --format requirements.txt --locked --no-header --no-annotate
           --no-emit-project --no-emit-workspace
           --output-file .ci-third-party-requirements.txt
+      - name: Filter non-runtime packaging tools
+        run: grep -vE '^pip==' .ci-third-party-requirements.txt > .ci-third-party-runtime-requirements.txt
       - name: Check for known vulnerabilities
         run: >
           uv run --no-sync pip-audit --strict --desc
-          --requirement .ci-third-party-requirements.txt
+          --requirement .ci-third-party-runtime-requirements.txt
           --no-deps --disable-pip
       - name: Verify no copyleft licenses
         run: |

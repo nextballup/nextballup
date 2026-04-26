@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from nextballup_api.demo_preview import queue_demo_preview_request
 from nextballup_api.routers.videos import get_storage
 from nextballup_api.security.jwt import create_access_token
 from nextballup_api.security.passwords import hash_password
@@ -17,6 +23,8 @@ from nextballup_api.storage import (
     StorageFailureError,
     StoragePresigner,
 )
+from nextballup_api.video_playback_status import derive_playback_status
+from nextballup_worker.runtime import execute_transcode
 from nextballup_worker.tenant import clear_worker_context, set_worker_operator_role
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,8 +37,10 @@ from nextballup_core.enums import (
     UserRole,
     VideoStatus,
 )
+from nextballup_core.errors import TooManyRequestsError
 from nextballup_core.settings import get_settings
 from nextballup_db.models.audit import AuditLog
+from nextballup_db.models.billing import UsageEvent
 from nextballup_db.models.user import User
 from nextballup_db.models.video import ProcessingJob, Video
 
@@ -45,6 +55,7 @@ class FakeStorage:
         self.completed_multiparts: list[dict[str, Any]] = []
         self.aborted_multiparts: list[dict[str, Any]] = []
         self.object_sizes: dict[str, int] = {}
+        self.object_metadata: dict[str, dict[str, str]] = {}
         self.pending_multiparts: dict[str, tuple[str, int]] = {}
         self.fail_presign = False
         self.fail_complete = False
@@ -54,7 +65,12 @@ class FakeStorage:
         return True
 
     def presign_upload(
-        self, *, key: str, content_type: str, file_size_bytes: int
+        self,
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
     ) -> PresignedUpload:
         if self.fail_presign:
             self.fail_presign = False
@@ -100,13 +116,16 @@ class FakeStorage:
         self.aborted_multiparts.append({"key": key, "upload_id": upload_id})
         self.pending_multiparts.pop(upload_id, None)
 
+    def delete_object(self, *, key: str) -> None:
+        self.object_sizes.pop(key, None)
+
     def head_object(self, *, key: str) -> dict[str, Any] | None:
         if key in self.fail_head_for_keys:
             return None
         size = self.object_sizes.get(key)
         if size is None:
             return None
-        return {"ContentLength": size}
+        return {"ContentLength": size, "Metadata": self.object_metadata.get(key, {})}
 
     def presign_get(
         self, *, key: str, expires_in: int, response_content_type: str | None = None
@@ -117,8 +136,16 @@ class FakeStorage:
     def download_file(self, *, key: str, destination: str) -> None:
         Path(destination).write_bytes(b"fake-video")
 
-    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+    def upload_file(
+        self,
+        *,
+        key: str,
+        source: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         self.object_sizes[key] = Path(source).stat().st_size
+        self.object_metadata[key] = dict(metadata or {})
 
 
 # ---- Fixtures -------------------------------------------------------------
@@ -243,6 +270,13 @@ def _game_body(team_id: str) -> dict[str, Any]:
     }
 
 
+def _shot_clock_game_body(team_id: str) -> dict[str, Any]:
+    body = _game_body(team_id)
+    body["shot_clock_enabled"] = True
+    body["shot_clock_seconds"] = 30
+    return body
+
+
 def _upload_body(game_id: str, **overrides: Any) -> dict[str, Any]:
     body: dict[str, Any] = {
         "game_id": game_id,
@@ -251,6 +285,21 @@ def _upload_body(game_id: str, **overrides: Any) -> dict[str, Any]:
         "content_type": "video/mp4",
         "camera_position": "sideline",
         "camera_height": "elevated",
+    }
+    body.update(overrides)
+    return body
+
+
+def _privacy_consent_body(**overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "label": "2026 guardian and athlete video release",
+        "consent_source": "written_permission",
+        "covers_video_uploads": True,
+        "covers_cv_processing": True,
+        "commercial_ml_training_allowed": False,
+        "minors_authorized": True,
+        "athlete_pii_authorized": True,
+        "evidence_uri": "s3://legal-evidence/team-release-2026.pdf",
     }
     body.update(overrides)
     return body
@@ -271,6 +320,31 @@ async def _setup_coach_team_game(
         "dict[str, Any]", (await client.post(f"{API}/games", json=_game_body(team["id"]))).json()
     )
     return team, game
+
+
+async def _seed_processed_video(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    *,
+    coach_email: str,
+) -> tuple[dict[str, Any], uuid.UUID]:
+    team, game = await _setup_coach_team_game(client, coach_email=coach_email)
+    upload = await client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    assert upload.status_code == 201, upload.text
+    complete = await client.post(
+        f"{API}/videos/{upload.json()['id']}/complete",
+        json={"checksum_sha256": "d" * 64},
+    )
+    assert complete.status_code == 200, complete.text
+    result = await execute_transcode(
+        db_session,
+        job_id=uuid.UUID(complete.json()["job_id"]),
+        celery_task_id="celery-demo-preview",
+        storage=fake_storage,
+    )
+    assert result.status == "completed"
+    return team, uuid.UUID(complete.json()["id"])
 
 
 async def _seed_admin_headers(
@@ -294,6 +368,42 @@ async def _seed_admin_headers(
     return {"Authorization": f"Bearer {token}"}
 
 
+@pytest.fixture()
+def demo_preview_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[dict[str, Path]]:
+    training_root = tmp_path / "training"
+    script_path = training_root / "scripts" / "local_demo_infer.py"
+    config_path = training_root / "configs" / "demo.yaml"
+    checkpoint_path = training_root / "checkpoints" / "demo.pth"
+    preview_root = tmp_path / "demo_previews"
+
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    script_path.write_text("print('stub demo infer')\n", encoding="utf-8")
+    config_path.write_text("id: demo\n", encoding="utf-8")
+    checkpoint_path.write_bytes(b"checkpoint")
+
+    monkeypatch.setenv("CV_DEMO_PREVIEW_ENABLED", "true")
+    monkeypatch.setenv("CV_DEMO_PREVIEW_ROOT", str(preview_root))
+    monkeypatch.setenv("CV_DEMO_TRAINING_REPO_ROOT", str(training_root))
+    monkeypatch.setenv("CV_DEMO_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("CV_DEMO_CHECKPOINT_PATH", str(checkpoint_path))
+
+    from nextballup_core.settings import reload_settings
+
+    reload_settings()
+    try:
+        yield {
+            "training_root": training_root,
+            "preview_root": preview_root,
+            "config_path": config_path,
+            "checkpoint_path": checkpoint_path,
+        }
+    finally:
+        reload_settings()
+
+
 # ---- POST /games (smoke for video parent) --------------------------------
 
 
@@ -313,6 +423,37 @@ async def test_coach_creates_game(client: AsyncClient, db_session: AsyncSession)
         select(AuditLog.action).where(AuditLog.action == AuditAction.GAME_CREATED)
     )
     assert AuditAction.GAME_CREATED in {row[0] for row in actions.all()}
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_create_game_persists_optional_shot_clock(
+    client: AsyncClient,
+) -> None:
+    await _register(client, _coach_payload("game-shot-clock@example.com"))
+    team = (await client.post(f"{API}/teams", json=_team_body())).json()
+
+    response = await client.post(f"{API}/games", json=_shot_clock_game_body(team["id"]))
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["shot_clock_enabled"] is True
+    assert body["shot_clock_seconds"] == 30
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_create_game_rejects_shot_clock_seconds_when_disabled(
+    client: AsyncClient,
+) -> None:
+    await _register(client, _coach_payload("game-shot-clock-invalid@example.com"))
+    team = (await client.post(f"{API}/teams", json=_team_body())).json()
+    body = _game_body(team["id"])
+    body["shot_clock_enabled"] = False
+    body["shot_clock_seconds"] = 30
+
+    response = await client.post(f"{API}/games", json=body)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == ErrorCode.VALIDATION_FAILED
 
 
 # ---- GET /games/{id}/videos ----------------------------------------------
@@ -606,6 +747,65 @@ async def test_initiate_storage_failure_audits_failure(
     assert failed is not None and failed >= 1
 
 
+@pytest.mark.asyncio(loop_scope="session")
+async def test_sensitive_team_upload_requires_current_privacy_consent(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nextballup_core.settings import reload_settings
+
+    monkeypatch.setenv("REQUIRE_PRIVACY_CONSENT_FOR_SENSITIVE_UPLOADS", "true")
+    reload_settings()
+    try:
+        team, game = await _setup_coach_team_game(
+            storage_client, coach_email="privacy-gate-coach@example.com"
+        )
+
+        missing = await storage_client.post(
+            f"{API}/videos/upload",
+            json=_upload_body(game["id"]),
+        )
+        assert missing.status_code == 403
+        assert missing.json()["error"]["code"] == ErrorCode.PRIVACY_CONSENT_REQUIRED
+
+        consent_response = await storage_client.post(
+            f"{API}/teams/{team['id']}/privacy-consents",
+            json=_privacy_consent_body(),
+        )
+        assert consent_response.status_code == 201, consent_response.text
+        consent = consent_response.json()
+        assert consent["is_active"] is True
+        assert consent["minors_authorized"] is True
+
+        listed = await storage_client.get(f"{API}/teams/{team['id']}/privacy-consents")
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+
+        allowed = await storage_client.post(
+            f"{API}/videos/upload",
+            json=_upload_body(game["id"], privacy_consent_id=consent["id"]),
+        )
+        assert allowed.status_code == 201, allowed.text
+
+        video = await db_session.scalar(
+            select(Video).where(Video.id == uuid.UUID(allowed.json()["id"]))
+        )
+        assert video is not None
+        assert str(video.privacy_consent_id) == consent["id"]
+        storage_usage = await db_session.scalar(
+            select(UsageEvent).where(
+                UsageEvent.team_id == uuid.UUID(team["id"]),
+                UsageEvent.event_key == "video.storage.bytes_reserved",
+            )
+        )
+        assert storage_usage is not None
+        assert storage_usage.quantity == 250 * 1024 * 1024
+    finally:
+        monkeypatch.delenv("REQUIRE_PRIVACY_CONSENT_FOR_SENSITIVE_UPLOADS", raising=False)
+        reload_settings()
+
+
 # ---- POST /videos/{id}/complete -------------------------------------------
 
 
@@ -775,7 +975,7 @@ async def test_player_cannot_complete_upload(storage_client: AsyncClient) -> Non
     assert join.status_code == 200
 
     response = await storage_client.post(
-        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "g" * 64}
+        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "a" * 64}
     )
     assert response.status_code == 403
 
@@ -797,7 +997,7 @@ async def test_complete_rejects_missing_uploaded_object(
     fake_storage.object_sizes.pop(video.storage_key_raw, None)
 
     response = await storage_client.post(
-        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "j" * 64}
+        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "b" * 64}
     )
     assert response.status_code == 409
     assert response.json()["error"]["code"] == ErrorCode.INVALID_VIDEO_STATE
@@ -836,6 +1036,7 @@ async def test_member_can_read_video_detail_and_status(
     assert detail.status_code == 200, detail.text
     detail_body = detail.json()
     assert detail_body["status"] == "pending_upload"
+    assert detail_body["playback_status"] == "uploading"
     assert detail_body["game_id"] == game["id"]
     assert set(detail_body["processing"].keys()) == {
         "transcode",
@@ -856,6 +1057,7 @@ async def test_member_can_read_video_detail_and_status(
     status_response = await storage_client.get(f"{API}/videos/{video_id}/status")
     assert status_response.status_code == 200
     assert status_response.json()["status"] == "pending_upload"
+    assert status_response.json()["playback_status"] == "uploading"
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -883,14 +1085,112 @@ async def test_video_status_reports_queued_after_complete(
         await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
     ).json()["id"]
     await storage_client.post(
-        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "h" * 64}
+        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "c" * 64}
     )
 
     status_response = await storage_client.get(f"{API}/videos/{video_id}/status")
     assert status_response.status_code == 200
     body = status_response.json()
     assert body["status"] == "queued"
+    assert body["playback_status"] == "queued"
     assert body["stages"]["transcode"]["status"] == "pending"
+
+
+def test_playback_status_mapping_for_lifecycle_states() -> None:
+    assert (
+        derive_playback_status(
+            Video(status=VideoStatus.PENDING_UPLOAD),
+            [],
+            cv_pipeline_enabled=False,
+        )
+        == "uploading"
+    )
+    assert (
+        derive_playback_status(Video(status=VideoStatus.UPLOADING), [], cv_pipeline_enabled=False)
+        == "uploading"
+    )
+    assert (
+        derive_playback_status(Video(status=VideoStatus.UPLOADED), [], cv_pipeline_enabled=False)
+        == "queued"
+    )
+    assert (
+        derive_playback_status(Video(status=VideoStatus.QUEUED), [], cv_pipeline_enabled=False)
+        == "queued"
+    )
+    assert (
+        derive_playback_status(
+            Video(status=VideoStatus.TRANSCODING),
+            [],
+            cv_pipeline_enabled=False,
+        )
+        == "transcoding"
+    )
+    assert (
+        derive_playback_status(Video(status=VideoStatus.PROCESSING), [], cv_pipeline_enabled=False)
+        == "transcoding"
+    )
+    assert (
+        derive_playback_status(Video(status=VideoStatus.FAILED), [], cv_pipeline_enabled=False)
+        == "failed"
+    )
+    assert (
+        derive_playback_status(Video(status=VideoStatus.PROCESSED), [], cv_pipeline_enabled=False)
+        == "ready_for_playback"
+    )
+    assert (
+        derive_playback_status(Video(status=VideoStatus.PROCESSED), [], cv_pipeline_enabled=True)
+        == "analysis_pending"
+    )
+    assert (
+        derive_playback_status(
+            Video(status=VideoStatus.PROCESSED),
+            [
+                ProcessingJob(
+                    stage=ProcessingJobStage.DETECTION,
+                    status=ProcessingJobStatus.RUNNING,
+                )
+            ],
+            cv_pipeline_enabled=True,
+        )
+        == "analysis_running"
+    )
+    assert (
+        derive_playback_status(
+            Video(status=VideoStatus.PROCESSED),
+            [
+                ProcessingJob(
+                    stage=ProcessingJobStage.DETECTION,
+                    status=ProcessingJobStatus.COMPLETED,
+                )
+            ],
+            cv_pipeline_enabled=True,
+        )
+        == "ready_for_playback"
+    )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_video_events_endpoint_reflects_game_shot_clock_policy(
+    storage_client: AsyncClient,
+) -> None:
+    await _register(storage_client, _coach_payload("events-shot-clock@example.com"))
+    team = (await storage_client.post(f"{API}/teams", json=_team_body())).json()
+    game = (
+        await storage_client.post(f"{API}/games", json=_shot_clock_game_body(team["id"]))
+    ).json()
+    video_id = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()["id"]
+
+    response = await storage_client.get(f"{API}/videos/{video_id}/events")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["video_id"] == video_id
+    assert body["shot_clock_enabled"] is True
+    assert body["shot_clock_seconds"] == 30
+    assert body["events"] == []
+    assert body["total"] == 0
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -915,6 +1215,308 @@ async def test_admin_can_read_cross_team_game_and_video(
     assert video_response.json()["game_id"] == game["id"]
 
 
+# ---- POST /videos/{id}/demo-preview --------------------------------------
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_video_detail_includes_demo_preview_when_available(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+) -> None:
+    _, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-detail@example.com",
+    )
+    preview_path = demo_preview_env["preview_root"] / str(video_id) / "demo-preview.annotated.mp4"
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_bytes(b"preview")
+
+    response = await storage_client.get(f"{API}/videos/{video_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["demo_preview_enabled"] is True
+    assert body["demo_preview_status"] == "completed"
+    assert body["demo_preview_url"] == f"/api/v1/videos/{video_id}/demo-preview/artifact"
+    assert body["demo_preview_generated_at"] is not None
+    assert body["demo_preview_error_message"] is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_coach_can_queue_demo_preview(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-generate@example.com",
+    )
+
+    monkeypatch.setattr(
+        "nextballup_api.demo_preview._enqueue_demo_preview_task",
+        lambda *, video_id, settings: f"task-{video_id}",
+    )
+
+    response = await storage_client.post(f"{API}/videos/{video_id}/demo-preview")
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["preview_url"] is None
+    assert body["generated_at"] is None
+
+    detail = await storage_client.get(f"{API}/videos/{video_id}")
+    assert detail.status_code == 200, detail.text
+    detail_body = detail.json()
+    assert detail_body["demo_preview_status"] == "queued"
+    assert detail_body["demo_preview_url"] is None
+    assert detail_body["demo_preview_generated_at"] is None
+
+    action_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_DEMO_PREVIEW_REQUESTED,
+            AuditLog.team_id == uuid.UUID(team["id"]),
+        )
+    )
+    assert action_count is not None and action_count >= 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_demo_preview_generation_is_idempotent_while_queued(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-concurrent@example.com",
+    )
+    enqueue_calls = 0
+
+    def _fake_enqueue(*, video_id: uuid.UUID, settings: Any) -> str:
+        nonlocal enqueue_calls
+        enqueue_calls += 1
+        time.sleep(0.05)
+        return f"task-{video_id}"
+
+    monkeypatch.setattr("nextballup_api.demo_preview._enqueue_demo_preview_task", _fake_enqueue)
+
+    video_row = await db_session.scalar(select(Video).where(Video.id == video_id))
+    assert video_row is not None
+    video = cast(
+        "Video",
+        SimpleNamespace(
+            id=video_row.id,
+            status=video_row.status,
+            storage_key_mezzanine=video_row.storage_key_mezzanine,
+        ),
+    )
+    settings = get_settings()
+
+    first_result, second_result = await asyncio.gather(
+        asyncio.to_thread(
+            queue_demo_preview_request,
+            video=video,
+            settings=settings,
+            storage=fake_storage,
+        ),
+        asyncio.to_thread(
+            queue_demo_preview_request,
+            video=video,
+            settings=settings,
+            storage=fake_storage,
+        ),
+    )
+
+    assert first_result.response.status == "queued"
+    assert second_result.response.status == "queued"
+    assert first_result.enqueued is True or second_result.enqueued is True
+    assert enqueue_calls == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_demo_preview_enqueue_failure_is_audited(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-enqueue-fail@example.com",
+    )
+
+    def _fail_enqueue(*, video_id: uuid.UUID, settings: Any) -> str:
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr("nextballup_api.demo_preview._enqueue_demo_preview_task", _fail_enqueue)
+
+    response = await storage_client.post(f"{API}/videos/{video_id}/demo-preview")
+    assert response.status_code == 503, response.text
+
+    action_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_DEMO_PREVIEW_REJECTED,
+            AuditLog.team_id == uuid.UUID(team["id"]),
+        )
+    )
+    assert action_count is not None and action_count >= 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_demo_preview_enqueue_failure_preserves_completed_preview(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-enqueue-keep-completed@example.com",
+    )
+    preview_path = demo_preview_env["preview_root"] / str(video_id) / "demo-preview.annotated.mp4"
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_bytes(b"preview")
+
+    def _fail_enqueue(*, video_id: uuid.UUID, settings: Any) -> str:
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr("nextballup_api.demo_preview._enqueue_demo_preview_task", _fail_enqueue)
+
+    response = await storage_client.post(f"{API}/videos/{video_id}/demo-preview")
+    assert response.status_code == 503, response.text
+
+    detail = await storage_client.get(f"{API}/videos/{video_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["demo_preview_status"] == "completed"
+    assert body["demo_preview_url"] == f"/api/v1/videos/{video_id}/demo-preview/artifact"
+    assert body["demo_preview_error_message"] is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_failed_demo_preview_state_reconciles_to_completed_when_artifact_exists(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+) -> None:
+    _, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-heal-failed@example.com",
+    )
+    preview_path = demo_preview_env["preview_root"] / str(video_id) / "demo-preview.annotated.mp4"
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_bytes(b"preview")
+    state_path = preview_path.parent / "demo-preview.state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "requested_at": datetime.now(tz=UTC).isoformat(),
+                "started_at": None,
+                "generated_at": None,
+                "task_id": "task-demo",
+                "error_message": "stale failure",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    response = await storage_client.get(f"{API}/videos/{video_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["demo_preview_status"] == "completed"
+    assert body["demo_preview_url"] == f"/api/v1/videos/{video_id}/demo-preview/artifact"
+    assert body["demo_preview_error_message"] is None
+
+    persisted_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted_state["status"] == "completed"
+    assert persisted_state["error_message"] is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_demo_preview_rate_limit_rejection_is_audited(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-rate-limit@example.com",
+    )
+
+    async def _reject_rate_limit(*args: Any, **kwargs: Any) -> None:
+        raise TooManyRequestsError("Too many demo preview requests")
+
+    monkeypatch.setattr("nextballup_api.routers.videos.enforce_rate_limit", _reject_rate_limit)
+
+    response = await storage_client.post(f"{API}/videos/{video_id}/demo-preview")
+    assert response.status_code == 429, response.text
+
+    action_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_DEMO_PREVIEW_REJECTED,
+            AuditLog.team_id == uuid.UUID(team["id"]),
+        )
+    )
+    assert action_count is not None and action_count >= 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_player_cannot_generate_demo_preview(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+) -> None:
+    team, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-player-owner@example.com",
+    )
+    await _register(storage_client, _player_payload("demo-player@example.com"))
+    join = await storage_client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 24},
+    )
+    assert join.status_code == 200
+
+    response = await storage_client.post(f"{API}/videos/{video_id}/demo-preview")
+    assert response.status_code == 403
+
+
 # ---- Audit + counts -------------------------------------------------------
 
 
@@ -930,7 +1532,7 @@ async def test_audit_log_count_grows_with_upload_lifecycle(
         await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
     ).json()["id"]
     await storage_client.post(
-        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "i" * 64}
+        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "d" * 64}
     )
 
     counts: dict[str, int] = {}
@@ -1143,7 +1745,7 @@ async def seeded_failed_job(
     complete = (
         await storage_client.post(
             f"{API}/videos/{upload['id']}/complete",
-            json={"checksum_sha256": "r" * 64},
+            json={"checksum_sha256": "e" * 64},
         )
     ).json()
     job_id = uuid.UUID(complete["job_id"])
@@ -1272,7 +1874,7 @@ async def test_requeue_rejects_active_job(
     complete = (
         await storage_client.post(
             f"{API}/videos/{upload['id']}/complete",
-            json={"checksum_sha256": "q" * 64},
+            json={"checksum_sha256": "f" * 64},
         )
     ).json()
     job_id = uuid.UUID(complete["job_id"])

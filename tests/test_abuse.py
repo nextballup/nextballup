@@ -37,12 +37,18 @@ API = "/api/v1"
 class _FakeStorage:
     def __init__(self) -> None:
         self.object_sizes: dict[str, int] = {}
+        self.object_metadata: dict[str, dict[str, str]] = {}
 
     def is_configured(self) -> bool:
         return True
 
     def presign_upload(
-        self, *, key: str, content_type: str, file_size_bytes: int
+        self,
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
     ) -> PresignedUpload:
         self.object_sizes[key] = file_size_bytes
         return PresignedUpload(
@@ -57,11 +63,14 @@ class _FakeStorage:
     def abort_multipart(self, *, key: str, upload_id: str) -> None:
         return None
 
+    def delete_object(self, *, key: str) -> None:
+        self.object_sizes.pop(key, None)
+
     def head_object(self, *, key: str) -> dict[str, Any] | None:
         size = self.object_sizes.get(key)
         if size is None:
             return None
-        return {"ContentLength": size}
+        return {"ContentLength": size, "Metadata": self.object_metadata.get(key, {})}
 
     def presign_get(
         self, *, key: str, expires_in: int, response_content_type: str | None = None
@@ -71,8 +80,16 @@ class _FakeStorage:
     def download_file(self, *, key: str, destination: str) -> None:
         Path(destination).write_bytes(b"fake-video")
 
-    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+    def upload_file(
+        self,
+        *,
+        key: str,
+        source: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         self.object_sizes[key] = Path(source).stat().st_size
+        self.object_metadata[key] = dict(metadata or {})
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -329,6 +346,33 @@ async def test_video_upload_rejects_cookie_auth_without_csrf(
         response = await bare.post(
             f"{API}/videos/upload",
             json=_upload_body(game["id"]),
+        )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == ErrorCode.CSRF_FAILED
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_cookie_auth_with_bearer_header_still_requires_csrf(
+    storage_client: AsyncClient,
+) -> None:
+    """A junk Authorization header must not suppress CSRF when auth cookies
+    are present. The dependency layer prefers cookies, so the middleware must
+    classify cookie+Bearer as cookie-authenticated."""
+    from httpx import AsyncClient as BareClient
+    from nextballup_api.main import app
+
+    await _register(storage_client, _coach_payload("csrf-bearer-upload@example.com"))
+    team = (await storage_client.post(f"{API}/teams", json=_team_body())).json()
+    game = (await storage_client.post(f"{API}/games", json=_game_body(team["id"]))).json()
+
+    transport = ASGITransport(app=app)
+    async with BareClient(transport=transport, base_url="http://test") as bare:
+        for cookie in storage_client.cookies.jar:
+            bare.cookies.set(cookie.name, cookie.value or "", cookie.domain, cookie.path)
+        response = await bare.post(
+            f"{API}/videos/upload",
+            json=_upload_body(game["id"]),
+            headers={"Authorization": "Bearer attacker-controlled-junk"},
         )
     assert response.status_code == 403
     assert response.json()["error"]["code"] == ErrorCode.CSRF_FAILED

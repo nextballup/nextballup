@@ -34,7 +34,7 @@ uv run uvicorn nextballup_api.main:app --reload --host 127.0.0.1 --port 8000
 
 # Run the Celery worker (browser-safe mezzanine transcode + maintenance tasks)
 uv run celery -A nextballup_worker.celery_app worker --loglevel=info \
-  --queues=nextballup.default,nextballup.transcode,nextballup.maintenance
+  --queues=nextballup.default,nextballup.transcode,nextballup.maintenance,nextballup.cpu
 
 # Run Celery beat (dispatches PENDING jobs + runs stale/abandoned cleanup)
 uv run celery -A nextballup_worker.celery_app beat --loglevel=info

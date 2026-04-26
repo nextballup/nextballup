@@ -217,6 +217,7 @@ keys/
 *.mkv
 apps/web/.next/
 apps/web/node_modules/
+local_artifacts/
 *.onnx
 *.pt
 *.pth

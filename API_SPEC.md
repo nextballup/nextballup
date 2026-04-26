@@ -7,8 +7,8 @@ Development: http://127.0.0.1:8000/api/v1
 Production:  https://api.nextballup.com/v1
 ```
 
-**Implemented API surface in the current repo:** health, auth, teams, games,
-videos, and a small admin surface (`/admin/audit/logs`).
+**Implemented API surface in the current repo:** health, internal metrics,
+auth, teams, games, videos, and a small admin surface (`/admin/audit/logs`).
 
 Sections later in this document that describe `/users`, `/events`, `/players`,
 `/metrics`, `/clips`, `/scouting`, `/search`, `/alerts`, and `/notes` are
@@ -95,6 +95,21 @@ Kubernetes liveness probe. Returns 200 if the process is not deadlocked.
 ```json
 { "status": "alive" }
 ```
+
+### GET `/api/v1/_metrics`
+
+Internal Prometheus-format operational metrics. Disabled unless
+`OBSERVABILITY_METRICS_ENABLED=true`; when enabled, callers must provide the
+opaque shared secret in `X-Metrics-Token`. Failed scrapes are audit logged.
+Metrics intentionally use aggregate operational labels only, not team/user
+identifiers.
+
+**Response: 200** — `text/plain; version=0.0.4`
+
+Worker metrics are emitted by each Celery worker process on a separate
+loopback-only listener when `OBSERVABILITY_WORKER_METRICS_ENABLED=true`.
+Infrastructure should scrape those worker endpoints directly from the worker
+host/container. The API endpoint is not a cross-process worker metrics proxy.
 
 ---
 
@@ -426,6 +441,15 @@ Full team detail with roster.
 ```
 
 **Access control:** Must be a member of the team.
+
+### DELETE `/teams/{team_id}`
+
+Soft-delete a team. Head coaches and assistant coaches on that team only.
+The row is hidden from normal team/list/detail flows, while immutable audit
+context remains available to admin export paths that explicitly include
+deleted records.
+
+**Response: 204** — no body. Repeating the request is a no-op.
 
 ### POST `/teams/{team_id}/invite`
 

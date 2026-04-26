@@ -8,6 +8,8 @@ order.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from httpx import AsyncClient
 from nextballup_api.security.jwt import create_access_token
@@ -125,6 +127,74 @@ async def test_admin_filters_by_action(client: AsyncClient, db_session: AsyncSes
     body = response.json()
     assert len(body["items"]) == 3
     assert all(item["action"] == "filter.match" for item in body["items"])
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_admin_filters_audit_exports_by_actor_email_and_time_range(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    base = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    db_session.add_all(
+        [
+            AuditLog(
+                created_at=base - timedelta(days=1, seconds=i),
+                action="export.index.noise",
+                actor_email=f"noise-before-{i}@example.com",
+                extra={"noise": i},
+            )
+            for i in range(2500)
+        ]
+        + [
+            AuditLog(
+                created_at=base + timedelta(days=1, seconds=i),
+                action="export.index.noise",
+                actor_email=f"noise-after-{i}@example.com",
+                extra={"noise": i},
+            )
+            for i in range(2500)
+        ]
+        + [
+            AuditLog(
+                created_at=base + timedelta(seconds=i),
+                action="export.index.target",
+                actor_email="export-target@example.com",
+                extra={"seq": i},
+            )
+            for i in range(3)
+        ]
+        + [
+            AuditLog(
+                created_at=base + timedelta(seconds=10),
+                action="export.index.target",
+                actor_email="export-other@example.com",
+                extra={"seq": "other"},
+            )
+        ]
+    )
+    await db_session.flush()
+    headers = await _auth_headers(db_session, role=UserRole.ADMIN, email="admin-export@example.com")
+    params: dict[str, str | int] = {
+        "from_ts": (base - timedelta(seconds=1)).isoformat(),
+        "to_ts": (base + timedelta(seconds=30)).isoformat(),
+        "limit": 10,
+    }
+
+    by_email = await client.get(
+        f"{API}/admin/audit/logs",
+        params=params | {"actor_email": "export-target@example.com"},
+        headers=headers,
+    )
+    assert by_email.status_code == 200, by_email.text
+    assert {(item["extra"] or {}).get("seq") for item in by_email.json()["items"]} == {0, 1, 2}
+
+    by_time = await client.get(f"{API}/admin/audit/logs", params=params, headers=headers)
+    assert by_time.status_code == 200, by_time.text
+    assert {(item["extra"] or {}).get("seq") for item in by_time.json()["items"]} == {
+        0,
+        1,
+        2,
+        "other",
+    }
 
 
 @pytest.mark.asyncio(loop_scope="session")

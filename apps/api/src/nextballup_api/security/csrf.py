@@ -122,14 +122,13 @@ def extract_csrf_cookie(request: Request, *, settings: Settings) -> str | None:
 
 
 def request_is_cookie_authenticated(request: Request, *, settings: Settings) -> bool:
-    """True if this request is relying on the auth cookie (vs. a Bearer header).
+    """True when an access cookie is present on the request.
 
-    CSRF only applies to cookie-authenticated requests; Bearer is immune by
-    construction (attackers can't set Authorization headers via CSRF).
+    Bearer-only API clients still skip CSRF. Cookie + Bearer is deliberately
+    treated as cookie-authenticated so a stray Authorization header cannot
+    suppress the browser CSRF check while the downstream auth dependency uses
+    the cookie.
     """
-    header = request.headers.get("authorization") or ""
-    if header.lower().startswith("bearer "):
-        return False
     access_cookie = request.cookies.get(settings.cookie_access_name)
     prefixed = request.cookies.get(f"__Host-{settings.cookie_access_name}")
     return bool(access_cookie or prefixed)

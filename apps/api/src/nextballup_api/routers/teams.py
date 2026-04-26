@@ -16,6 +16,7 @@ from nextballup_api.permissions import (
     require_team_coach,
     require_team_member,
     require_user_role,
+    require_verified_account,
 )
 from nextballup_api.security.invite_code import generate_invite_code
 from nextballup_api.security.rate_limit import enforce_rate_limit
@@ -46,10 +47,13 @@ from nextballup_core.schemas.team import (
     TeamListResponse,
     TeamMembersResponse,
     TeamMemberSummary,
+    TeamPrivacyConsentCreate,
+    TeamPrivacyConsentListResponse,
+    TeamPrivacyConsentResponse,
 )
 from nextballup_core.settings import Settings
 from nextballup_db.models.game import Game
-from nextballup_db.models.team import Team, TeamInvite, TeamMembership
+from nextballup_db.models.team import Team, TeamInvite, TeamMembership, TeamPrivacyConsent
 from nextballup_db.models.user import User
 
 router = APIRouter(prefix="/teams", tags=["teams"])
@@ -89,6 +93,37 @@ def _member_summary(membership: TeamMembership, user: User) -> TeamMemberSummary
         team_role=membership.team_role,
         jersey_number=membership.jersey_number,
         joined_at=membership.joined_at,
+    )
+
+
+def _privacy_consent_response(
+    consent: TeamPrivacyConsent,
+    *,
+    now: datetime | None = None,
+) -> TeamPrivacyConsentResponse:
+    resolved_now = now or datetime.now(tz=UTC)
+    return TeamPrivacyConsentResponse(
+        id=consent.id,
+        team_id=consent.team_id,
+        recorded_by=consent.recorded_by,
+        label=consent.label,
+        consent_source=consent.consent_source,
+        covers_video_uploads=consent.covers_video_uploads,
+        covers_cv_processing=consent.covers_cv_processing,
+        commercial_ml_training_allowed=consent.commercial_ml_training_allowed,
+        minors_authorized=consent.minors_authorized,
+        athlete_pii_authorized=consent.athlete_pii_authorized,
+        evidence_uri=consent.evidence_uri,
+        evidence_sha256=consent.evidence_sha256,
+        effective_at=consent.effective_at,
+        expires_at=consent.expires_at,
+        revoked_at=consent.revoked_at,
+        is_active=(
+            consent.revoked_at is None
+            and consent.effective_at <= resolved_now
+            and (consent.expires_at is None or consent.expires_at > resolved_now)
+        ),
+        created_at=consent.created_at,
     )
 
 
@@ -222,6 +257,7 @@ async def list_my_teams(
             TeamMembership.user_id == current_user.id,
             TeamMembership.is_active.is_(True),
             Team.is_active.is_(True),
+            Team.deleted_at.is_(None),
         )
         .order_by(Team.name)
     )
@@ -285,8 +321,10 @@ async def create_team(
     request: Request,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
 ) -> TeamCreatedResponse:
     require_user_role(current_user, UserRole.COACH, UserRole.ADMIN)
+    require_verified_account(current_user, settings=settings)
 
     invite_code = await _generate_unique_invite_code(session)
     team_id = uuid.uuid4()
@@ -350,6 +388,7 @@ async def create_invite(
     current_user: User = Depends(get_current_user),
     settings: Settings = Depends(get_app_settings),
 ) -> CreateInviteResponse:
+    require_verified_account(current_user, settings=settings)
     await clear_join_invite_context(session)
     await set_tenant_context(session, team_id)
     team = await get_team_or_404(session, team_id)
@@ -400,6 +439,126 @@ async def create_invite(
     )
 
 
+@router.delete("/{team_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_team(
+    team_id: uuid.UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+) -> None:
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await set_tenant_context(session, team_id)
+
+    team = await session.get(Team, team_id)
+    if team is None or not team.is_active:
+        return None
+    await require_team_coach(session, user=current_user, team_id=team.id)
+    if team.deleted_at is not None:
+        return None
+
+    deleted_at = datetime.now(tz=UTC)
+    team.deleted_at = deleted_at
+    await write_audit(
+        session,
+        action=AuditAction.TEAM_DELETED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="team",
+        resource_id=team.id,
+        team_id=team.id,
+        extra={"deleted_at": deleted_at.isoformat()},
+    )
+    await session.commit()
+    return None
+
+
+@router.post(
+    "/{team_id}/privacy-consents",
+    response_model=TeamPrivacyConsentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def record_privacy_consent(
+    team_id: uuid.UUID,
+    payload: TeamPrivacyConsentCreate,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+) -> TeamPrivacyConsentResponse:
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await set_tenant_context(session, team_id)
+    team = await get_team_or_404(session, team_id)
+    await require_team_coach(session, user=current_user, team_id=team.id)
+
+    consent = TeamPrivacyConsent(
+        team_id=team.id,
+        recorded_by=current_user.id,
+        label=payload.label,
+        consent_source=payload.consent_source,
+        covers_video_uploads=payload.covers_video_uploads,
+        covers_cv_processing=payload.covers_cv_processing,
+        commercial_ml_training_allowed=payload.commercial_ml_training_allowed,
+        minors_authorized=payload.minors_authorized,
+        athlete_pii_authorized=payload.athlete_pii_authorized,
+        evidence_uri=payload.evidence_uri,
+        evidence_sha256=payload.evidence_sha256,
+        expires_at=payload.expires_at,
+        notes=payload.notes,
+    )
+    session.add(consent)
+    await session.flush()
+
+    await write_audit(
+        session,
+        action=AuditAction.TEAM_PRIVACY_CONSENT_RECORDED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="team_privacy_consent",
+        resource_id=consent.id,
+        team_id=team.id,
+        extra={
+            "covers_video_uploads": consent.covers_video_uploads,
+            "covers_cv_processing": consent.covers_cv_processing,
+            "commercial_ml_training_allowed": consent.commercial_ml_training_allowed,
+            "minors_authorized": consent.minors_authorized,
+            "has_evidence_uri": consent.evidence_uri is not None,
+            "has_evidence_sha256": consent.evidence_sha256 is not None,
+        },
+    )
+    await session.commit()
+    await session.refresh(consent)
+    return _privacy_consent_response(consent)
+
+
+@router.get(
+    "/{team_id}/privacy-consents",
+    response_model=TeamPrivacyConsentListResponse,
+)
+async def list_privacy_consents(
+    team_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TeamPrivacyConsentListResponse:
+    await clear_join_invite_context(session)
+    await set_tenant_context(session, team_id)
+    team = await get_team_or_404(session, team_id)
+    await require_team_member(session, user=current_user, team_id=team.id)
+
+    now = datetime.now(tz=UTC)
+    rows = await session.execute(
+        select(TeamPrivacyConsent)
+        .where(TeamPrivacyConsent.team_id == team.id)
+        .order_by(TeamPrivacyConsent.created_at.desc())
+    )
+    consents = [_privacy_consent_response(row, now=now) for row in rows.scalars()]
+    return TeamPrivacyConsentListResponse(consents=consents, total=len(consents))
+
+
 @router.post(
     "/join",
     response_model=JoinTeamResponse,
@@ -421,6 +580,7 @@ async def join_team(
         max_attempts=settings.team_join_rate_limit_attempts,
         window_seconds=settings.team_join_rate_limit_window_seconds,
     )
+    require_verified_account(current_user, settings=settings)
 
     await clear_tenant_context(session)
     await set_join_invite_context(session, code)
@@ -428,7 +588,9 @@ async def join_team(
     team = await session.scalar(select(Team).where(Team.invite_code == code))
     invite: TeamInvite | None = None
     if team is None:
-        invite = await session.scalar(select(TeamInvite).where(TeamInvite.invite_code == code))
+        invite = await session.scalar(
+            select(TeamInvite).where(TeamInvite.invite_code == code).with_for_update()
+        )
         if invite is not None:
             await set_tenant_context(session, invite.team_id)
             team = await session.get(Team, invite.team_id)
@@ -436,7 +598,7 @@ async def join_team(
         await set_tenant_context(session, team.id)
     await clear_join_invite_context(session)
 
-    if team is None or not team.is_active:
+    if team is None or not team.is_active or team.deleted_at is not None:
         await _record_join_failure(
             session,
             request=request,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import math
 import re
@@ -54,7 +55,12 @@ class StoragePresigner(Protocol):
     def is_configured(self) -> bool: ...
 
     def presign_upload(
-        self, *, key: str, content_type: str, file_size_bytes: int
+        self,
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
     ) -> PresignedUpload: ...
 
     def complete_multipart(
@@ -71,7 +77,16 @@ class StoragePresigner(Protocol):
 
     def download_file(self, *, key: str, destination: str) -> None: ...
 
-    def upload_file(self, *, key: str, source: str, content_type: str) -> None: ...
+    def upload_file(
+        self,
+        *,
+        key: str,
+        source: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None: ...
+
+    def delete_object(self, *, key: str) -> None: ...
 
 
 class S3StoragePresigner:
@@ -99,19 +114,33 @@ class S3StoragePresigner:
         return True
 
     def presign_upload(
-        self, *, key: str, content_type: str, file_size_bytes: int
+        self,
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
     ) -> PresignedUpload:
         threshold = self._settings.upload_multipart_threshold_bytes
         expires_in = self._settings.upload_url_expires_seconds
         if file_size_bytes <= threshold:
+            params: dict[str, Any] = {
+                "Bucket": self._bucket,
+                "Key": key,
+                "ContentType": content_type,
+            }
+            headers = {"Content-Type": content_type}
+            if checksum_sha256 and self._settings.upload_presigned_put_checksum_header:
+                checksum_b64 = base64.b64encode(bytes.fromhex(checksum_sha256)).decode("ascii")
+                params["ChecksumSHA256"] = checksum_b64
+                headers["x-amz-checksum-sha256"] = checksum_b64
+            if checksum_sha256:
+                params["Metadata"] = {"nbu-sha256": checksum_sha256}
+                headers["x-amz-meta-nbu-sha256"] = checksum_sha256
             try:
                 url = self._client.generate_presigned_url(
                     "put_object",
-                    Params={
-                        "Bucket": self._bucket,
-                        "Key": key,
-                        "ContentType": content_type,
-                    },
+                    Params=params,
                     ExpiresIn=expires_in,
                     HttpMethod="PUT",
                 )
@@ -122,7 +151,7 @@ class S3StoragePresigner:
             return PresignedUpload(
                 method=UploadMethod.PUT,
                 url=url,
-                headers={"Content-Type": content_type},
+                headers=headers,
             )
 
         part_size = self._settings.upload_multipart_part_size_bytes
@@ -220,16 +249,32 @@ class S3StoragePresigner:
         except (BotoCoreError, ClientError) as exc:
             raise StorageFailureError("Failed to download object", details={"key": key}) from exc
 
-    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+    def upload_file(
+        self,
+        *,
+        key: str,
+        source: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
+        extra_args: dict[str, Any] = {"ContentType": content_type}
+        if metadata:
+            extra_args["Metadata"] = metadata
         try:
             self._client.upload_file(
                 source,
                 self._bucket,
                 key,
-                ExtraArgs={"ContentType": content_type},
+                ExtraArgs=extra_args,
             )
         except (BotoCoreError, ClientError) as exc:
             raise StorageFailureError("Failed to upload object", details={"key": key}) from exc
+
+    def delete_object(self, *, key: str) -> None:
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=key)
+        except (BotoCoreError, ClientError) as exc:
+            raise StorageFailureError("Failed to delete object", details={"key": key}) from exc
 
 
 def get_storage_presigner(settings: Settings) -> StoragePresigner | None:
@@ -246,12 +291,14 @@ async def storage_presign_upload(
     key: str,
     content_type: str,
     file_size_bytes: int,
+    checksum_sha256: str | None = None,
 ) -> PresignedUpload:
     return await to_thread.run_sync(
         lambda: presigner.presign_upload(
             key=key,
             content_type=content_type,
             file_size_bytes=file_size_bytes,
+            checksum_sha256=checksum_sha256,
         )
     )
 
@@ -320,10 +367,24 @@ async def storage_upload_file(
     key: str,
     source: str,
     content_type: str,
+    metadata: dict[str, str] | None = None,
 ) -> None:
     await to_thread.run_sync(
-        lambda: presigner.upload_file(key=key, source=source, content_type=content_type)
+        lambda: presigner.upload_file(
+            key=key,
+            source=source,
+            content_type=content_type,
+            metadata=metadata,
+        )
     )
+
+
+async def storage_delete_object(
+    presigner: StoragePresigner,
+    *,
+    key: str,
+) -> None:
+    await to_thread.run_sync(lambda: presigner.delete_object(key=key))
 
 
 # Only `[A-Za-z0-9._-]` survive sanitation. Anything else — unicode, spaces,

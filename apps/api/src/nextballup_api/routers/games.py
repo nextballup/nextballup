@@ -9,21 +9,23 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_api.audit import write_audit
-from nextballup_api.deps import get_current_user, get_db
+from nextballup_api.deps import get_app_settings, get_current_user, get_db
 from nextballup_api.permissions import (
     get_team_or_404,
     require_team_coach,
     require_team_member,
     require_user_role,
+    require_verified_account,
 )
 from nextballup_api.tenant import (
     clear_join_invite_context,
     clear_tenant_context,
     set_tenant_context,
 )
+from nextballup_api.video_playback_status import derive_playback_status
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.enums import GameStatus, GameType, UserRole
-from nextballup_core.errors import ForbiddenError, NotFoundError
+from nextballup_core.errors import ForbiddenError, NotFoundError, ValidationFailedError
 from nextballup_core.schemas.game import (
     CreateGameRequest,
     GameListResponse,
@@ -31,10 +33,11 @@ from nextballup_core.schemas.game import (
     UpdateGameRequest,
 )
 from nextballup_core.schemas.video import VideoListItem, VideoListResponse
+from nextballup_core.settings import Settings
 from nextballup_db.models.game import Game
-from nextballup_db.models.team import TeamMembership
+from nextballup_db.models.team import Team, TeamMembership
 from nextballup_db.models.user import User
-from nextballup_db.models.video import Video
+from nextballup_db.models.video import ProcessingJob, Video
 
 router = APIRouter(prefix="/games", tags=["games"])
 
@@ -58,8 +61,10 @@ async def create_game(
     request: Request,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
 ) -> GameSummary:
     require_user_role(current_user, UserRole.COACH, UserRole.ADMIN)
+    require_verified_account(current_user, settings=settings)
     await clear_join_invite_context(session)
     await set_tenant_context(session, payload.team_id)
     team = await get_team_or_404(session, payload.team_id)
@@ -75,6 +80,8 @@ async def create_game(
         is_home=payload.is_home,
         periods=payload.periods,
         period_length_minutes=payload.period_length_minutes,
+        shot_clock_enabled=payload.shot_clock_enabled,
+        shot_clock_seconds=payload.shot_clock_seconds,
         notes=payload.notes,
         status=GameStatus.SCHEDULED,
     )
@@ -119,18 +126,20 @@ async def list_games(
         # the FORCE-RLS policies on the games table actually filter under
         # production roles, even though we layer an explicit app-level guard.
         await set_tenant_context(session, team_id)
-        await require_team_member(session, user=current_user, team_id=team_id)
-        team_filter = Game.team_id == team_id
+        team = await get_team_or_404(session, team_id)
+        await require_team_member(session, user=current_user, team_id=team.id)
+        team_filter = Game.team_id == team.id
     elif current_user.role is UserRole.ADMIN:
         # Admin role: list across all tenants. The user_role GUC is left at
         # access-token defaults; the games SELECT policy admits admin reads.
-        team_filter = None
+        team_filter = Game.team_id.in_(select(Team.id).where(Team.deleted_at.is_(None)))
     else:
         # No team specified — restrict to teams the caller actively belongs
         # to. Subquery returns the user's active team ids for the IN filter.
         membership_subq = select(TeamMembership.team_id).where(
             TeamMembership.user_id == current_user.id,
             TeamMembership.is_active.is_(True),
+            TeamMembership.team_id.in_(select(Team.id).where(Team.deleted_at.is_(None))),
         )
         team_filter = Game.team_id.in_(membership_subq)
 
@@ -184,6 +193,7 @@ async def get_game(
     if game is None:
         raise NotFoundError("Game not found", code=ErrorCode.GAME_NOT_FOUND)
     await set_tenant_context(session, game.team_id)
+    await get_team_or_404(session, game.team_id)
     await require_team_member(session, user=current_user, team_id=game.team_id)
     return GameSummary.model_validate(game)
 
@@ -193,6 +203,7 @@ async def list_game_videos(
     game_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
 ) -> VideoListResponse:
     """List videos attached to a game. Any team member may read — this surface
     does not issue signed playback URLs, so it is safe for every member."""
@@ -203,17 +214,30 @@ async def list_game_videos(
     if game is None:
         raise NotFoundError("Game not found", code=ErrorCode.GAME_NOT_FOUND)
     await set_tenant_context(session, game.team_id)
+    await get_team_or_404(session, game.team_id)
     await require_team_member(session, user=current_user, team_id=game.team_id)
 
     rows = await session.execute(
         select(Video).where(Video.game_id == game.id).order_by(Video.created_at.desc())
     )
     videos = rows.scalars().all()
+    jobs_by_video: dict[uuid.UUID, list[ProcessingJob]] = {video.id: [] for video in videos}
+    if videos:
+        jobs_rows = await session.execute(
+            select(ProcessingJob).where(ProcessingJob.video_id.in_([video.id for video in videos]))
+        )
+        for job in jobs_rows.scalars():
+            jobs_by_video.setdefault(job.video_id, []).append(job)
     items = [
         VideoListItem(
             id=v.id,
             filename=v.filename,
             status=v.status,
+            playback_status=derive_playback_status(
+                v,
+                jobs_by_video.get(v.id, []),
+                cv_pipeline_enabled=settings.cv_pipeline_enabled,
+            ),
             file_size_bytes=v.file_size_bytes,
             duration_seconds=v.duration_seconds,
             camera_position=v.camera_position,
@@ -232,7 +256,9 @@ async def update_game(
     request: Request,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
 ) -> GameSummary:
+    require_verified_account(current_user, settings=settings)
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
     session.sync_session.expunge_all()
@@ -240,6 +266,7 @@ async def update_game(
     if game is None:
         raise NotFoundError("Game not found", code=ErrorCode.GAME_NOT_FOUND)
     await set_tenant_context(session, game.team_id)
+    await get_team_or_404(session, game.team_id)
     await require_team_coach(session, user=current_user, team_id=game.team_id)
 
     updates = payload.model_dump(exclude_unset=True)
@@ -260,6 +287,13 @@ async def update_game(
 
     for field, value in updates.items():
         setattr(game, field, value)
+    if not game.shot_clock_enabled:
+        game.shot_clock_seconds = None
+    elif game.shot_clock_seconds is None:
+        raise ValidationFailedError(
+            "shot_clock_seconds is required when shot_clock_enabled is true",
+            code=ErrorCode.VALIDATION_FAILED,
+        )
     await session.flush()
     await write_audit(
         session,

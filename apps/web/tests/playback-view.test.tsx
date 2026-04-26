@@ -3,7 +3,10 @@ import { render, screen, act, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { VideoPlaybackView } from "@/app/(app)/videos/[videoId]/video-playback-view";
-import type { VideoDetailResponse } from "@/lib/contract";
+import type {
+  GenerateDemoPreviewResponse,
+  VideoDetailResponse,
+} from "@/lib/contract";
 import { server } from "./setup";
 
 function wrap(ui: React.ReactElement) {
@@ -14,10 +17,18 @@ function wrap(ui: React.ReactElement) {
 }
 
 function baseVideo(overrides: Partial<VideoDetailResponse> = {}): VideoDetailResponse {
+  const status = overrides.status ?? "processed";
   return {
     id: "v1",
     game_id: "g1",
-    status: "processed",
+    status,
+    playback_status:
+      overrides.playback_status ??
+      (status === "processed"
+        ? "ready_for_playback"
+        : status === "failed"
+          ? "failed"
+          : "transcoding"),
     filename: "x.mp4",
     file_size_bytes: 100,
     duration_seconds: 10,
@@ -29,11 +40,20 @@ function baseVideo(overrides: Partial<VideoDetailResponse> = {}): VideoDetailRes
     camera_height: null,
     checksum_sha256: null,
     storage_etag: null,
+    storage_output_sha256: null,
+    privacy_consent_id: null,
+    raw_retention_expires_at: null,
+    raw_deleted_at: null,
     thumbnail_url: null,
     playback_url: null,
     playback_token: null,
     playback_format: null,
     token_expires_at: null,
+    demo_preview_enabled: false,
+    demo_preview_status: "idle",
+    demo_preview_url: null,
+    demo_preview_generated_at: null,
+    demo_preview_error_message: null,
     processing: { transcode: "completed" },
     created_at: "2026-04-15T00:00:00Z",
     ...overrides,
@@ -130,6 +150,31 @@ describe("VideoPlaybackView", () => {
     expect(player.getAttribute("src")).toBe(
       "https://signed.example/v1.mp4?sig=abc",
     );
+  });
+
+  it("renders the friendly playback status label", async () => {
+    const video = baseVideo({
+      status: "processed",
+      playback_status: "ready_for_playback",
+    });
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: { transcode: { status: "completed" } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    expect(screen.getByText("Ready for playback")).toBeInTheDocument();
+    expect(screen.queryByText("processed")).not.toBeInTheDocument();
   });
 
   it("labels unimplemented CV stages honestly instead of showing 'pending'", async () => {
@@ -263,6 +308,79 @@ describe("VideoPlaybackView", () => {
     const button = await screen.findByTestId("requeue-transcode");
     expect(button).toBeInTheDocument();
     expect(button.textContent).toMatch(/requeue/i);
+  });
+
+  it("shows the local demo preview controls when the backend enables them", async () => {
+    const video = baseVideo({
+      demo_preview_enabled: true,
+      status: "processed",
+    });
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          stage: null,
+          progress_percent: 100,
+          stages: { transcode: { status: "completed" } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+    expect(screen.getByTestId("demo-preview-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("generate-demo-preview")).toBeInTheDocument();
+  });
+
+  it("generates a local demo preview and renders the returned mp4", async () => {
+    const initial = baseVideo({
+      demo_preview_enabled: true,
+      status: "processed",
+    });
+    const refreshed = baseVideo({
+      demo_preview_enabled: true,
+      demo_preview_status: "completed",
+      status: "processed",
+      demo_preview_url: "/api/v1/videos/v1/demo-preview/artifact",
+      demo_preview_generated_at: "2026-04-19T12:00:00Z",
+    });
+    let postCount = 0;
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(refreshed)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          stage: null,
+          progress_percent: 100,
+          stages: { transcode: { status: "completed" } },
+        }),
+      ),
+      http.post("/api/v1/videos/v1/demo-preview", async () => {
+        postCount += 1;
+        return HttpResponse.json<GenerateDemoPreviewResponse>({
+          status: "queued",
+          preview_url: null,
+          generated_at: null,
+        }, { status: 202 });
+      }),
+    );
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={initial} viewerRole="coach" />));
+    });
+    await act(async () => {
+      screen.getByTestId("generate-demo-preview").click();
+    });
+    await waitFor(() => {
+      const players = screen.getAllByTestId("video-player");
+      const demoPlayer = players.find(
+        (player) =>
+          player.getAttribute("src") ===
+          "/api/v1/videos/v1/demo-preview/artifact?v=2026-04-19T12%3A00%3A00Z",
+      );
+      expect(demoPlayer).toBeDefined();
+    });
+    expect(postCount).toBe(1);
   });
 
   it("does not show the requeue button for a running stage, even to an admin", async () => {

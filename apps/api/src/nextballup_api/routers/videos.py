@@ -1,19 +1,34 @@
 from __future__ import annotations
 
+import base64
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Request, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_api.audit import write_audit
+from nextballup_api.billing import (
+    check_video_storage_quota,
+    check_video_upload_quota,
+    quota_exceeded_error,
+    record_usage,
+    resolve_team_plan,
+)
+from nextballup_api.demo_preview import (
+    queue_demo_preview_request,
+    resolve_demo_preview,
+    resolve_demo_preview_state,
+)
 from nextballup_api.deps import get_app_settings, get_current_user, get_db
 from nextballup_api.permissions import (
     require_team_coach,
     require_team_member,
     require_user_role,
+    require_verified_account,
 )
 from nextballup_api.security.jwt import create_playback_token, decode_token
 from nextballup_api.security.rate_limit import enforce_rate_limit
@@ -23,6 +38,7 @@ from nextballup_api.storage import (
     StoragePresigner,
     get_storage_presigner,
     storage_complete_multipart,
+    storage_delete_object,
     storage_head_object,
     storage_key_for_video,
     storage_presign_get,
@@ -33,10 +49,13 @@ from nextballup_api.tenant import (
     clear_tenant_context,
     set_tenant_context,
 )
+from nextballup_api.video_playback_status import derive_playback_status
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.enums import (
+    InstitutionType,
     ProcessingJobStage,
     ProcessingJobStatus,
+    TeamLevel,
     UserRole,
     VideoStatus,
 )
@@ -44,6 +63,7 @@ from nextballup_core.errors import (
     AppError,
     AuthenticationError,
     ConflictError,
+    ForbiddenError,
     NotFoundError,
     ServiceUnavailableError,
     ValidationFailedError,
@@ -53,6 +73,7 @@ from nextballup_core.schemas.video import (
     CompleteUploadResponse,
     CreateUploadRequest,
     CreateUploadResponse,
+    GenerateDemoPreviewResponse,
     PlaybackVerifyRequest,
     PlaybackVerifyResponse,
     PresignedPart,
@@ -60,10 +81,14 @@ from nextballup_core.schemas.video import (
     RequeueProcessingRequest,
     RequeueProcessingResponse,
     VideoDetailResponse,
+    VideoEventsResponse,
+    VideoEventSummary,
     VideoStatusResponse,
 )
 from nextballup_core.settings import Settings
+from nextballup_db.models.cv import VideoEvent
 from nextballup_db.models.game import Game
+from nextballup_db.models.team import Team, TeamPrivacyConsent
 from nextballup_db.models.user import User
 from nextballup_db.models.video import ProcessingJob, Video
 
@@ -80,6 +105,14 @@ _PIPELINE_STAGES: tuple[ProcessingJobStage, ...] = (
     ProcessingJobStage.METRICS,
 )
 _ESTIMATED_PROCESSING_MINUTES = 45  # Surfaced as guidance, per API_SPEC.
+_SENSITIVE_TEAM_LEVELS: frozenset[TeamLevel] = frozenset(
+    {
+        TeamLevel.YOUTH,
+        TeamLevel.AAU_CLUB,
+        TeamLevel.MIDDLE_SCHOOL,
+        TeamLevel.HIGH_SCHOOL,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +140,108 @@ def _playback_candidates(video: Video) -> tuple[tuple[str, str], ...]:
     if video.storage_key_mezzanine:
         candidates.append((video.storage_key_mezzanine, "mp4"))
     return tuple(candidates)
+
+
+def _object_metadata_value(metadata: dict[str, object], key: str) -> str | None:
+    object_metadata = metadata.get("Metadata")
+    if not isinstance(object_metadata, dict):
+        return None
+    value = object_metadata.get(key)
+    return value.lower() if isinstance(value, str) else None
+
+
+def _raw_retention_expires_at(
+    settings: Settings,
+    *,
+    plan_retention_days: int | None = None,
+    now: datetime | None = None,
+) -> datetime:
+    retention_days = plan_retention_days or settings.raw_video_retention_days
+    return (now or datetime.now(tz=UTC)) + timedelta(days=retention_days)
+
+
+def _team_requires_privacy_consent(team: Team, settings: Settings) -> bool:
+    if not settings.should_require_sensitive_upload_consent():
+        return False
+    return (
+        team.level in _SENSITIVE_TEAM_LEVELS or team.institution_type == InstitutionType.K12_SCHOOL
+    )
+
+
+def _require_uploader_youth_consent(*, team: Team, user: User, settings: Settings) -> None:
+    """Require minor-user consent fields without blocking adult coach uploads."""
+    if not _team_requires_privacy_consent(team, settings):
+        return
+    if user.role in {UserRole.ADMIN, UserRole.COACH}:
+        return
+    if user.date_of_birth_verified and user.parental_consent_on_file:
+        return
+    missing: list[str] = []
+    if not user.date_of_birth_verified:
+        missing.append("date_of_birth_verified")
+    if not user.parental_consent_on_file:
+        missing.append("parental_consent_on_file")
+    raise ForbiddenError(
+        "Sensitive youth/K-12 uploads require uploader age verification and parental consent on file",
+        code=ErrorCode.PRIVACY_CONSENT_REQUIRED,
+        details={
+            "reason": "uploader_minor_consent_required",
+            "missing": missing,
+        },
+    )
+
+
+def _consent_is_current(consent: TeamPrivacyConsent, *, now: datetime) -> bool:
+    return (
+        consent.revoked_at is None
+        and consent.effective_at <= now
+        and (consent.expires_at is None or consent.expires_at > now)
+    )
+
+
+async def _resolve_upload_privacy_consent(
+    *,
+    session: AsyncSession,
+    team: Team,
+    consent_id: uuid.UUID | None,
+    settings: Settings,
+) -> TeamPrivacyConsent | None:
+    required = _team_requires_privacy_consent(team, settings)
+    if consent_id is None:
+        if required:
+            raise ForbiddenError(
+                "A current athlete/guardian privacy consent record is required for this upload",
+                code=ErrorCode.PRIVACY_CONSENT_REQUIRED,
+            )
+        return None
+
+    consent = await session.scalar(
+        select(TeamPrivacyConsent).where(
+            TeamPrivacyConsent.id == consent_id,
+            TeamPrivacyConsent.team_id == team.id,
+        )
+    )
+    now = datetime.now(tz=UTC)
+    if consent is None or not _consent_is_current(consent, now=now):
+        raise ForbiddenError(
+            "Privacy consent record is not current for this team",
+            code=ErrorCode.PRIVACY_CONSENT_INVALID,
+        )
+    if not (
+        consent.covers_video_uploads
+        and consent.covers_cv_processing
+        and consent.athlete_pii_authorized
+    ):
+        raise ForbiddenError(
+            "Privacy consent record does not cover video upload and CV processing",
+            code=ErrorCode.PRIVACY_CONSENT_INVALID,
+        )
+    if required and not consent.minors_authorized:
+        raise ForbiddenError(
+            "Privacy consent record does not authorize minor athlete processing",
+            code=ErrorCode.PRIVACY_CONSENT_INVALID,
+        )
+    return consent
 
 
 async def _try_issue_playback(
@@ -142,6 +277,13 @@ async def _try_issue_playback(
         if metadata is None:
             continue
         if _uploaded_object_size(metadata) == 0:
+            continue
+        if (
+            fmt == "mp4"
+            and video.storage_output_sha256
+            and _object_metadata_value(metadata, "nbu-output-sha256")
+            != video.storage_output_sha256.lower()
+        ):
             continue
         url = await storage_presign_get(
             storage,
@@ -283,7 +425,13 @@ def _video_detail(
     video: Video,
     jobs: list[ProcessingJob],
     *,
+    settings: Settings,
     playback: _PlaybackArtifact | None = None,
+    demo_preview_status: str = "idle",
+    demo_preview_url: str | None = None,
+    demo_preview_generated_at: datetime | None = None,
+    demo_preview_error_message: str | None = None,
+    demo_preview_enabled: bool = False,
 ) -> VideoDetailResponse:
     processing_summary: dict[str, str] = {stage.value: "pending" for stage in _PIPELINE_STAGES}
     for job in jobs:
@@ -292,6 +440,11 @@ def _video_detail(
         id=video.id,
         game_id=video.game_id,
         status=video.status,
+        playback_status=derive_playback_status(
+            video,
+            jobs,
+            cv_pipeline_enabled=settings.cv_pipeline_enabled,
+        ),
         filename=video.filename,
         file_size_bytes=video.file_size_bytes,
         duration_seconds=video.duration_seconds,
@@ -303,17 +456,28 @@ def _video_detail(
         camera_height=video.camera_height,
         checksum_sha256=video.checksum_sha256,
         storage_etag=video.storage_etag,
+        storage_output_sha256=video.storage_output_sha256,
+        privacy_consent_id=video.privacy_consent_id,
+        raw_retention_expires_at=video.raw_retention_expires_at,
+        raw_deleted_at=video.raw_deleted_at,
         thumbnail_url=video.thumbnail_url,
         playback_url=playback.url if playback else None,
         playback_token=playback.token if playback else None,
         playback_format=playback.fmt if playback else None,
         token_expires_at=playback.expires_at if playback else None,
+        demo_preview_enabled=demo_preview_enabled,
+        demo_preview_status=demo_preview_status,
+        demo_preview_url=demo_preview_url,
+        demo_preview_generated_at=demo_preview_generated_at,
+        demo_preview_error_message=demo_preview_error_message,
         processing=processing_summary,
         created_at=video.created_at,
     )
 
 
-def _video_status(video: Video, jobs: list[ProcessingJob]) -> VideoStatusResponse:
+def _video_status(
+    video: Video, jobs: list[ProcessingJob], *, settings: Settings
+) -> VideoStatusResponse:
     stages: dict[str, ProcessingStageStatus] = {
         stage.value: ProcessingStageStatus(status="pending") for stage in _PIPELINE_STAGES
     }
@@ -331,6 +495,11 @@ def _video_status(video: Video, jobs: list[ProcessingJob]) -> VideoStatusRespons
             progress_pct = job.progress_percent
     return VideoStatusResponse(
         status=video.status,
+        playback_status=derive_playback_status(
+            video,
+            jobs,
+            cv_pipeline_enabled=settings.cv_pipeline_enabled,
+        ),
         stage=active_stage,
         progress_percent=progress_pct,
         stages=stages,
@@ -384,6 +553,34 @@ def _uploaded_object_size(metadata: dict[str, object]) -> int | None:
     return None
 
 
+def _uploaded_object_checksum_sha256(metadata: dict[str, object]) -> str | None:
+    raw_metadata = metadata.get("Metadata")
+    if isinstance(raw_metadata, dict):
+        value = raw_metadata.get("nbu-sha256") or raw_metadata.get("Nbu-Sha256")
+        if isinstance(value, str) and len(value) == 64:
+            return value.lower()
+    raw_checksum = metadata.get("ChecksumSHA256")
+    if isinstance(raw_checksum, str):
+        try:
+            return base64.b64decode(raw_checksum).hex()
+        except Exception:
+            return None
+    return None
+
+
+async def _delete_raw_object_best_effort(
+    presigner: StoragePresigner, storage_key: str | None
+) -> None:
+    if not storage_key:
+        return
+    try:
+        await storage_delete_object(presigner, key=storage_key)
+    except Exception:
+        # The S3 implementation already logs. Fakes may raise; completion
+        # should still report the validation failure that caused cleanup.
+        return
+
+
 async def _verify_uploaded_object(
     *,
     session: AsyncSession,
@@ -391,6 +588,7 @@ async def _verify_uploaded_object(
     current_user: User,
     video: Video,
     presigner: StoragePresigner,
+    expected_checksum_sha256: str | None = None,
 ) -> None:
     storage_key = video.storage_key_raw
     if not storage_key:
@@ -429,6 +627,7 @@ async def _verify_uploaded_object(
         and video.file_size_bytes is not None
         and actual_size != video.file_size_bytes
     ):
+        await _delete_raw_object_best_effort(presigner, storage_key)
         await _record_upload_failure(
             session,
             request=request,
@@ -451,6 +650,31 @@ async def _verify_uploaded_object(
             },
         )
 
+    actual_checksum = _uploaded_object_checksum_sha256(metadata)
+    if (
+        expected_checksum_sha256 is not None
+        and actual_checksum is not None
+        and actual_checksum != expected_checksum_sha256
+    ):
+        await _delete_raw_object_best_effort(presigner, storage_key)
+        await _record_upload_failure(
+            session,
+            request=request,
+            current_user=current_user,
+            video_id=video.id,
+            team_id=video.team_id,
+            extra={
+                "reason": "upload_checksum_mismatch",
+                "expected_sha256": expected_checksum_sha256,
+                "actual_sha256": actual_checksum,
+            },
+        )
+        raise ConflictError(
+            "Uploaded object checksum does not match the expected SHA-256 digest",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"reason": "upload_checksum_mismatch"},
+        )
+
 
 # ---- POST /videos/upload --------------------------------------------------
 
@@ -469,6 +693,7 @@ async def initiate_upload(
     storage: StoragePresigner | None = Depends(get_storage),
 ) -> CreateUploadResponse:
     _validate_upload(payload, settings)
+    require_verified_account(current_user, settings=settings)
 
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
@@ -483,6 +708,16 @@ async def initiate_upload(
         raise NotFoundError("Game not found", code=ErrorCode.GAME_NOT_FOUND)
     await set_tenant_context(session, game.team_id)
     await require_team_coach(session, user=current_user, team_id=game.team_id)
+    team = await session.get(Team, game.team_id)
+    if team is None or not team.is_active or team.deleted_at is not None:
+        raise NotFoundError("Team not found", code=ErrorCode.TEAM_NOT_FOUND)
+    privacy_consent = await _resolve_upload_privacy_consent(
+        session=session,
+        team=team,
+        consent_id=payload.privacy_consent_id,
+        settings=settings,
+    )
+    _require_uploader_youth_consent(team=team, user=current_user, settings=settings)
 
     await enforce_rate_limit(
         request=request,
@@ -493,16 +728,72 @@ async def initiate_upload(
         window_seconds=settings.video_upload_rate_limit_window_seconds,
     )
 
+    # Plan quota gate. Provisions a free billing account for the team if one
+    # does not yet exist (legacy / pre-migration teams) and rejects with a
+    # documented error when usage would exceed the plan ceiling.
+    quota_check = await check_video_upload_quota(
+        session,
+        team_id=game.team_id,
+        owner_user_id=current_user.id,
+        settings=settings,
+    )
+    if not quota_check.allowed:
+        await write_audit(
+            session,
+            action=AuditAction.BILLING_QUOTA_DENIED,
+            request=request,
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            resource_type="video",
+            team_id=game.team_id,
+            extra={
+                "quota_key": quota_check.quota_key,
+                "limit": quota_check.limit,
+                "used": quota_check.used,
+                "plan_code": quota_check.plan_code,
+            },
+        )
+        await session.commit()
+        raise quota_exceeded_error(quota_check)
+    storage_quota_check = await check_video_storage_quota(
+        session,
+        team_id=game.team_id,
+        owner_user_id=current_user.id,
+        settings=settings,
+        additional_bytes=payload.file_size_bytes,
+    )
+    if not storage_quota_check.allowed:
+        await write_audit(
+            session,
+            action=AuditAction.BILLING_QUOTA_DENIED,
+            request=request,
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            resource_type="video",
+            team_id=game.team_id,
+            extra={
+                "quota_key": storage_quota_check.quota_key,
+                "limit": storage_quota_check.limit,
+                "used": storage_quota_check.used,
+                "requested": payload.file_size_bytes,
+                "plan_code": storage_quota_check.plan_code,
+            },
+        )
+        await session.commit()
+        raise quota_exceeded_error(storage_quota_check)
+
     presigner = _require_storage(storage)
 
     video = Video(
         game_id=game.id,
         team_id=game.team_id,
         uploaded_by=current_user.id,
+        privacy_consent_id=privacy_consent.id if privacy_consent is not None else None,
         filename=payload.filename,
         status=VideoStatus.PENDING_UPLOAD,
         file_size_bytes=payload.file_size_bytes,
         content_type=payload.content_type,
+        checksum_sha256=payload.checksum_sha256,
         camera_position=payload.camera_position,
         camera_height=payload.camera_height,
     )
@@ -518,6 +809,7 @@ async def initiate_upload(
             key=storage_key,
             content_type=payload.content_type,
             file_size_bytes=payload.file_size_bytes,
+            checksum_sha256=payload.checksum_sha256,
         )
     except StorageFailureError as exc:
         failed_video_id = video.id
@@ -559,9 +851,36 @@ async def initiate_upload(
             "filename": payload.filename,
             "file_size_bytes": payload.file_size_bytes,
             "content_type": payload.content_type,
+            "checksum_sha256": payload.checksum_sha256,
+            "privacy_consent_id": (
+                str(privacy_consent.id) if privacy_consent is not None else None
+            ),
             "upload_method": presigned.method.value,
+            "quota_plan_code": quota_check.plan_code,
+            "quota_used_after": quota_check.used + 1,
+            "storage_quota_used_after": storage_quota_check.used + payload.file_size_bytes,
         },
     )
+    # Record metered usage for billing aggregation. The check above already
+    # provisioned a billing account if needed, so this is always against a
+    # known account_id resolved via the team link.
+    plan_ctx = await resolve_team_plan(session, team_id=game.team_id)
+    if plan_ctx is not None:
+        await record_usage(
+            session,
+            billing_account_id=plan_ctx.account_id,
+            event_key="video.upload.initiated",
+            team_id=game.team_id,
+            metadata={"video_id": str(video.id), "size_bytes": payload.file_size_bytes},
+        )
+        await record_usage(
+            session,
+            billing_account_id=plan_ctx.account_id,
+            event_key="video.storage.bytes_reserved",
+            quantity=payload.file_size_bytes,
+            team_id=game.team_id,
+            metadata={"video_id": str(video.id)},
+        )
     await session.commit()
     await session.refresh(video)
 
@@ -581,8 +900,10 @@ async def complete_upload(
     request: Request,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
     storage: StoragePresigner | None = Depends(get_storage),
 ) -> CompleteUploadResponse:
+    require_verified_account(current_user, settings=settings)
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
     session.sync_session.expunge_all()
@@ -621,6 +942,17 @@ async def complete_upload(
             details={"current_status": video.status.value},
         )
 
+    expected_checksum = payload.checksum_sha256 or video.checksum_sha256
+    if (
+        payload.checksum_sha256
+        and video.checksum_sha256
+        and payload.checksum_sha256 != video.checksum_sha256
+    ):
+        raise ValidationFailedError(
+            "checksum_sha256 does not match the checksum declared at upload initiation",
+            code=ErrorCode.VALIDATION_FAILED,
+        )
+
     if video.upload_id is not None:
         if not payload.parts:
             raise ValidationFailedError(
@@ -649,6 +981,7 @@ async def complete_upload(
                 current_user=current_user,
                 video=video,
                 presigner=presigner,
+                expected_checksum_sha256=expected_checksum,
             )
         except StorageFailureError as exc:
             failed_video_id = video.id
@@ -673,6 +1006,7 @@ async def complete_upload(
                 current_user=current_user,
                 video=video,
                 presigner=presigner,
+                expected_checksum_sha256=expected_checksum,
             )
         except StorageFailureError as exc:
             failed_video_id = video.id
@@ -689,9 +1023,14 @@ async def complete_upload(
             raise exc
 
     video.status = VideoStatus.QUEUED
-    video.checksum_sha256 = payload.checksum_sha256
+    video.checksum_sha256 = expected_checksum
     video.upload_id = None
     video.upload_expires_at = None
+    plan_ctx = await resolve_team_plan(session, team_id=video.team_id)
+    video.raw_retention_expires_at = video.raw_retention_expires_at or _raw_retention_expires_at(
+        settings,
+        plan_retention_days=(plan_ctx.raw_video_retention_days if plan_ctx is not None else None),
+    )
 
     transcode_job = ProcessingJob(
         video_id=video.id,
@@ -712,7 +1051,7 @@ async def complete_upload(
         resource_type="video",
         resource_id=video.id,
         team_id=video.team_id,
-        extra={"checksum_sha256": payload.checksum_sha256},
+        extra={"checksum_sha256": expected_checksum},
     )
     await write_audit(
         session,
@@ -768,6 +1107,8 @@ async def get_video(
         storage=storage,
         settings=settings,
     )
+    demo_preview = resolve_demo_preview(settings=settings, video_id=video.id)
+    demo_preview_state = resolve_demo_preview_state(settings=settings, video_id=video.id)
     if playback is not None:
         await write_audit(
             session,
@@ -784,7 +1125,17 @@ async def get_video(
             },
         )
         await session.commit()
-    return _video_detail(video, jobs, playback=playback)
+    return _video_detail(
+        video,
+        jobs,
+        settings=settings,
+        playback=playback,
+        demo_preview_enabled=settings.local_demo_preview_enabled(),
+        demo_preview_status=demo_preview_state.status,
+        demo_preview_url=demo_preview.url_path if demo_preview else None,
+        demo_preview_generated_at=demo_preview.generated_at if demo_preview else None,
+        demo_preview_error_message=demo_preview_state.error_message,
+    )
 
 
 # ---- GET /videos/{video_id}/status ----------------------------------------
@@ -795,6 +1146,7 @@ async def get_video_status(
     video_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
 ) -> VideoStatusResponse:
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
@@ -809,7 +1161,57 @@ async def get_video_status(
         select(ProcessingJob).where(ProcessingJob.video_id == video.id)
     )
     jobs = list(jobs_result.scalars().all())
-    return _video_status(video, jobs)
+    return _video_status(video, jobs, settings=settings)
+
+
+# ---- GET /videos/{video_id}/events ----------------------------------------
+
+
+@router.get("/{video_id}/events", response_model=VideoEventsResponse)
+async def list_video_events(
+    video_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> VideoEventsResponse:
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_member(session, user=current_user, team_id=video.team_id)
+
+    game = await session.get(Game, video.game_id)
+    rows = await session.execute(
+        select(VideoEvent)
+        .where(VideoEvent.video_id == video.id)
+        .order_by(VideoEvent.event_time_ms, VideoEvent.output_frame)
+    )
+    events = [
+        VideoEventSummary(
+            id=row.id,
+            event_type=row.event_type,
+            event_time_ms=row.event_time_ms,
+            output_frame=row.output_frame,
+            period=row.period,
+            game_clock_ms=row.game_clock_ms,
+            shot_clock_enabled=row.shot_clock_enabled,
+            shot_clock_ms=row.shot_clock_ms,
+            primary_track_key=row.primary_track_key,
+            confidence=row.confidence,
+            review_status=row.review_status,
+            created_at=row.created_at,
+        )
+        for row in rows.scalars()
+    ]
+    return VideoEventsResponse(
+        video_id=video.id,
+        shot_clock_enabled=bool(game.shot_clock_enabled) if game is not None else False,
+        shot_clock_seconds=game.shot_clock_seconds if game is not None else None,
+        events=events,
+        total=len(events),
+    )
 
 
 # ---- POST /videos/{video_id}/playback/verify ------------------------------
@@ -876,6 +1278,117 @@ async def verify_playback_token(
 
     exp = datetime.fromtimestamp(int(claims["exp"]), tz=UTC)
     return PlaybackVerifyResponse(video_id=video_id, expires_at=exp)
+
+
+# ---- POST /videos/{video_id}/demo-preview ---------------------------------
+
+
+@router.post(
+    "/{video_id}/demo-preview",
+    response_model=GenerateDemoPreviewResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_demo_preview(
+    video_id: uuid.UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+    storage: StoragePresigner | None = Depends(get_storage),
+) -> GenerateDemoPreviewResponse:
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    try:
+        await enforce_rate_limit(
+            request=request,
+            settings=settings,
+            scope="video_demo_preview",
+            subject=str(current_user.id),
+            max_attempts=settings.video_demo_preview_rate_limit_attempts,
+            window_seconds=settings.video_demo_preview_rate_limit_window_seconds,
+        )
+        result = queue_demo_preview_request(
+            video=video,
+            storage=_require_storage(storage),
+            settings=settings,
+        )
+    except AppError as exc:
+        await write_audit(
+            session,
+            action=AuditAction.VIDEO_DEMO_PREVIEW_REJECTED,
+            request=request,
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            resource_type="video",
+            resource_id=video.id,
+            team_id=video.team_id,
+            extra={
+                "error_code": exc.code,
+                "error_message": exc.message,
+                "sample_fps": settings.cv_demo_sample_fps,
+            },
+        )
+        await session.commit()
+        raise
+    if result.enqueued:
+        await write_audit(
+            session,
+            action=AuditAction.VIDEO_DEMO_PREVIEW_REQUESTED,
+            request=request,
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            resource_type="video",
+            resource_id=video.id,
+            team_id=video.team_id,
+            extra={
+                "status": result.response.status,
+                "sample_fps": settings.cv_demo_sample_fps,
+            },
+        )
+    await session.commit()
+    return result.response
+
+
+# ---- GET /videos/{video_id}/demo-preview/artifact -------------------------
+
+
+@router.get("/{video_id}/demo-preview/artifact")
+async def get_demo_preview_artifact(
+    video_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+) -> FileResponse:
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_member(session, user=current_user, team_id=video.team_id)
+
+    artifact = resolve_demo_preview(settings=settings, video_id=video.id)
+    if artifact is None:
+        raise NotFoundError("Demo preview not found", code=ErrorCode.NOT_FOUND)
+    return FileResponse(
+        path=artifact.output_path,
+        media_type="video/mp4",
+        filename=f"{video.id}.demo-preview.mp4",
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # ---- POST /videos/{video_id}/processing/requeue ---------------------------

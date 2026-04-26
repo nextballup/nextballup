@@ -151,11 +151,23 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Export runtime Python requirements for auditing
+        run: >
+          uv export --format requirements.txt --locked --no-header --no-annotate
+          --no-emit-project --no-emit-workspace
+          --output-file .ci-third-party-requirements.txt
+
+      - name: Filter non-runtime packaging tools
+        run: grep -vE '^pip==' .ci-third-party-requirements.txt > .ci-third-party-runtime-requirements.txt
+
       - name: Run pip-audit
-        # `--skip-editable` keeps pip-audit from trying to look up our own
-        # first-party workspace packages on PyPI (they aren't published).
-        # We still audit every third-party dep resolved into the venv.
-        run: uv run pip-audit --skip-editable --progress-spinner off
+        # `pip` is a local packaging tool in the GitHub runner/uv environment,
+        # not a shipped application dependency. Runtime third-party packages
+        # remain audited from the resolved lockfile.
+        run: >
+          uv run --no-sync pip-audit --strict --desc
+          --requirement .ci-third-party-runtime-requirements.txt
+          --no-deps --disable-pip
 
   security-node:
     name: Security (pnpm audit)

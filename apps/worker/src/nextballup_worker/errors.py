@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 
 class ProcessingError(Exception):
     """Base for worker-side processing errors.
@@ -11,11 +13,18 @@ class ProcessingError(Exception):
 
     code: str = "processing_error"
 
-    def __init__(self, message: str, *, code: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         if code is not None:
             self.code = code
+        self.details = details or {}
 
 
 class TransientProcessingError(ProcessingError):

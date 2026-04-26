@@ -23,6 +23,13 @@ async def set_user_role_context(session: AsyncSession, role: UserRole | str) -> 
     )
 
 
+async def set_include_deleted_context(session: AsyncSession, include_deleted: bool) -> None:
+    value = "true" if include_deleted else ""
+    await session.execute(
+        text("SELECT set_config('app.include_deleted', :value, true)").bindparams(value=value)
+    )
+
+
 async def set_join_invite_context(session: AsyncSession, invite_code: str) -> None:
     await session.execute(
         text("SELECT set_config('app.current_join_invite_code', :invite_code, true)").bindparams(

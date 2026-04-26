@@ -48,6 +48,7 @@ class _FakeE2EStorage:
 
     def __init__(self) -> None:
         self.object_sizes: dict[str, int] = {}
+        self.object_metadata: dict[str, dict[str, str]] = {}
         self.multipart_uploads: dict[str, str] = {}
         self.multipart_completions: list[dict[str, Any]] = []
 
@@ -55,7 +56,12 @@ class _FakeE2EStorage:
         return True
 
     def presign_upload(
-        self, *, key: str, content_type: str, file_size_bytes: int
+        self,
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
     ) -> PresignedUpload:
         self.object_sizes[key] = file_size_bytes
         return PresignedUpload(
@@ -96,12 +102,19 @@ class _FakeE2EStorage:
     def abort_multipart(self, *, key: str, upload_id: str) -> None:  # pragma: no cover -- not used
         raise AssertionError("multipart abort path not exercised by this smoke")
 
+    def delete_object(self, *, key: str) -> None:
+        self.object_sizes.pop(key, None)
+
     def head_object(self, *, key: str) -> dict[str, Any] | None:
         size = self.object_sizes.get(key)
         if size is None:
             return None
         etag = (key.encode("utf-8").hex().ljust(32, "0"))[:32]
-        return {"ContentLength": size, "ETag": f'"{etag}"'}
+        return {
+            "ContentLength": size,
+            "ETag": f'"{etag}"',
+            "Metadata": self.object_metadata.get(key, {}),
+        }
 
     def presign_get(
         self, *, key: str, expires_in: int, response_content_type: str | None = None
@@ -111,8 +124,16 @@ class _FakeE2EStorage:
     def download_file(self, *, key: str, destination: str) -> None:
         Path(destination).write_bytes(b"fake-video")
 
-    def upload_file(self, *, key: str, source: str, content_type: str) -> None:
+    def upload_file(
+        self,
+        *,
+        key: str,
+        source: str,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         self.object_sizes[key] = Path(source).stat().st_size
+        self.object_metadata[key] = dict(metadata or {})
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -330,7 +351,11 @@ async def test_end_to_end_multipart_with_client_checksum(
     original_presign_upload = _smoke_storage.presign_upload
 
     def _routing_presign_upload(
-        *, key: str, content_type: str, file_size_bytes: int
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
     ) -> PresignedUpload:
         if file_size_bytes > 1_048_576:
             num_parts = max(1, (file_size_bytes + 1_048_575) // 1_048_576)
@@ -341,7 +366,10 @@ async def test_end_to_end_multipart_with_client_checksum(
                 num_parts=num_parts,
             )
         return original_presign_upload(
-            key=key, content_type=content_type, file_size_bytes=file_size_bytes
+            key=key,
+            content_type=content_type,
+            file_size_bytes=file_size_bytes,
+            checksum_sha256=checksum_sha256,
         )
 
     monkeypatch.setattr(_smoke_storage, "presign_upload", _routing_presign_upload)

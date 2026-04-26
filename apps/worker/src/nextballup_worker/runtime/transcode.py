@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from nextballup_api.billing import resolve_team_plan
 from nextballup_api.storage import (
     StorageFailureError,
     StoragePresigner,
@@ -16,13 +21,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.enums import ProcessingJobStage, VideoStatus
+from nextballup_core.observability import (
+    WORKER_STORAGE_BYTES_UPLOADED_TOTAL,
+    WORKER_TRANSCODE_SECONDS,
+)
 from nextballup_core.settings import Settings, get_settings
 from nextballup_db.models.video import ProcessingJob, Video
-from nextballup_worker.audit import write_worker_audit
+from nextballup_worker.audit import originating_user_extra, write_worker_audit
 from nextballup_worker.errors import (
     PermanentProcessingError,
     TransientProcessingError,
 )
+from nextballup_worker.runtime.cv_pipeline import queue_next_stage_if_enabled
 from nextballup_worker.runtime.jobs import (
     claim_job,
     complete_job,
@@ -37,6 +47,21 @@ from nextballup_worker.tenant import (
     set_worker_context,
     set_worker_operator_role,
 )
+
+
+def _metadata_checksum_sha256(metadata: dict[str, Any]) -> str | None:
+    raw_metadata = metadata.get("Metadata")
+    if isinstance(raw_metadata, dict):
+        value = raw_metadata.get("nbu-sha256") or raw_metadata.get("Nbu-Sha256")
+        if isinstance(value, str) and len(value) == 64:
+            return value.lower()
+    raw_checksum = metadata.get("ChecksumSHA256")
+    if isinstance(raw_checksum, str):
+        try:
+            return base64.b64decode(raw_checksum).hex()
+        except Exception:
+            return None
+    return None
 
 
 @dataclass
@@ -96,6 +121,12 @@ async def _verify_storage(
             "Uploaded object size does not match the declared file size",
             code=ErrorCode.PROCESSING_SIZE_MISMATCH,
         )
+    actual_checksum = _metadata_checksum_sha256(metadata)
+    if video.checksum_sha256 and actual_checksum and actual_checksum != video.checksum_sha256:
+        raise PermanentProcessingError(
+            "Uploaded object checksum does not match the recorded SHA-256 digest",
+            code=ErrorCode.PROCESSING_CHECKSUM_MISMATCH,
+        )
     raw_etag = metadata.get("ETag")
     normalized = normalize_etag(raw_etag if isinstance(raw_etag, str) else None)
     # An ETag without a "-N" suffix is the object's MD5; keep it explicit so
@@ -124,27 +155,68 @@ async def _materialize_outputs(
     *,
     video: Video,
     artifact: BrowserMezzanineArtifact,
+    settings: Settings,
 ) -> dict[str, str | None]:
     """Persist the browser-safe playback artifact metadata onto the video row."""
+    plan_ctx = await resolve_team_plan(session, team_id=video.team_id)
+    retention_days = (
+        plan_ctx.raw_video_retention_days
+        if plan_ctx is not None and plan_ctx.raw_video_retention_days is not None
+        else settings.raw_video_retention_days
+    )
+    raw_retention_expires_at = video.raw_retention_expires_at or datetime.now(tz=UTC) + timedelta(
+        days=retention_days
+    )
     await session.execute(
         update(Video)
         .where(Video.id == video.id)
         .values(
             storage_key_mezzanine=artifact.mezzanine_key,
             storage_etag=artifact.storage_etag,
+            storage_output_sha256=artifact.output_sha256,
             duration_seconds=artifact.duration_seconds,
             width=artifact.width,
             height=artifact.height,
             fps=artifact.fps,
             codec=artifact.codec,
+            raw_retention_expires_at=raw_retention_expires_at,
         )
     )
     await session.commit()
+    if artifact.output_size_bytes is not None:
+        WORKER_STORAGE_BYTES_UPLOADED_TOTAL.inc(artifact.output_size_bytes)
     return {
         "mezzanine": artifact.mezzanine_key,
         "hls": None,
         "thumbnail": None,
     }
+
+
+async def _await_with_heartbeat(
+    awaitable: Any,
+    *,
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    settings: Settings,
+    progress_percent: int,
+) -> Any:
+    """Await a long-running stage while keeping the DB heartbeat fresh."""
+    interval = max(1, settings.worker_heartbeat_interval_seconds)
+    task = asyncio.create_task(awaitable)
+    try:
+        while not task.done():
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+            except TimeoutError:
+                await touch_heartbeat(
+                    session,
+                    job_id=job_id,
+                    progress_percent=progress_percent,
+                )
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 async def execute_transcode(
@@ -199,6 +271,7 @@ async def execute_transcode(
         new_status=VideoStatus.PROCESSING,
         allowed_from={VideoStatus.QUEUED, VideoStatus.PROCESSING},
     )
+    origin_extra = await originating_user_extra(session, video_id=claimed.video_id)
     await write_worker_audit(
         session,
         action=AuditAction.VIDEO_PROCESSING_STARTED,
@@ -210,6 +283,7 @@ async def execute_transcode(
             "video_id": str(claimed.video_id),
             "stage": claimed.stage.value,
             "celery_task_id": celery_task_id,
+            **origin_extra,
         },
     )
     await session.commit()
@@ -234,15 +308,24 @@ async def execute_transcode(
             )
         verification = await _verify_storage(video=video, presigner=resolved_storage)
         await touch_heartbeat(session, job_id=claimed.id, progress_percent=50)
-        artifact = await create_browser_mezzanine(
-            video=video,
-            presigner=resolved_storage,
+        transcode_started = time.perf_counter()
+        artifact = await _await_with_heartbeat(
+            create_browser_mezzanine(
+                video=video,
+                presigner=resolved_storage,
+                settings=resolved_settings,
+            ),
+            session=session,
+            job_id=claimed.id,
             settings=resolved_settings,
+            progress_percent=50,
         )
+        WORKER_TRANSCODE_SECONDS.observe(time.perf_counter() - transcode_started)
         outputs = await _materialize_outputs(
             session,
             video=video,
             artifact=artifact,
+            settings=resolved_settings,
         )
         await write_worker_audit(
             session,
@@ -256,7 +339,9 @@ async def execute_transcode(
                 "outputs": outputs,
                 "transcode_mode": artifact.transcoder,
                 "metadata_stripped": True,
+                "output_sha256": artifact.output_sha256,
                 "output_size_bytes": artifact.output_size_bytes,
+                **origin_extra,
             },
         )
         await session.commit()
@@ -289,6 +374,7 @@ async def execute_transcode(
             "outputs": outputs,
             "transcode_mode": artifact.transcoder,
             "metadata_stripped": True,
+            "output_sha256": artifact.output_sha256,
             "output_size_bytes": artifact.output_size_bytes,
         },
     )
@@ -312,8 +398,19 @@ async def execute_transcode(
             "video_id": str(claimed.video_id),
             "stage": claimed.stage.value,
             "verification": verification,
+            "output_sha256": artifact.output_sha256,
+            **origin_extra,
         },
     )
+    video = await _load_video(session, claimed.video_id)
+    if video is not None:
+        await queue_next_stage_if_enabled(
+            session,
+            video=video,
+            completed_stage=ProcessingJobStage.TRANSCODE,
+            settings=resolved_settings,
+            request_id=request_id,
+        )
     await session.commit()
     await clear_worker_context(session)
     return TranscodeResult(job_id=claimed.id, status="completed", retryable=False, error_code=None)
@@ -329,6 +426,8 @@ async def _handle_task_failure(
 ) -> TranscodeResult:
     error_code = getattr(exc, "code", None) or ErrorCode.INTERNAL_ERROR
     error_message = str(exc)[:2000]
+    error_details = getattr(exc, "details", None)
+    origin_extra = await originating_user_extra(session, video_id=job.video_id)
     if retryable:
         # Transient: return the job to PENDING so Celery's own scheduled retry
         # can claim it again, but keep celery_task_id populated so beat does not
@@ -349,6 +448,17 @@ async def _handle_task_failure(
             new_status=VideoStatus.QUEUED,
             allowed_from={VideoStatus.PROCESSING, VideoStatus.QUEUED},
         )
+        extra = {
+            "video_id": str(job.video_id),
+            "stage": job.stage.value,
+            "error_code": error_code,
+            "error_message": error_message,
+            "retryable": True,
+            "attempt": attempt,
+            **origin_extra,
+        }
+        if isinstance(error_details, dict):
+            extra.update(error_details)
         await write_worker_audit(
             session,
             action=AuditAction.VIDEO_PROCESSING_FAILED,
@@ -356,14 +466,7 @@ async def _handle_task_failure(
             resource_type="processing_job",
             resource_id=job.id,
             request_id=request_id,
-            extra={
-                "video_id": str(job.video_id),
-                "stage": job.stage.value,
-                "error_code": error_code,
-                "error_message": error_message,
-                "retryable": True,
-                "attempt": attempt,
-            },
+            extra=extra,
         )
         await session.commit()
         await clear_worker_context(session)
@@ -384,6 +487,15 @@ async def _handle_task_failure(
         new_status=VideoStatus.FAILED,
         allowed_from={VideoStatus.PROCESSING, VideoStatus.QUEUED},
     )
+    extra = {
+        "video_id": str(job.video_id),
+        "stage": job.stage.value,
+        "error_code": error_code,
+        "error_message": error_message,
+        **origin_extra,
+    }
+    if isinstance(error_details, dict):
+        extra.update(error_details)
     await write_worker_audit(
         session,
         action=AuditAction.VIDEO_PROCESSING_FAILED,
@@ -391,12 +503,7 @@ async def _handle_task_failure(
         resource_type="processing_job",
         resource_id=job.id,
         request_id=request_id,
-        extra={
-            "video_id": str(job.video_id),
-            "stage": job.stage.value,
-            "error_code": error_code,
-            "error_message": error_message,
-        },
+        extra=extra,
     )
     await session.commit()
     await clear_worker_context(session)

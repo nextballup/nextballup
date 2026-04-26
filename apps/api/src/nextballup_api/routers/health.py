@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 
 import boto3
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_api import __version__
+from nextballup_api.audit import write_audit
 from nextballup_api.deps import get_app_settings, get_db
+from nextballup_core.constants import AuditAction
+from nextballup_core.observability import render_metrics
 from nextballup_core.schemas.health import (
     HealthResponse,
     LivenessResponse,
@@ -60,6 +64,37 @@ async def readiness(
             storage=storage,
         )
     return ReadinessResponse(status="ready", database=database, redis=redis, storage=storage)
+
+
+@router.get("/_metrics")
+async def metrics(
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> Response:
+    if not settings.observability_metrics_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    expected = settings.observability_metrics_token or ""
+    presented = request.headers.get("X-Metrics-Token", "")
+    if not expected or not secrets.compare_digest(presented, expected):
+        await write_audit(
+            session,
+            action=AuditAction.METRICS_SCRAPE_REJECTED,
+            request=request,
+            resource_type="metrics",
+            extra={
+                "reason": "token_not_configured" if not expected else "invalid_token",
+                "has_presented_token": bool(presented),
+            },
+        )
+        await session.commit()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    return Response(
+        content=render_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 async def _check_redis(redis_url: str) -> str:

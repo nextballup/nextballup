@@ -63,6 +63,7 @@ class Team(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     conference: Mapped[str | None] = mapped_column(String(255))
     invite_code: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     memberships: Mapped[list[TeamMembership]] = relationship(
         back_populates="team",
@@ -75,6 +76,12 @@ class Team(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         cascade="all, delete-orphan",
     )
     games: Mapped[list[Game]] = relationship(
+        back_populates="team",
+        lazy="noload",
+        cascade="all, delete-orphan",
+    )
+    privacy_consents: Mapped[list[TeamPrivacyConsent]] = relationship(
+        "TeamPrivacyConsent",
         back_populates="team",
         lazy="noload",
         cascade="all, delete-orphan",
@@ -173,4 +180,52 @@ class TeamInvite(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         Index("ix_team_invites_team_active", "team_id", "is_active"),
         Index("ix_team_invites_expires_at", "expires_at"),
+    )
+
+
+class TeamPrivacyConsent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Ledger-backed team consent/rights record for video and CV processing.
+
+    This does not replace a signed legal release; it stores the enforceable
+    platform-side pointer that upload and processing code can check before
+    accepting sensitive athlete video.
+    """
+
+    __tablename__ = "team_privacy_consents"
+
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("teams.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    recorded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    consent_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    covers_video_uploads: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    covers_cv_processing: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    commercial_ml_training_allowed: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    minors_authorized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    athlete_pii_authorized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    evidence_uri: Mapped[str | None] = mapped_column(String(1024))
+    evidence_sha256: Mapped[str | None] = mapped_column(String(64))
+    effective_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[str | None] = mapped_column(String(2000))
+
+    team: Mapped[Team] = relationship(back_populates="privacy_consents")
+
+    __table_args__ = (
+        Index("ix_team_privacy_consents_team", "team_id"),
+        Index("ix_team_privacy_consents_team_active", "team_id", "revoked_at", "expires_at"),
     )

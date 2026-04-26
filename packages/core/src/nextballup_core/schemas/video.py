@@ -2,15 +2,38 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from nextballup_core.enums import (
     CameraHeight,
     CameraPosition,
+    ReviewStatus,
     UploadMethod,
+    VideoEventType,
     VideoStatus,
 )
+
+DemoPreviewStatusValue = Literal["idle", "queued", "running", "completed", "failed"]
+PlaybackStatusValue = Literal[
+    "uploading",
+    "queued",
+    "transcoding",
+    "ready_for_playback",
+    "analysis_pending",
+    "analysis_running",
+    "failed",
+]
+
+
+def _normalize_sha256(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) != 64 or any(c not in "0123456789abcdef" for c in normalized):
+        raise ValueError("checksum_sha256 must be a 64-character lowercase hex SHA-256 digest")
+    return normalized
 
 
 class CreateUploadRequest(BaseModel):
@@ -20,13 +43,20 @@ class CreateUploadRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=512)
     file_size_bytes: int = Field(ge=1)
     content_type: str = Field(min_length=1, max_length=128)
+    checksum_sha256: str | None = Field(default=None, min_length=64, max_length=64)
     camera_position: CameraPosition | None = None
     camera_height: CameraHeight | None = None
+    privacy_consent_id: uuid.UUID | None = None
 
     @field_validator("content_type")
     @classmethod
     def _normalize_content_type(cls, value: str) -> str:
         return value.strip().lower()
+
+    @field_validator("checksum_sha256")
+    @classmethod
+    def _validate_checksum(cls, value: str | None) -> str | None:
+        return _normalize_sha256(value)
 
 
 class PresignedPart(BaseModel):
@@ -64,6 +94,11 @@ class CompleteUploadRequest(BaseModel):
     checksum_sha256: str | None = Field(default=None, min_length=64, max_length=64)
     parts: list[CompletedPart] | None = None
 
+    @field_validator("checksum_sha256")
+    @classmethod
+    def _validate_checksum(cls, value: str | None) -> str | None:
+        return _normalize_sha256(value)
+
 
 class CompleteUploadResponse(BaseModel):
     id: uuid.UUID
@@ -83,6 +118,7 @@ class VideoDetailResponse(BaseModel):
     id: uuid.UUID
     game_id: uuid.UUID
     status: VideoStatus
+    playback_status: PlaybackStatusValue
     filename: str
     file_size_bytes: int | None = None
     duration_seconds: float | None = None
@@ -94,17 +130,27 @@ class VideoDetailResponse(BaseModel):
     camera_height: CameraHeight | None = None
     checksum_sha256: str | None = None
     storage_etag: str | None = None
+    storage_output_sha256: str | None = None
+    privacy_consent_id: uuid.UUID | None = None
+    raw_retention_expires_at: datetime | None = None
+    raw_deleted_at: datetime | None = None
     thumbnail_url: str | None = None
     playback_url: str | None = None
     playback_token: str | None = None
     playback_format: str | None = None
     token_expires_at: datetime | None = None
+    demo_preview_enabled: bool = False
+    demo_preview_status: DemoPreviewStatusValue = "idle"
+    demo_preview_url: str | None = None
+    demo_preview_generated_at: datetime | None = None
+    demo_preview_error_message: str | None = None
     processing: dict[str, str]
     created_at: datetime
 
 
 class VideoStatusResponse(BaseModel):
     status: VideoStatus
+    playback_status: PlaybackStatusValue
     stage: str | None
     progress_percent: int
     stages: dict[str, ProcessingStageStatus]
@@ -121,6 +167,7 @@ class VideoListItem(BaseModel):
     id: uuid.UUID
     filename: str
     status: VideoStatus
+    playback_status: PlaybackStatusValue
     file_size_bytes: int | None = None
     duration_seconds: float | None = None
     camera_position: CameraPosition | None = None
@@ -130,6 +177,29 @@ class VideoListItem(BaseModel):
 
 class VideoListResponse(BaseModel):
     videos: list[VideoListItem]
+    total: int
+
+
+class VideoEventSummary(BaseModel):
+    id: uuid.UUID
+    event_type: VideoEventType
+    event_time_ms: int
+    output_frame: int
+    period: int | None = None
+    game_clock_ms: int | None = None
+    shot_clock_enabled: bool
+    shot_clock_ms: int | None = None
+    primary_track_key: str | None = None
+    confidence: float | None = None
+    review_status: ReviewStatus
+    created_at: datetime
+
+
+class VideoEventsResponse(BaseModel):
+    video_id: uuid.UUID
+    shot_clock_enabled: bool
+    shot_clock_seconds: int | None = None
+    events: list[VideoEventSummary]
     total: int
 
 
@@ -164,3 +234,9 @@ class RequeueProcessingResponse(BaseModel):
     stage: str
     status: str
     requeued_at: datetime
+
+
+class GenerateDemoPreviewResponse(BaseModel):
+    status: DemoPreviewStatusValue
+    preview_url: str | None = None
+    generated_at: datetime | None = None

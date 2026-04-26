@@ -53,6 +53,11 @@ class Video(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    privacy_consent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("team_privacy_consents.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     storage_key_raw: Mapped[str | None] = mapped_column(String(1024))
     storage_key_mezzanine: Mapped[str | None] = mapped_column(String(1024))
@@ -75,6 +80,7 @@ class Video(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     codec: Mapped[str | None] = mapped_column(String(50))
     checksum_sha256: Mapped[str | None] = mapped_column(String(64))
     storage_etag: Mapped[str | None] = mapped_column(String(128))
+    storage_output_sha256: Mapped[str | None] = mapped_column(String(64))
     camera_position: Mapped[CameraPosition | None] = mapped_column(
         Enum(
             CameraPosition,
@@ -92,6 +98,12 @@ class Video(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     thumbnail_url: Mapped[str | None] = mapped_column(String(1024))
     upload_id: Mapped[str | None] = mapped_column(String(255))
     upload_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_retention_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_delete_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_delete_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_storage_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_delete_reason: Mapped[str | None] = mapped_column(String(64))
 
     game: Mapped[Game] = relationship(
         back_populates="videos",
@@ -116,6 +128,12 @@ class Video(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_videos_game", "game_id"),
         Index("ix_videos_team", "team_id"),
         Index("ix_videos_status", "status"),
+        Index("ix_videos_raw_retention", "raw_retention_expires_at", "raw_deleted_at"),
+        Index(
+            "ix_videos_raw_delete_retry",
+            "raw_delete_requested_at",
+            "raw_storage_deleted_at",
+        ),
     )
 
 
@@ -177,5 +195,5 @@ class ProcessingJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UniqueConstraint("video_id", "stage", name="uq_processing_jobs_video_stage"),
         Index("ix_processing_jobs_video_stage", "video_id", "stage"),
         Index("ix_processing_jobs_team", "team_id"),
-        Index("ix_processing_jobs_status", "status"),
+        Index("ix_processing_jobs_status_created", "status", "created_at"),
     )
