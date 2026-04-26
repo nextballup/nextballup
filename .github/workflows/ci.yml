@@ -198,16 +198,8 @@ jobs:
         # deps are excluded — they don't ship to users.
         run: pnpm audit --audit-level high --prod
 
-  security-secrets:
-    name: Security (gitleaks)
-    runs-on: ubuntu-latest
-    # Full-history scan on push, commit-range scan on PRs. The action fails
-    # the job on any detected secret so a leaked token never reaches main.
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # Secret-detection lives in `.github/workflows/security.yml` via the
+  # trufflehog action, which works for organization repos without a paid
+  # license. The earlier gitleaks-action@v2 job here required a paid
+  # gitleaks.io license for org repos and was dropped to avoid duplicating
+  # trufflehog's coverage with a non-functioning scanner.

@@ -14,8 +14,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Python `pip install --target` and `pyvenv` artifacts. Anchored to repo
+# root so a TypeScript/JS `src/lib/` directory is not silently ignored.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
