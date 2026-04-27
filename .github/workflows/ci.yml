@@ -203,3 +203,35 @@ jobs:
   # license. The earlier gitleaks-action@v2 job here required a paid
   # gitleaks.io license for org repos and was dropped to avoid duplicating
   # trufflehog's coverage with a non-functioning scanner.
+
+  hygiene-gitignore-drift:
+    name: Hygiene (gitignore drift)
+    runs-on: ubuntu-latest
+    # Catches the failure mode that hid `apps/web/src/lib/*.ts` for an
+    # entire phase of the project: source files present on disk but
+    # silently swallowed by an unanchored `.gitignore` pattern. Fails the
+    # build if any project-source-shaped file exists locally and is
+    # ignored. Build-output and dependency directories are skipped so
+    # legitimately-ignored compiled assets don't trip the check.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect ignored source files
+        run: |
+          set -euo pipefail
+          suspicious=$(
+            git ls-files --others --ignored --exclude-standard \
+              | grep -E '\.(py|ts|tsx)$' \
+              | grep -vE '(^|/)(node_modules|\.venv|\.next|dist|build|coverage|__pycache__|\.mypy_cache|\.pytest_cache|\.ruff_cache|\.pnpm-store)/' \
+              || true
+          )
+          if [ -n "$suspicious" ]; then
+            echo "::error::Project-source files exist on disk but are .gitignore'd:"
+            printf '  %s\n' $suspicious
+            echo ""
+            echo "Either anchor / fix the matching .gitignore rule, or, if"
+            echo "the ignore is intentional, document it with an inline"
+            echo "comment so the next reviewer can tell at a glance."
+            exit 1
+          fi
+          echo "OK — no project-source files are silently ignored."
