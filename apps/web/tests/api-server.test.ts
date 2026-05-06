@@ -9,12 +9,37 @@ vi.mock("next/headers", () => ({
 }));
 
 import { ApiError } from "@/lib/errors";
-import { serverApiJson, serverApiOptional } from "@/lib/api-server";
+import {
+  resolveApiUpstream,
+  serverApiJson,
+  serverApiOptional,
+} from "@/lib/api-server";
 
 describe("serverApi helpers", () => {
   beforeEach(() => {
     cookiesMock.mockReset();
     vi.restoreAllMocks();
+  });
+
+  it("uses an explicit upstream URL when configured", () => {
+    expect(
+      resolveApiUpstream({
+        API_UPSTREAM_URL: "http://api.internal:8000",
+        API_UPSTREAM_HOSTPORT: "ignored:10000",
+      }),
+    ).toBe("http://api.internal:8000");
+  });
+
+  it("derives the upstream URL from Render private hostport", () => {
+    expect(
+      resolveApiUpstream({
+        API_UPSTREAM_HOSTPORT: "nextballup-alpha-api:10000",
+      }),
+    ).toBe("http://nextballup-alpha-api:10000");
+  });
+
+  it("keeps the local API default for development", () => {
+    expect(resolveApiUpstream({})).toBe("http://localhost:8000");
   });
 
   it("forwards only NextBallUp auth cookies to the upstream API", async () => {

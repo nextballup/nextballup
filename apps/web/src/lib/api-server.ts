@@ -13,7 +13,24 @@ import { ApiError, toApiError } from "./errors";
  * the incoming request, so a compromised user can't influence upstream
  * behavior beyond what their session already allows.
  */
-const UPSTREAM = process.env.API_UPSTREAM_URL ?? "http://localhost:8000";
+type ApiUpstreamEnv = {
+  API_UPSTREAM_URL?: string;
+  API_UPSTREAM_HOSTPORT?: string;
+};
+
+export function resolveApiUpstream(
+  env: ApiUpstreamEnv = {
+    API_UPSTREAM_URL: process.env.API_UPSTREAM_URL,
+    API_UPSTREAM_HOSTPORT: process.env.API_UPSTREAM_HOSTPORT,
+  },
+): string {
+  return (
+    env.API_UPSTREAM_URL ??
+    (env.API_UPSTREAM_HOSTPORT ? `http://${env.API_UPSTREAM_HOSTPORT}` : "http://localhost:8000")
+  );
+}
+
+const UPSTREAM = resolveApiUpstream();
 const API_PATH = "/api/v1";
 type ServerApiOptionalInit = RequestInit & {
   nullOnStatuses?: ReadonlyArray<number>;
