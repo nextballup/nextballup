@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import traceback
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
@@ -27,7 +28,7 @@ from nextballup_api.routers import videos as videos_router
 from nextballup_api.security.csrf import CSRF_HEADER
 from nextballup_core.constants import REQUEST_ID_HEADER
 from nextballup_core.demo_preview import validate_demo_preview_runtime
-from nextballup_core.logging import install_log_redaction_filter
+from nextballup_core.logging import install_log_redaction_filter, redact_log_value
 from nextballup_core.settings import get_settings
 from nextballup_db.engine import dispose_engine
 
@@ -38,14 +39,29 @@ logger = logging.getLogger("nextballup_api")
 
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
+        payload: dict[str, object] = {
             "ts": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
             "request_id": current_request_id(),
         }
-        return json.dumps(payload, default=str)
+        if record.exc_info:
+            exc_type, exc_value, traceback_obj = record.exc_info
+            frames = traceback.extract_tb(traceback_obj)[-30:] if traceback_obj else []
+            payload["exception"] = {
+                "type": exc_type.__name__ if exc_type else type(exc_value).__name__,
+                "message": str(exc_value)[:1000],
+                "frames": [
+                    {
+                        "file": frame.filename,
+                        "line": frame.lineno,
+                        "function": frame.name,
+                    }
+                    for frame in frames
+                ],
+            }
+        return json.dumps(redact_log_value(payload), default=str)
 
 
 def _configure_logging(level: str) -> None:
