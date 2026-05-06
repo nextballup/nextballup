@@ -64,7 +64,7 @@ services:
   - type: worker
     name: nextballup-alpha-worker
     runtime: docker
-    plan: starter
+    plan: standard
     region: ohio
     autoDeployTrigger: off
     dockerfilePath: ./Dockerfile.backend
