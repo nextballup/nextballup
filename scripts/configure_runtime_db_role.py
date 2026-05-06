@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -18,6 +19,23 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from nextballup_core.settings import get_settings
 
 _ROLE_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+async def _set_runtime_role_password(connection: Any, role: str, password: str) -> None:
+    """Set the runtime-role password using PostgreSQL's own SQL quoting.
+
+    PostgreSQL utility statements such as ALTER ROLE do not accept bound
+    parameters for PASSWORD, so a direct `PASSWORD :password` / `$1` bind fails
+    on asyncpg. Generate the DDL with `format(%I, %L)` server-side to avoid
+    client-side string interpolation of role names or secrets.
+    """
+    statement = await connection.scalar(
+        text("SELECT format('ALTER ROLE %I WITH LOGIN PASSWORD %L', :role, :password)"),
+        {"role": role, "password": password},
+    )
+    if not statement:
+        raise RuntimeError("Failed to build runtime-role password statement")
+    await connection.exec_driver_sql(statement)
 
 
 async def _main() -> None:
@@ -32,10 +50,7 @@ async def _main() -> None:
     owner_engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     try:
         async with owner_engine.begin() as connection:
-            await connection.execute(
-                text(f"ALTER ROLE {role} WITH LOGIN PASSWORD :password"),
-                {"password": password},
-            )
+            await _set_runtime_role_password(connection, role, password)
     finally:
         await owner_engine.dispose()
 

@@ -14,6 +14,38 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_core.settings import Settings
+from scripts.configure_runtime_db_role import _set_runtime_role_password
+
+
+class _FakeRoleConnection:
+    def __init__(self) -> None:
+        self.scalar_statement: str | None = None
+        self.scalar_params: dict[str, str] | None = None
+        self.driver_statement: str | None = None
+
+    async def scalar(self, statement: object, params: dict[str, str]) -> str:
+        self.scalar_statement = str(statement)
+        self.scalar_params = params
+        return "ALTER ROLE nextballup_app WITH LOGIN PASSWORD 'p''ass:word'"
+
+    async def exec_driver_sql(self, statement: str) -> None:
+        self.driver_statement = statement
+
+
+@pytest.mark.asyncio
+async def test_configure_runtime_db_role_quotes_password_server_side() -> None:
+    connection = _FakeRoleConnection()
+
+    await _set_runtime_role_password(connection, "nextballup_app", "p'ass:word")
+
+    assert connection.scalar_statement is not None
+    assert "format('ALTER ROLE %I WITH LOGIN PASSWORD %L'" in connection.scalar_statement
+    assert connection.scalar_params == {"role": "nextballup_app", "password": "p'ass:word"}
+    assert connection.driver_statement == (
+        "ALTER ROLE nextballup_app WITH LOGIN PASSWORD 'p''ass:word'"
+    )
+    assert "$1" not in connection.driver_statement
+    assert ":password" not in connection.driver_statement
 
 
 @pytest.mark.asyncio(loop_scope="session")
