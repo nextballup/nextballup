@@ -14,6 +14,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -96,7 +97,7 @@ class Video(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         )
     )
     thumbnail_url: Mapped[str | None] = mapped_column(String(1024))
-    upload_id: Mapped[str | None] = mapped_column(String(255))
+    upload_id: Mapped[str | None] = mapped_column(Text)
     upload_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     raw_retention_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     raw_delete_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

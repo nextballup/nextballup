@@ -58,6 +58,7 @@ class FakeStorage:
         self.object_sizes: dict[str, int] = {}
         self.object_metadata: dict[str, dict[str, str]] = {}
         self.pending_multiparts: dict[str, tuple[str, int]] = {}
+        self.next_upload_id: str | None = None
         self.fail_presign = False
         self.fail_complete = False
         self.fail_head_for_keys: set[str] = set()
@@ -83,7 +84,8 @@ class FakeStorage:
                 url=f"https://fake-storage.test/{key}?X-Test=1",
                 headers={"Content-Type": content_type},
             )
-        upload_id = f"fake-upload-{uuid.uuid4().hex[:8]}"
+        upload_id = self.next_upload_id or f"fake-upload-{uuid.uuid4().hex[:8]}"
+        self.next_upload_id = None
         part_count = max(1, (file_size_bytes + 99 * 1024 * 1024) // (100 * 1024 * 1024))
         self.pending_multiparts[upload_id] = (key, file_size_bytes)
         parts = tuple(
@@ -599,6 +601,32 @@ async def test_initiate_multipart_upload_above_threshold(
     assert body["upload_id"] is not None
     assert body["part_size_bytes"] == 100 * 1024 * 1024
     assert isinstance(body["part_urls"], list) and len(body["part_urls"]) >= 20
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_initiate_multipart_upload_accepts_r2_length_upload_id(
+    storage_client: AsyncClient,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+) -> None:
+    _, game = await _setup_coach_team_game(
+        storage_client, coach_email="r2-upload-id-coach@example.com"
+    )
+    r2_upload_id = "r2-" + ("A" * 350)
+    fake_storage.next_upload_id = r2_upload_id
+
+    response = await storage_client.post(
+        f"{API}/videos/upload",
+        json=_upload_body(game["id"], file_size_bytes=2 * 1024 * 1024 * 1024),
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["upload_method"] == "MULTIPART"
+    assert body["upload_id"] == r2_upload_id
+    video = await db_session.scalar(select(Video).where(Video.id == uuid.UUID(body["id"])))
+    assert video is not None
+    assert video.upload_id == r2_upload_id
 
 
 @pytest.mark.asyncio(loop_scope="session")
