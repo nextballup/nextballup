@@ -12,6 +12,7 @@ describe("middleware CSP", () => {
     expect(csp).toBeTruthy();
     expect(csp).toContain("script-src 'self' 'nonce-");
     expect(csp).not.toContain("'strict-dynamic'");
+    expect(csp).toContain("style-src 'self' 'unsafe-inline'");
     expect(csp).toContain("connect-src 'self' https:");
     expect(response.headers.get("Report-To")).toContain("csp-endpoint");
   });
