@@ -527,6 +527,23 @@ async def _load_video_for_update(session: AsyncSession, video_id: uuid.UUID) -> 
     return result.scalar_one_or_none()
 
 
+async def _load_video_for_update_after_binding_tenant(
+    session: AsyncSession, video_id: uuid.UUID
+) -> Video | None:
+    """Bind tenant context before locking a video row under FORCE RLS.
+
+    The runtime app role's update policy requires ``app.current_team_id`` for
+    ``SELECT ... FOR UPDATE``. A plain read can discover the team through the
+    user-membership select policy; after that, lock the row with the tenant GUC
+    set so production behaves like the owner-role tests.
+    """
+    video = await _load_video(session, video_id)
+    if video is None:
+        return None
+    await set_tenant_context(session, video.team_id)
+    return await _load_video_for_update(session, video_id)
+
+
 async def _record_upload_failure(
     session: AsyncSession,
     *,
@@ -946,10 +963,9 @@ async def cancel_upload(
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
     session.sync_session.expunge_all()
-    video = await _load_video_for_update(session, video_id)
+    video = await _load_video_for_update_after_binding_tenant(session, video_id)
     if video is None:
         raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
-    await set_tenant_context(session, video.team_id)
     await require_team_coach(session, user=current_user, team_id=video.team_id)
 
     if video.status is VideoStatus.FAILED:
@@ -1017,10 +1033,9 @@ async def complete_upload(
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
     session.sync_session.expunge_all()
-    video = await _load_video_for_update(session, video_id)
+    video = await _load_video_for_update_after_binding_tenant(session, video_id)
     if video is None:
         raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
-    await set_tenant_context(session, video.team_id)
     await require_team_coach(session, user=current_user, team_id=video.team_id)
 
     # Idempotent: a duplicate /complete after a successful one returns the

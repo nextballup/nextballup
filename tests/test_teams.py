@@ -88,6 +88,10 @@ async def _force_team_rls(session: AsyncSession) -> None:
 
 
 class _RuntimeUploadStorage:
+    def __init__(self) -> None:
+        self.object_sizes: dict[str, int] = {}
+        self.completed_multiparts: list[dict[str, Any]] = []
+
     def is_configured(self) -> bool:
         return True
 
@@ -106,12 +110,26 @@ class _RuntimeUploadStorage:
             )
             for part_number in range(1, 4)
         )
+        self.object_sizes[key] = file_size_bytes
         return PresignedUpload(
             method=UploadMethod.MULTIPART,
             upload_id="runtime-upload-test",
             parts=parts,
             part_size_bytes=100 * 1024 * 1024,
         )
+
+    def complete_multipart(self, *, key: str, upload_id: str, parts: list[dict[str, Any]]) -> None:
+        self.completed_multiparts.append({"key": key, "upload_id": upload_id, "parts": parts})
+
+    def abort_multipart(self, *, key: str, upload_id: str) -> None:
+        self.object_sizes.pop(key, None)
+        _ = upload_id
+
+    def head_object(self, *, key: str) -> dict[str, Any] | None:
+        size = self.object_sizes.get(key)
+        if size is None:
+            return None
+        return {"ContentLength": size}
 
 
 # ---- POST /teams -----------------------------------------------------------
@@ -212,8 +230,9 @@ async def test_runtime_role_can_initiate_video_upload_through_api(
     reload_settings()
     await dispose_engine()
     reset_engine_for_url(runtime_url)
+    storage = _RuntimeUploadStorage()
     try:
-        app.dependency_overrides[get_storage] = lambda: _RuntimeUploadStorage()
+        app.dependency_overrides[get_storage] = lambda: storage
         transport = ASGITransport(app=app)
         async with AsyncClient(
             transport=transport,
@@ -261,6 +280,18 @@ async def test_runtime_role_can_initiate_video_upload_through_api(
             assert body["upload_method"] == UploadMethod.MULTIPART
             assert body["upload_id"] == "runtime-upload-test"
             assert len(body["part_urls"]) == 3
+
+            complete = await runtime_client.post(
+                f"{API}/videos/{body['id']}/complete",
+                json={
+                    "parts": [
+                        {"part_number": part["part_number"], "etag": f"etag-{part['part_number']}"}
+                        for part in body["part_urls"]
+                    ]
+                },
+            )
+            assert complete.status_code == 200, complete.text
+            assert storage.completed_multiparts[-1]["upload_id"] == body["upload_id"]
     finally:
         monkeypatch.delenv("DATABASE_URL_RUNTIME", raising=False)
         reload_settings()
