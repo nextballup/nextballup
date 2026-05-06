@@ -64,6 +64,35 @@ def _configure_logging(level: str) -> None:
     install_log_redaction_filter(root)
 
 
+def _storage_config_failures() -> list[str]:
+    settings = get_settings()
+    failures: list[str] = []
+    storage_values = {
+        "S3_ENDPOINT_URL": settings.s3_endpoint_url,
+        "S3_ACCESS_KEY": settings.s3_access_key,
+        "S3_SECRET_KEY": settings.s3_secret_key,
+        "S3_BUCKET_RAW": settings.s3_bucket_raw,
+    }
+    missing = [name for name, value in storage_values.items() if not value]
+    if missing:
+        failures.append(
+            "Object storage must be configured in staging/production "
+            f"(missing: {', '.join(sorted(missing))})"
+        )
+        return failures
+
+    endpoint = urlparse(settings.s3_endpoint_url or "")
+    endpoint_host = (endpoint.hostname or "").lower()
+    if endpoint.scheme != "https" or not endpoint.netloc:
+        failures.append("S3_ENDPOINT_URL must be an absolute https URL in staging/production")
+    elif endpoint_host in {"localhost", "127.0.0.1", "::1"}:
+        failures.append("S3_ENDPOINT_URL must not point at localhost in staging/production")
+    bucket = settings.s3_bucket_raw or ""
+    if bucket != bucket.strip() or "/" in bucket or "\\" in bucket:
+        failures.append("S3_BUCKET_RAW must be a bucket name, not a path")
+    return failures
+
+
 def _validate_startup_secrets() -> None:
     settings = get_settings()
     settings.load_jwt_private_key()
@@ -123,6 +152,7 @@ def _validate_startup_secrets() -> None:
             failures.append(
                 "OBSERVABILITY_METRICS_TOKEN must be configured when metrics are enabled"
             )
+        failures.extend(_storage_config_failures())
         if settings.cookie_domain is not None:
             failures.append(
                 "COOKIE_DOMAIN must be unset in staging/production when using __Host- cookies"

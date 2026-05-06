@@ -435,6 +435,10 @@ function describeInitiationError(err: ApiError): string {
   switch (err.code) {
     case "STORAGE_NOT_CONFIGURED":
       return "Object storage isn't configured on this environment. Ask an admin to set the S3 values.";
+    case "STORAGE_FAILURE":
+      return "Object storage rejected the upload setup. Check the alpha R2 endpoint, bucket, token permissions, and CORS settings.";
+    case "BILLING_QUOTA_EXCEEDED":
+      return "This team has reached its current upload or storage quota.";
     case "INVALID_CONTENT_TYPE":
       return "Unsupported file type. Use MP4, MOV, or MKV.";
     case "CONTENT_TYPE_EXTENSION_MISMATCH":

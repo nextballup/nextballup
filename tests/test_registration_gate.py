@@ -55,6 +55,10 @@ _ENV_KEYS = (
     "FRONTEND_APP_URL",
     "DATABASE_URL_RUNTIME",
     "CV_DEMO_PREVIEW_ENABLED",
+    "S3_ENDPOINT_URL",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "S3_BUCKET_RAW",
 )
 
 
@@ -385,6 +389,10 @@ def _set_production_env() -> None:
     os.environ["BILLING_PROVIDER"] = "registration_gate_real_billing"
     os.environ["FRONTEND_APP_URL"] = "https://beta.nextballup.com"
     os.environ["DATABASE_URL_RUNTIME"] = "postgresql+asyncpg://app:app@localhost:5432/db"
+    os.environ["S3_ENDPOINT_URL"] = "https://example-account.r2.cloudflarestorage.com"
+    os.environ["S3_ACCESS_KEY"] = "r2-access-key-for-registration-gate-tests"
+    os.environ["S3_SECRET_KEY"] = "r2-secret-key-for-registration-gate-tests"
+    os.environ["S3_BUCKET_RAW"] = "nextballup-alpha-raw"
     # Local .env may set CV_DEMO_PREVIEW_ENABLED=true for dev convenience; the
     # validator refuses that outside development/test, so force it off here.
     os.environ["CV_DEMO_PREVIEW_ENABLED"] = "false"

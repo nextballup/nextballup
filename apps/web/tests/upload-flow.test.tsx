@@ -168,6 +168,31 @@ describe("UploadFlow", () => {
     expect(alert.textContent).toMatch(/storage isn't configured/i);
   });
 
+  it("surfaces storage provider failures as deployment setup work", async () => {
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "STORAGE_FAILURE",
+              message: "Failed to initiate multipart upload",
+            },
+          },
+          { status: 502 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<UploadFlow gameId="g1" />);
+    const file = new File([new Uint8Array(10)], "clip.mov", {
+      type: "video/quicktime",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/R2 endpoint, bucket, token permissions, and CORS/i);
+  });
+
   it("includes the selected privacy consent id when uploading team film", async () => {
     const originalXHR = window.XMLHttpRequest;
     window.XMLHttpRequest = MockXHR as unknown as typeof XMLHttpRequest;

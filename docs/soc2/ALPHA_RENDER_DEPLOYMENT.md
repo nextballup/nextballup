@@ -72,6 +72,22 @@ Create an alpha-only bucket:
 - secret key: matching R2 secret
 - region: `auto`
 
+For browser uploads, add an R2 CORS policy for the alpha host. Multipart
+uploads must be able to read each part's `ETag` response header before the app
+can call `/videos/{id}/complete`.
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://alpha.nextballup.com"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedHeaders": ["content-type", "x-amz-*"],
+    "ExposeHeaders": ["ETag", "x-amz-checksum-sha256"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
 Do not store alpha raw footage in the public marketing Worker or in the repo.
 
 ## Render Creation

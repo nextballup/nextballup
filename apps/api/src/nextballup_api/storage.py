@@ -6,6 +6,7 @@ import math
 import re
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 import boto3
 from anyio import to_thread
@@ -97,18 +98,30 @@ class S3StoragePresigner:
             raise StorageNotConfiguredError("Object storage is not configured")
         self._settings = settings
         self._bucket = settings.s3_bucket_raw or ""
-        self._client = boto3.client(
-            "s3",
-            endpoint_url=settings.s3_endpoint_url,
-            aws_access_key_id=settings.s3_access_key,
-            aws_secret_access_key=settings.s3_secret_key,
-            region_name=settings.s3_region,
-            config=BotoConfig(
-                signature_version="s3v4",
-                s3={"addressing_style": "path"},
-                retries={"max_attempts": 3, "mode": "standard"},
-            ),
-        )
+        endpoint = urlparse(settings.s3_endpoint_url or "")
+        if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+            raise StorageFailureError(
+                "Object storage endpoint is invalid",
+                details={"reason": "invalid_endpoint_url"},
+            )
+        try:
+            self._client = boto3.client(
+                "s3",
+                endpoint_url=settings.s3_endpoint_url,
+                aws_access_key_id=settings.s3_access_key,
+                aws_secret_access_key=settings.s3_secret_key,
+                region_name=settings.s3_region,
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path"},
+                    retries={"max_attempts": 3, "mode": "standard"},
+                ),
+            )
+        except (BotoCoreError, ValueError) as exc:
+            raise StorageFailureError(
+                "Object storage client could not be initialized",
+                details={"reason": "client_initialization_failed"},
+            ) from exc
 
     def is_configured(self) -> bool:
         return True
@@ -161,7 +174,12 @@ class S3StoragePresigner:
             response = self._client.create_multipart_upload(
                 Bucket=self._bucket, Key=key, ContentType=content_type
             )
-            upload_id = response["UploadId"]
+            upload_id = response.get("UploadId")
+            if not isinstance(upload_id, str) or not upload_id:
+                raise StorageFailureError(
+                    "Storage did not return a multipart upload id",
+                    details={"key": key},
+                )
             parts = tuple(
                 PresignedPart(
                     part_number=i,

@@ -56,6 +56,10 @@ def _set_hardened_production_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BILLING_PROVIDER", "startup_real_billing")
     monkeypatch.setenv("REGISTRATION_MODE", "invite_only")
     monkeypatch.setenv("REGISTRATION_INVITE_CODES", "PILOT-CODE-AAAA")
+    monkeypatch.setenv("S3_ENDPOINT_URL", "https://example-account.r2.cloudflarestorage.com")
+    monkeypatch.setenv("S3_ACCESS_KEY", "r2-access-key-for-startup-tests")
+    monkeypatch.setenv("S3_SECRET_KEY", "r2-secret-key-for-startup-tests")
+    monkeypatch.setenv("S3_BUCKET_RAW", "nextballup-alpha-raw")
     monkeypatch.delenv("COOKIE_DOMAIN", raising=False)
 
 
@@ -113,6 +117,48 @@ def test_startup_validation_requires_redis_in_production(
     monkeypatch.setenv("REDIS_URL", "")
     reload_settings()
     with pytest.raises(RuntimeError, match="REDIS_URL must be configured"):
+        _validate_startup_secrets()
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    ["S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET_RAW"],
+)
+def test_startup_validation_requires_object_storage_in_production(
+    monkeypatch: pytest.MonkeyPatch, env_name: str
+) -> None:
+    _set_hardened_production_env(monkeypatch)
+    monkeypatch.setenv(env_name, "")
+    reload_settings()
+    with pytest.raises(RuntimeError, match="Object storage must be configured"):
+        _validate_startup_secrets()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected_message"),
+    [
+        ("not-a-url", "S3_ENDPOINT_URL must be an absolute https URL"),
+        ("http://127.0.0.1:9000", "S3_ENDPOINT_URL must be an absolute https URL"),
+        ("https://localhost:9000", "S3_ENDPOINT_URL must not point at localhost"),
+    ],
+)
+def test_startup_validation_rejects_insecure_storage_endpoint_in_production(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, expected_message: str
+) -> None:
+    _set_hardened_production_env(monkeypatch)
+    monkeypatch.setenv("S3_ENDPOINT_URL", endpoint)
+    reload_settings()
+    with pytest.raises(RuntimeError, match=expected_message):
+        _validate_startup_secrets()
+
+
+def test_startup_validation_rejects_storage_bucket_paths_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_hardened_production_env(monkeypatch)
+    monkeypatch.setenv("S3_BUCKET_RAW", "nextballup-alpha-raw/prefix")
+    reload_settings()
+    with pytest.raises(RuntimeError, match="S3_BUCKET_RAW must be a bucket name"):
         _validate_startup_secrets()
 
 
