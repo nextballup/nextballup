@@ -17,8 +17,8 @@ services:
     autoDeployTrigger: off
     dockerfilePath: ./Dockerfile.backend
     dockerContext: .
-    dockerCommand: sh -c 'uvicorn nextballup_api.main:app --host 0.0.0.0 --port ${PORT:-8000}'
-    preDeployCommand: sh -c 'alembic upgrade head && python scripts/configure_runtime_db_role.py'
+    dockerCommand: /bin/sh scripts/render_start_api.sh
+    preDeployCommand: /bin/sh scripts/render_predeploy.sh
     maxShutdownDelaySeconds: 120
     envVars:
       - fromGroup: nextballup-alpha-backend-common
@@ -69,7 +69,7 @@ services:
     autoDeployTrigger: off
     dockerfilePath: ./Dockerfile.backend
     dockerContext: .
-    dockerCommand: sh -c 'celery -A nextballup_worker.celery_app worker --loglevel=info --queues=nextballup.default,nextballup.transcode,nextballup.maintenance,nextballup.cpu'
+    dockerCommand: /bin/sh scripts/render_start_worker.sh
     maxShutdownDelaySeconds: 300
     envVars:
       - fromGroup: nextballup-alpha-backend-common
@@ -112,7 +112,7 @@ services:
     autoDeployTrigger: off
     dockerfilePath: ./Dockerfile.backend
     dockerContext: .
-    dockerCommand: sh -c 'celery -A nextballup_worker.celery_app beat --loglevel=info'
+    dockerCommand: /bin/sh scripts/render_start_beat.sh
     maxShutdownDelaySeconds: 120
     envVars:
       - fromGroup: nextballup-alpha-backend-common
