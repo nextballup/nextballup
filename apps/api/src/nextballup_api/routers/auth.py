@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -12,6 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from nextballup_api.audit import write_audit
 from nextballup_api.deps import get_app_settings, get_current_user, get_db
+from nextballup_api.email_delivery import EmailDeliveryError
 from nextballup_api.email_verification import (
     confirm_verification_token,
     deliver_verification_email,
@@ -94,6 +96,13 @@ from nextballup_db.models.user import User
 from nextballup_db.models.video import Video
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
+
+
+def _safe_delivery_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, EmailDeliveryError):
+        return str(exc)
+    return exc.__class__.__name__
 
 
 def _user_public(user: User) -> UserPublic:
@@ -829,7 +838,12 @@ async def request_password_reset(
             resource_id=issued.record.id,
             extra={"provider": settings.email_delivery_provider},
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Password reset email delivery failed via %s: %s",
+            settings.email_delivery_provider,
+            _safe_delivery_failure_reason(exc),
+        )
         failure_at = datetime.now(tz=UTC)
         await session.execute(
             update(PasswordResetToken)
@@ -1459,6 +1473,20 @@ async def request_email_verification(
         )
         await session.commit()
     except Exception as exc:
+        logger.warning(
+            "Email verification delivery failed via %s: %s",
+            settings.email_delivery_provider,
+            _safe_delivery_failure_reason(exc),
+        )
+        failure_at = datetime.now(tz=UTC)
+        await session.execute(
+            update(EmailVerificationToken)
+            .where(
+                EmailVerificationToken.id == issued.record.id,
+                EmailVerificationToken.used_at.is_(None),
+            )
+            .values(used_at=failure_at)
+        )
         await write_audit(
             session,
             action=AuditAction.USER_EMAIL_VERIFICATION_REJECTED,

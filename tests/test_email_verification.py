@@ -18,6 +18,7 @@ Coverage:
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -373,6 +374,64 @@ def test_noop_provider_drops_messages_silently() -> None:
             metadata={},
         )
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_request_delivery_failure_logs_safe_reason_and_consumes_token(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingDeliveryProvider:
+        name = "failing_verification_provider"
+
+        def send(self, message: EmailMessage) -> None:
+            del message
+            raise EmailDeliveryError(
+                "Postmark rejected email delivery: Sender signature not confirmed "
+                "(Postmark error 300)"
+            )
+
+    register_email_provider("failing_verification_provider", lambda _s: FailingDeliveryProvider())
+    monkeypatch.setenv("EMAIL_DELIVERY_PROVIDER", "failing_verification_provider")
+    from nextballup_core.settings import reload_settings
+
+    reload_settings()
+    try:
+        await client.post(
+            f"{API}/auth/register",
+            json=_register_payload(email="delivery-failure@example.com"),
+        )
+        caplog.set_level(logging.WARNING, logger="nextballup_api.routers.auth")
+
+        response = await client.post(f"{API}/auth/email/verify/request", json={})
+
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "Email delivery is temporarily unavailable"
+        assert "Sender signature not confirmed" in caplog.text
+        assert "token=" not in caplog.text
+
+        user = (
+            await db_session.scalars(
+                select(User).where(User.email == "delivery-failure@example.com")
+            )
+        ).first()
+        assert user is not None
+        token = (
+            await db_session.scalars(
+                select(EmailVerificationToken).where(EmailVerificationToken.user_id == user.id)
+            )
+        ).first()
+        assert token is not None
+        assert token.used_at is not None
+
+        status_response = await client.get(f"{API}/auth/email/verify/status")
+        assert status_response.status_code == 200
+        assert status_response.json()["pending_request"] is False
+    finally:
+        monkeypatch.setenv("EMAIL_DELIVERY_PROVIDER", "noop")
+        reload_settings()
 
 
 def test_postmark_provider_sends_plaintext_message_without_logging_token() -> None:
