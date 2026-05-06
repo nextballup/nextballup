@@ -23,6 +23,26 @@ async def set_user_role_context(session: AsyncSession, role: UserRole | str) -> 
     )
 
 
+async def bind_authenticated_context(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    role: UserRole | str,
+    team_id: uuid.UUID | None = None,
+) -> None:
+    """Restore request-scoped RLS GUCs after a real transaction commit.
+
+    The individual setters use `SET LOCAL` semantics, which is exactly what we
+    want inside a request transaction. A real commit clears those GUCs, though,
+    so post-commit refreshes must bind the user/role/team context again before
+    reading FORCE-RLS tables.
+    """
+    await set_user_context(session, user_id)
+    await set_user_role_context(session, role)
+    if team_id is not None:
+        await set_tenant_context(session, team_id)
+
+
 async def set_include_deleted_context(session: AsyncSession, include_deleted: bool) -> None:
     value = "true" if include_deleted else ""
     await session.execute(

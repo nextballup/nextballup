@@ -18,6 +18,7 @@ from nextballup_api.permissions import (
     require_verified_account,
 )
 from nextballup_api.tenant import (
+    bind_authenticated_context,
     clear_join_invite_context,
     clear_tenant_context,
     set_tenant_context,
@@ -100,6 +101,12 @@ async def create_game(
         extra={"game_type": game.game_type.value, "date": game.date.isoformat()},
     )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=team.id,
+    )
     await session.refresh(game)
     return GameSummary.model_validate(game)
 
@@ -307,5 +314,11 @@ async def update_game(
         extra={"fields": sorted(updates.keys())},
     )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=game.team_id,
+    )
     await session.refresh(game)
     return GameSummary.model_validate(game)

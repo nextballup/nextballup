@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import os
 from typing import Any, cast
 
 import pytest
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
+from nextballup_api.main import app
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from nextballup_core.constants import AuditAction, ErrorCode
+from nextballup_core.settings import reload_settings
+from nextballup_db.engine import dispose_engine, reset_engine_for_url
 from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.team import Team, TeamInvite, TeamMembership
+from scripts.configure_runtime_db_role import _set_runtime_role_password
+from tests.csrf_helper import make_csrf_mirror_hook
 
 API = "/api/v1"
 
@@ -104,6 +110,58 @@ async def test_coach_can_create_team_and_becomes_head_coach(
 
     actions = await _audit_actions_for_team(db_session, team_id)
     assert AuditAction.TEAM_CREATED in actions
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_runtime_role_can_create_team_through_api_without_owner_override(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    password = "RuntimeRoleApiTeamTest1"
+    owner_url = os.environ["DATABASE_URL"]
+    runtime_url = owner_url.replace(
+        "nextballup:nextballup_dev@",
+        f"nextballup_app:{password}@",
+    )
+    async with engine.begin() as connection:
+        await _set_runtime_role_password(connection, "nextballup_app", password)
+
+    user_id: str | None = None
+    team_id: str | None = None
+    monkeypatch.setenv("DATABASE_URL_RUNTIME", runtime_url)
+    reload_settings()
+    await dispose_engine()
+    reset_engine_for_url(runtime_url)
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            event_hooks={"request": [make_csrf_mirror_hook()]},
+        ) as runtime_client:
+            register = await runtime_client.post(
+                f"{API}/auth/register",
+                json=_coach_payload("runtime-create-team@example.com"),
+            )
+            assert register.status_code == 201, register.text
+            user_id = register.json()["id"]
+
+            response = await runtime_client.post(
+                f"{API}/teams",
+                json=_team_create_body(name="Runtime Alpha Team", level="aau_club"),
+            )
+            assert response.status_code == 201, response.text
+            body = response.json()
+            team_id = body["id"]
+            assert body["name"] == "Runtime Alpha Team"
+            assert body["member_count"] == 1
+    finally:
+        monkeypatch.delenv("DATABASE_URL_RUNTIME", raising=False)
+        reload_settings()
+        await dispose_engine()
+        reset_engine_for_url(owner_url)
+        app.dependency_overrides.clear()
+        _ = (team_id, user_id)
 
 
 @pytest.mark.asyncio(loop_scope="session")

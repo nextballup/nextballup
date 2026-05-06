@@ -9,9 +9,12 @@ for new tables), we want CI to catch it before it ships.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from nextballup_core.settings import Settings
 from scripts.configure_runtime_db_role import _set_runtime_role_password
@@ -119,6 +122,172 @@ async def test_app_role_has_crud_on_tenant_tables(db_session: AsyncSession) -> N
         )
         # Defense-in-depth: the role must NOT have DDL-ish grants.
         assert "TRUNCATE" not in privs, f"nextballup_app should not have TRUNCATE on {table}"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_visibility_triggers_are_security_definer_without_runtime_table_grants(
+    db_session: AsyncSession,
+) -> None:
+    rows = (
+        await db_session.execute(
+            text(
+                """
+                SELECT proname, prosecdef, COALESCE(array_to_string(proconfig, ','), '') AS config
+                FROM pg_proc
+                WHERE proname IN ('sync_team_visibility', 'sync_billing_account_visibility')
+                """
+            )
+        )
+    ).mappings()
+    functions = {row["proname"]: row for row in rows}
+    assert set(functions) == {"sync_team_visibility", "sync_billing_account_visibility"}
+    for row in functions.values():
+        assert row["prosecdef"] is True
+        assert "search_path=public, pg_temp" in row["config"]
+
+    for table in ("team_visibility", "billing_account_visibility"):
+        for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            allowed = await db_session.scalar(
+                text("SELECT has_table_privilege('nextballup_app', :table, :privilege)"),
+                {"table": table, "privilege": privilege},
+            )
+            assert allowed is False, f"nextballup_app should not have {privilege} on {table}"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_app_role_can_insert_team_while_visibility_table_stays_private(
+    engine: AsyncEngine,
+    db_session: AsyncSession,
+) -> None:
+    password = "RuntimeRoleVisibilityTest1"
+    team_id = uuid.uuid4()
+    async with engine.begin() as connection:
+        await _set_runtime_role_password(connection, "nextballup_app", password)
+
+    runtime_engine = create_async_engine(
+        f"postgresql+asyncpg://nextballup_app:{password}@localhost:5432/nextballup_test",
+        poolclass=NullPool,
+    )
+    try:
+        async with runtime_engine.begin() as connection:
+            await connection.execute(
+                text("SELECT set_config('app.current_team_id', CAST(:team_id AS text), true)"),
+                {"team_id": str(team_id)},
+            )
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO teams (
+                        id, name, sport, level, institution_type, season, invite_code
+                    )
+                    VALUES (
+                        CAST(:team_id AS uuid),
+                        :name,
+                        CAST(:sport AS sport),
+                        CAST(:level AS team_level),
+                        CAST(:institution_type AS institution_type),
+                        :season,
+                        :invite_code
+                    )
+                    """
+                ),
+                {
+                    "team_id": str(team_id),
+                    "name": "Runtime Visibility Test",
+                    "sport": "basketball",
+                    "level": "aau_club",
+                    "institution_type": "none",
+                    "season": "2026",
+                    "invite_code": "RLSVIS26",
+                },
+            )
+
+        visible = await db_session.scalar(
+            text(
+                "SELECT deleted_at IS NULL FROM team_visibility "
+                "WHERE team_id = CAST(:team_id AS uuid)"
+            ),
+            {"team_id": str(team_id)},
+        )
+        assert visible is True
+    finally:
+        await runtime_engine.dispose()
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("SELECT set_config('app.current_team_id', CAST(:team_id AS text), true)"),
+                {"team_id": str(team_id)},
+            )
+            await connection.execute(
+                text("DELETE FROM teams WHERE id = CAST(:team_id AS uuid)"),
+                {"team_id": str(team_id)},
+            )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_app_role_can_insert_billing_account_while_visibility_table_stays_private(
+    engine: AsyncEngine,
+    db_session: AsyncSession,
+) -> None:
+    password = "RuntimeRoleBillingVisibilityTest1"
+    account_id = uuid.uuid4()
+    async with engine.begin() as connection:
+        await _set_runtime_role_password(connection, "nextballup_app", password)
+
+    runtime_engine = create_async_engine(
+        f"postgresql+asyncpg://nextballup_app:{password}@localhost:5432/nextballup_test",
+        poolclass=NullPool,
+    )
+    try:
+        async with runtime_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "SELECT set_config("
+                    "'app.current_billing_account_id', CAST(:account_id AS text), true)"
+                ),
+                {"account_id": str(account_id)},
+            )
+            created_at = await connection.scalar(
+                text(
+                    """
+                    INSERT INTO billing_accounts (id, name, status)
+                    VALUES (
+                        CAST(:account_id AS uuid),
+                        :name,
+                        CAST(:status AS billing_account_status)
+                    )
+                    RETURNING created_at
+                    """
+                ),
+                {
+                    "account_id": str(account_id),
+                    "name": "Runtime Billing Visibility Test",
+                    "status": "active",
+                },
+            )
+            assert created_at is not None
+
+        visible = await db_session.scalar(
+            text(
+                "SELECT deleted_at IS NULL FROM billing_account_visibility "
+                "WHERE billing_account_id = CAST(:account_id AS uuid)"
+            ),
+            {"account_id": str(account_id)},
+        )
+        assert visible is True
+    finally:
+        await runtime_engine.dispose()
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "SELECT set_config("
+                    "'app.current_billing_account_id', CAST(:account_id AS text), true)"
+                ),
+                {"account_id": str(account_id)},
+            )
+            await connection.execute(
+                text("DELETE FROM billing_accounts WHERE id = CAST(:account_id AS uuid)"),
+                {"account_id": str(account_id)},
+            )
 
 
 @pytest.mark.asyncio(loop_scope="session")

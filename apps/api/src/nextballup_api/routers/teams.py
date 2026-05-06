@@ -21,6 +21,7 @@ from nextballup_api.permissions import (
 from nextballup_api.security.invite_code import generate_invite_code
 from nextballup_api.security.rate_limit import enforce_rate_limit
 from nextballup_api.tenant import (
+    bind_authenticated_context,
     clear_join_invite_context,
     clear_tenant_context,
     set_join_invite_context,
@@ -366,6 +367,12 @@ async def create_team(
         extra={"sport": team.sport.value, "level": team.level.value},
     )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=team.id,
+    )
     await session.refresh(team)
 
     return TeamCreatedResponse(
@@ -428,6 +435,12 @@ async def create_invite(
         extra={"role": payload.role.value, "max_uses": payload.max_uses},
     )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=team.id,
+    )
     await session.refresh(invite)
 
     return CreateInviteResponse(
@@ -531,6 +544,12 @@ async def record_privacy_consent(
         },
     )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=team.id,
+    )
     await session.refresh(consent)
     return _privacy_consent_response(consent)
 
@@ -732,6 +751,12 @@ async def join_team(
         },
     )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=team.id,
+    )
     await session.refresh(membership)
 
     return JoinTeamResponse(

@@ -45,6 +45,7 @@ from nextballup_api.storage import (
     storage_presign_upload,
 )
 from nextballup_api.tenant import (
+    bind_authenticated_context,
     clear_join_invite_context,
     clear_tenant_context,
     set_tenant_context,
@@ -882,6 +883,12 @@ async def initiate_upload(
             metadata={"video_id": str(video.id)},
         )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=game.team_id,
+    )
     await session.refresh(video)
 
     return _build_presigned_response(video_id=video.id, presigned=presigned, expires_at=expires_at)
@@ -1065,6 +1072,12 @@ async def complete_upload(
         extra={"stage": transcode_job.stage.value, "video_id": str(video.id)},
     )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=video.team_id,
+    )
     await session.refresh(video)
     await session.refresh(transcode_job)
 
@@ -1482,6 +1495,12 @@ async def requeue_processing(
         },
     )
     await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=video.team_id,
+    )
     await session.refresh(job)
 
     return RequeueProcessingResponse(
