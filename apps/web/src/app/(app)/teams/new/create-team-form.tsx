@@ -48,6 +48,20 @@ function currentSeason(): string {
   return `${year - 1}-${year}`;
 }
 
+function createTeamErrorMessage(err: ApiError): string {
+  if (
+    err.status === 403 &&
+    (err.details?.reason === "email_unverified" ||
+      err.message.toLowerCase().includes("email verification"))
+  ) {
+    return "Verify your email before creating a team.";
+  }
+  if (err.status === 403) {
+    return "Only coach accounts can create teams.";
+  }
+  return err.message;
+}
+
 export function CreateTeamForm() {
   const router = useRouter();
   const [name, setName] = useState("");
@@ -89,11 +103,7 @@ export function CreateTeamForm() {
       router.replace(`/teams/${created.id}`);
     } catch (err) {
       if (err instanceof ApiError) {
-        setError(
-          err.status === 403
-            ? "Only coach accounts can create teams."
-            : err.message,
-        );
+        setError(createTeamErrorMessage(err));
       } else {
         setError("Could not create team.");
       }

@@ -31,6 +31,24 @@ export type PasswordResetConfirmResponse = {
   reset_at: string;
 };
 
+export type RequestEmailVerificationResponse = {
+  requested_at: string;
+  expires_at: string;
+  delivery: string;
+};
+
+export type ConfirmEmailVerificationResponse = {
+  confirmed_at: string;
+  is_verified: boolean;
+};
+
+export type EmailVerificationStatusResponse = {
+  is_verified: boolean;
+  pending_request: boolean;
+  last_requested_at: string | null;
+  last_confirmed_at: string | null;
+};
+
 export type RegistrationMode = "open" | "invite_only" | "allowlist" | "disabled";
 
 export type RegistrationStatusResponse = {

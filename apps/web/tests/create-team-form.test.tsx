@@ -77,4 +77,30 @@ describe("CreateTeamForm", () => {
     expect(alert.textContent).toMatch(/only coach accounts/i);
     expect(replace).not.toHaveBeenCalled();
   });
+
+  it("tells an unverified coach to verify email before creating a team", async () => {
+    replace.mockReset();
+    server.use(
+      http.post("/api/v1/teams", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "FORBIDDEN",
+              message: "Email verification is required before this action",
+              details: { reason: "email_unverified" },
+            },
+          },
+          { status: 403 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<CreateTeamForm />);
+    await user.type(screen.getByLabelText(/Team name/i), "Alpha Team");
+    await user.click(screen.getByRole("button", { name: /create team/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/verify your email/i);
+    expect(alert.textContent).not.toMatch(/only coach accounts/i);
+    expect(replace).not.toHaveBeenCalled();
+  });
 });

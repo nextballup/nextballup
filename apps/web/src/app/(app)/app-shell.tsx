@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { BrandLink } from "@/components/brand-link";
+import { EmailVerificationBanner } from "@/components/email-verification-banner";
 import { TeamPicker } from "@/components/team-picker";
 import { apiVoid } from "@/lib/api-client";
 import type { TeamListEntry, UserPublic } from "@/lib/contract";
@@ -112,6 +113,7 @@ export function AppShell({
             );
           })}
         </nav>
+        <EmailVerificationBanner email={user.email} />
       </header>
       <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-6">{children}</main>
     </div>

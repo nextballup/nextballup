@@ -88,6 +88,7 @@ describe("registration channel UI", () => {
 
   it("submits the invite code only when the backend requires it", async () => {
     const submissions: Array<Record<string, unknown>> = [];
+    const verificationRequests: Request[] = [];
     const statusRequests: Request[] = [];
     server.use(
       http.get("/api/v1/auth/registration/status", ({ request }) => {
@@ -111,6 +112,17 @@ describe("registration channel UI", () => {
           { status: 201 },
         );
       }),
+      http.post("/api/v1/auth/email/verify/request", ({ request }) => {
+        verificationRequests.push(request);
+        return HttpResponse.json(
+          {
+            requested_at: "2026-05-06T00:00:00Z",
+            expires_at: "2026-05-06T01:00:00Z",
+            delivery: "postmark",
+          },
+          { status: 202 },
+        );
+      }),
     );
     const user = userEvent.setup();
 
@@ -132,5 +144,6 @@ describe("registration channel UI", () => {
       },
     ]);
     expect(statusRequests[0]?.cache).toBe("no-store");
+    expect(verificationRequests).toHaveLength(1);
   });
 });

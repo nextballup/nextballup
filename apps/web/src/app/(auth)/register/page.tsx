@@ -8,6 +8,7 @@ import { ApiError } from "@/lib/errors";
 import { useRetryAfterGate } from "@/lib/retry-after";
 import type {
   RegisterResponse,
+  RequestEmailVerificationResponse,
   RegistrationStatusResponse,
 } from "@/app/(auth)/types";
 
@@ -85,6 +86,15 @@ export default function RegisterPage() {
         },
         noRefreshOn401: true,
       });
+      try {
+        await apiJson<RequestEmailVerificationResponse>("/auth/email/verify/request", {
+          method: "POST",
+          json: {},
+        });
+      } catch {
+        // The signed-in app shell exposes a retry control. Registration should
+        // not strand the user if the transactional provider is briefly down.
+      }
       router.replace("/games");
     } catch (err) {
       if (err instanceof ApiError) {
