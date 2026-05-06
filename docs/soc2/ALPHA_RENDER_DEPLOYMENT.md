@@ -107,6 +107,13 @@ python scripts/configure_runtime_db_role.py
 The API must remain a private service. The frontend should call it via
 `API_UPSTREAM_HOSTPORT`, not a public API hostname.
 
+The alpha Render worker intentionally uses the POSIX media subprocess sandbox
+(`WORKER_MEDIA_SUBPROCESS_SANDBOX=true`) with CPU/output limits instead of the
+containerized FFmpeg sandbox. Render does not provide the Docker-in-Docker
+shape that the production checklist expects. Keep
+`WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED=true` for production/beta transcode
+workers on infrastructure that supports that hardened container profile.
+
 ## Cloudflare Cutover
 
 Keep the current `nextballup-alpha-holding` Worker until Render is green.

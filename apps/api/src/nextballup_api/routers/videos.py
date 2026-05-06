@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -94,6 +95,7 @@ from nextballup_db.models.user import User
 from nextballup_db.models.video import ProcessingJob, Video
 
 router = APIRouter(prefix="/videos", tags=["videos"])
+logger = logging.getLogger(__name__)
 
 # The first concrete worker stage materializes a browser-safe MP4 mezzanine;
 # downstream CV stages exist in the schema for forward compatibility.
@@ -528,23 +530,40 @@ async def _record_upload_failure(
     session: AsyncSession,
     *,
     request: Request,
-    current_user: User,
+    actor_user_id: uuid.UUID,
+    actor_email: str,
+    actor_role: UserRole,
     video_id: uuid.UUID | None,
     team_id: uuid.UUID | None,
     extra: dict[str, object],
 ) -> None:
-    await write_audit(
-        session,
-        action=AuditAction.VIDEO_UPLOAD_FAILED,
-        request=request,
-        actor_user_id=current_user.id,
-        actor_email=current_user.email,
-        resource_type="video",
-        resource_id=video_id,
-        team_id=team_id,
-        extra=extra,
-    )
-    await session.commit()
+    try:
+        await bind_authenticated_context(
+            session,
+            user_id=actor_user_id,
+            role=actor_role,
+            team_id=team_id,
+        )
+        await write_audit(
+            session,
+            action=AuditAction.VIDEO_UPLOAD_FAILED,
+            request=request,
+            actor_user_id=actor_user_id,
+            actor_email=actor_email,
+            resource_type="video",
+            resource_id=video_id,
+            team_id=team_id,
+            extra=extra,
+        )
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        logger.exception(
+            "Failed to record video upload failure audit request_id=%s video_id=%s team_id=%s",
+            getattr(request.state, "request_id", None),
+            video_id,
+            team_id,
+        )
 
 
 def _uploaded_object_size(metadata: dict[str, object]) -> int | None:
@@ -596,7 +615,9 @@ async def _verify_uploaded_object(
         await _record_upload_failure(
             session,
             request=request,
-            current_user=current_user,
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            actor_role=current_user.role,
             video_id=video.id,
             team_id=video.team_id,
             extra={"reason": "missing_storage_key"},
@@ -611,7 +632,9 @@ async def _verify_uploaded_object(
         await _record_upload_failure(
             session,
             request=request,
-            current_user=current_user,
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            actor_role=current_user.role,
             video_id=video.id,
             team_id=video.team_id,
             extra={"reason": "upload_not_found", "storage_key": storage_key},
@@ -632,7 +655,9 @@ async def _verify_uploaded_object(
         await _record_upload_failure(
             session,
             request=request,
-            current_user=current_user,
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            actor_role=current_user.role,
             video_id=video.id,
             team_id=video.team_id,
             extra={
@@ -661,7 +686,9 @@ async def _verify_uploaded_object(
         await _record_upload_failure(
             session,
             request=request,
-            current_user=current_user,
+            actor_user_id=current_user.id,
+            actor_email=current_user.email,
+            actor_role=current_user.role,
             video_id=video.id,
             team_id=video.team_id,
             extra={
@@ -695,6 +722,9 @@ async def initiate_upload(
 ) -> CreateUploadResponse:
     _validate_upload(payload, settings)
     require_verified_account(current_user, settings=settings)
+    actor_user_id = current_user.id
+    actor_email = current_user.email
+    actor_role = current_user.role
 
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
@@ -820,7 +850,9 @@ async def initiate_upload(
         await _record_upload_failure(
             session,
             request=request,
-            current_user=current_user,
+            actor_user_id=actor_user_id,
+            actor_email=actor_email,
+            actor_role=actor_role,
             video_id=failed_video_id,
             team_id=failed_team_id,
             extra={
@@ -911,6 +943,9 @@ async def complete_upload(
     storage: StoragePresigner | None = Depends(get_storage),
 ) -> CompleteUploadResponse:
     require_verified_account(current_user, settings=settings)
+    actor_user_id = current_user.id
+    actor_email = current_user.email
+    actor_role = current_user.role
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
     session.sync_session.expunge_all()
@@ -998,7 +1033,9 @@ async def complete_upload(
             await _record_upload_failure(
                 session,
                 request=request,
-                current_user=current_user,
+                actor_user_id=actor_user_id,
+                actor_email=actor_email,
+                actor_role=actor_role,
                 video_id=failed_video_id,
                 team_id=failed_team_id,
                 extra={"reason": "storage_complete_failed", "upload_id": failed_upload_id},
@@ -1022,7 +1059,9 @@ async def complete_upload(
             await _record_upload_failure(
                 session,
                 request=request,
-                current_user=current_user,
+                actor_user_id=actor_user_id,
+                actor_email=actor_email,
+                actor_role=actor_role,
                 video_id=failed_video_id,
                 team_id=failed_team_id,
                 extra={"reason": "storage_head_failed"},

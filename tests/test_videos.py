@@ -14,7 +14,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from nextballup_api.demo_preview import queue_demo_preview_request
-from nextballup_api.routers.videos import get_storage
+from nextballup_api.routers.videos import _record_upload_failure, get_storage
 from nextballup_api.security.jwt import create_access_token
 from nextballup_api.security.passwords import hash_password
 from nextballup_api.storage import (
@@ -26,8 +26,9 @@ from nextballup_api.storage import (
 from nextballup_api.video_playback_status import derive_playback_status
 from nextballup_worker.runtime import execute_transcode
 from nextballup_worker.tenant import clear_worker_context, set_worker_operator_role
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import Request
 
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.enums import (
@@ -745,6 +746,56 @@ async def test_initiate_storage_failure_audits_failure(
         )
     )
     assert failed is not None and failed >= 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_upload_failure_audit_rebinds_rls_context(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, _ = await _setup_coach_team_game(
+        storage_client, coach_email="upload-fail-rls@example.com"
+    )
+    user = await db_session.scalar(select(User).where(User.email == "upload-fail-rls@example.com"))
+    assert user is not None
+
+    # Storage failures roll back the main upload transaction before auditing.
+    # Recreate the important part of that state: request-local RLS GUCs are
+    # absent, but the failure audit still needs to be persisted.
+    await db_session.execute(text("SELECT set_config('app.current_team_id', '', true)"))
+    await db_session.execute(text("SELECT set_config('app.current_user_id', '', true)"))
+    await db_session.execute(text("SELECT set_config('app.current_user_role', '', true)"))
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": f"{API}/videos/upload",
+            "headers": [],
+            "client": ("127.0.0.1", 51000),
+        }
+    )
+    request.state.request_id = "upload-failure-rls-test"
+
+    await _record_upload_failure(
+        db_session,
+        request=request,
+        actor_user_id=user.id,
+        actor_email=user.email,
+        actor_role=user.role,
+        video_id=uuid.uuid4(),
+        team_id=uuid.UUID(team["id"]),
+        extra={"reason": "storage_presign_failed"},
+    )
+
+    failed = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_UPLOAD_FAILED,
+            AuditLog.team_id == uuid.UUID(team["id"]),
+            AuditLog.request_id == "upload-failure-rls-test",
+        )
+    )
+    assert failed == 1
 
 
 @pytest.mark.asyncio(loop_scope="session")

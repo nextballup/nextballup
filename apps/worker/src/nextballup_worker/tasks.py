@@ -270,9 +270,15 @@ def _ensure_runtime_broker_configured() -> None:
     settings.runtime_database_url()
     if settings.app_env in ("staging", "production"):
         failures: list[str] = []
-        if not settings.worker_media_container_sandbox_enabled:
+        if settings.app_env == "production" and not settings.worker_media_container_sandbox_enabled:
+            failures.append("WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED must be true in production")
+        if settings.app_env == "staging" and not (
+            settings.worker_media_container_sandbox_enabled
+            or settings.worker_media_subprocess_sandbox
+        ):
             failures.append(
-                "WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED must be true in staging/production"
+                "WORKER_MEDIA_SUBPROCESS_SANDBOX or WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED "
+                "must be true in staging"
             )
         if settings.worker_media_max_cpu_seconds <= 0:
             failures.append("WORKER_MEDIA_MAX_CPU_SECONDS must be non-zero in staging/production")

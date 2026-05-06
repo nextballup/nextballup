@@ -1562,6 +1562,62 @@ def test_worker_startup_requires_media_sandbox_in_production(
         reload_settings()
 
 
+def test_worker_startup_accepts_render_alpha_subprocess_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "staging")
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://localhost:6379/1")
+    monkeypatch.setenv(
+        "DATABASE_URL_RUNTIME",
+        "postgresql+asyncpg://nextballup_app:nextballup_app_pw@localhost:5432/nextballup",
+    )
+    monkeypatch.setenv("WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED", "false")
+    monkeypatch.setenv("WORKER_MEDIA_SUBPROCESS_SANDBOX", "true")
+    monkeypatch.setenv("WORKER_MEDIA_MAX_CPU_SECONDS", "7200")
+    monkeypatch.setenv("WORKER_MEDIA_MAX_OUTPUT_BYTES", "107374182400")
+    reload_settings()
+    try:
+        _ensure_runtime_broker_configured()
+    finally:
+        monkeypatch.setenv("APP_ENV", "test")
+        monkeypatch.delenv("DATABASE_URL_RUNTIME", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_SUBPROCESS_SANDBOX", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_MAX_CPU_SECONDS", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_MAX_OUTPUT_BYTES", raising=False)
+        reload_settings()
+
+
+def test_worker_startup_requires_some_media_sandbox_in_staging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "staging")
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://localhost:6379/1")
+    monkeypatch.setenv(
+        "DATABASE_URL_RUNTIME",
+        "postgresql+asyncpg://nextballup_app:nextballup_app_pw@localhost:5432/nextballup",
+    )
+    monkeypatch.setenv("WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED", "false")
+    monkeypatch.setenv("WORKER_MEDIA_SUBPROCESS_SANDBOX", "false")
+    monkeypatch.setenv("WORKER_MEDIA_MAX_CPU_SECONDS", "7200")
+    monkeypatch.setenv("WORKER_MEDIA_MAX_OUTPUT_BYTES", "107374182400")
+    reload_settings()
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="WORKER_MEDIA_SUBPROCESS_SANDBOX or WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED",
+        ):
+            _ensure_runtime_broker_configured()
+    finally:
+        monkeypatch.setenv("APP_ENV", "test")
+        monkeypatch.delenv("DATABASE_URL_RUNTIME", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_SUBPROCESS_SANDBOX", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_MAX_CPU_SECONDS", raising=False)
+        monkeypatch.delenv("WORKER_MEDIA_MAX_OUTPUT_BYTES", raising=False)
+        reload_settings()
+
+
 def test_worker_startup_requires_demo_preview_dependencies_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
