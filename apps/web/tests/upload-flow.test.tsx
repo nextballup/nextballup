@@ -490,6 +490,62 @@ describe("UploadFlow", () => {
     window.XMLHttpRequest = originalXHR;
   });
 
+  it("lets the user cancel a multipart upload and requests server-side abort", async () => {
+    const originalXHR = window.XMLHttpRequest;
+    MultipartMockXHR.calls = [];
+    MultipartMockXHR.withheldEtag = false;
+    MultipartMockXHR.overReportBytes = 0;
+    MultipartMockXHR.delayLoad = true;
+    window.XMLHttpRequest = MultipartMockXHR as unknown as typeof XMLHttpRequest;
+
+    let cancelCalls = 0;
+    let completed = false;
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            id: "cancelled-video",
+            upload_method: "MULTIPART",
+            upload_url: null,
+            upload_headers: null,
+            upload_id: "mpid-cancelled",
+            part_size_bytes: 64,
+            part_urls: [
+              { part_number: 1, url: "https://signed/1?partNumber=1" },
+              { part_number: 2, url: "https://signed/2?partNumber=2" },
+            ],
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          { status: 201 },
+        ),
+      ),
+      http.post("/api/v1/videos/cancelled-video/cancel-upload", () => {
+        cancelCalls += 1;
+        return new HttpResponse(null, { status: 204 });
+      }),
+      http.post("/api/v1/videos/cancelled-video/complete", () => {
+        completed = true;
+        return HttpResponse.json({}, { status: 500 });
+      }),
+    );
+
+    const user = userEvent.setup({ applyAccept: false });
+    render(<UploadFlow gameId="g1" />);
+    const file = new File([new Uint8Array(128)], "big.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+    await user.click(await screen.findByRole("button", { name: /cancel upload/i }));
+
+    await screen.findByText(/Upload cancelled/i);
+    await waitFor(() => expect(cancelCalls).toBe(1));
+    expect(completed).toBe(false);
+
+    MultipartMockXHR.delayLoad = false;
+    window.XMLHttpRequest = originalXHR;
+  });
+
   it("computes a SHA-256 checksum and sends it through initiation and completion", async () => {
     const originalXHR = window.XMLHttpRequest;
     window.XMLHttpRequest = MockXHR as unknown as typeof XMLHttpRequest;

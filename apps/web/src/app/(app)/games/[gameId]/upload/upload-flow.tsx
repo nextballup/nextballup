@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { apiJson } from "@/lib/api-client";
+import { apiJson, apiVoid } from "@/lib/api-client";
 import { ApiError, isEmailVerificationRequiredError } from "@/lib/errors";
 import type {
   CompleteUploadResponse,
@@ -42,9 +42,17 @@ type Phase =
   | { kind: "hashing"; percent: number }
   | { kind: "finalizing" }
   | { kind: "done"; videoId: string }
+  | { kind: "cancelled" }
   | { kind: "error"; message: string };
 
 type XhrPool = { active: Set<XMLHttpRequest>; aborted: boolean };
+type UploadRun = {
+  id: number;
+  controller: AbortController;
+  pool: XhrPool;
+  videoId?: string;
+  remoteCancelRequested?: boolean;
+};
 
 function consentSupportsUpload(consent: TeamPrivacyConsentResponse): boolean {
   return (
@@ -64,9 +72,10 @@ export function UploadFlow({
 }) {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement | null>(null);
-  // We used to keep a single-xhr ref. Multipart needs to abort every in-flight
-  // part when the component unmounts, so we track them in a set.
-  const xhrPoolRef = useRef<XhrPool>({ active: new Set(), aborted: false });
+  // Multipart needs to abort every in-flight part, so each upload run owns an
+  // XHR pool plus an AbortController for API requests.
+  const activeRunRef = useRef<UploadRun | null>(null);
+  const runIdRef = useRef(0);
   const [cameraPosition, setCameraPosition] = useState<string>("sideline");
   const [cameraHeight, setCameraHeight] = useState<string>("elevated");
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
@@ -76,14 +85,7 @@ export function UploadFlow({
 
   useEffect(
     () => () => {
-      xhrPoolRef.current.aborted = true;
-      for (const xhr of xhrPoolRef.current.active) {
-        try {
-          xhr.abort();
-        } catch {
-          /* ignore */
-        }
-      }
+      abortRun(activeRunRef.current);
     },
     [],
   );
@@ -115,8 +117,41 @@ export function UploadFlow({
     };
   }, [teamId]);
 
+  function isRunCancelled(run: UploadRun): boolean {
+    return (
+      run.controller.signal.aborted ||
+      run.pool.aborted ||
+      activeRunRef.current?.id !== run.id
+    );
+  }
+
+  function finishRun(run: UploadRun) {
+    if (activeRunRef.current?.id === run.id) {
+      activeRunRef.current = null;
+    }
+  }
+
+  async function cancelRemoteUpload(run: UploadRun) {
+    if (!run.videoId || run.remoteCancelRequested) {
+      return;
+    }
+    run.remoteCancelRequested = true;
+    try {
+      await apiVoid(`/videos/${run.videoId}/cancel-upload`, {
+        method: "POST",
+      });
+    } catch {
+      // The local upload is already cancelled. Server-side cleanup is also
+      // covered by abandoned-upload pruning, so don't replace the user's
+      // cancellation state with a secondary cleanup error.
+    }
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (activeRunRef.current) {
+      return;
+    }
     const file = inputRef.current?.files?.[0];
     if (!file) {
       setPhase({ kind: "error", message: "Select a file first." });
@@ -138,15 +173,37 @@ export function UploadFlow({
       return;
     }
 
+    const run: UploadRun = {
+      id: runIdRef.current + 1,
+      controller: new AbortController(),
+      pool: { active: new Set(), aborted: false },
+    };
+    runIdRef.current = run.id;
+    activeRunRef.current = run;
+
     let checksum: string | undefined;
     if (file.size <= CHECKSUM_MAX_BYTES && typeof crypto?.subtle?.digest === "function") {
       setPhase({ kind: "hashing", percent: 0 });
       try {
-        const computedChecksum = await computeSha256Hex(file, (percent) =>
-          setPhase({ kind: "hashing", percent }),
+        const computedChecksum = await computeSha256Hex(
+          file,
+          (percent) => {
+            if (!isRunCancelled(run)) {
+              setPhase({ kind: "hashing", percent });
+            }
+          },
+          run.controller.signal,
         );
+        if (isRunCancelled(run)) {
+          finishRun(run);
+          return;
+        }
         checksum = computedChecksum ?? undefined;
       } catch {
+        if (isRunCancelled(run)) {
+          finishRun(run);
+          return;
+        }
         checksum = undefined;
       }
     }
@@ -166,8 +223,14 @@ export function UploadFlow({
           camera_height: cameraHeight,
           ...(selectedConsentId ? { privacy_consent_id: selectedConsentId } : {}),
         },
+        signal: run.controller.signal,
       });
+      run.videoId = presign.id;
     } catch (err) {
+      if (isRunCancelled(run)) {
+        finishRun(run);
+        return;
+      }
       setPhase({
         kind: "error",
         message:
@@ -175,6 +238,12 @@ export function UploadFlow({
             ? describeInitiationError(err)
             : "Could not start upload.",
       });
+      finishRun(run);
+      return;
+    }
+    if (isRunCancelled(run)) {
+      void cancelRemoteUpload(run);
+      finishRun(run);
       return;
     }
 
@@ -189,6 +258,7 @@ export function UploadFlow({
           kind: "error",
           message: "Backend returned a PUT response without an upload URL.",
         });
+        finishRun(run);
         return;
       }
       if (file.size > SINGLE_PUT_LIMIT) {
@@ -200,21 +270,29 @@ export function UploadFlow({
           message:
             "Files over 1 GB require multipart upload but the backend did not return one.",
         });
+        finishRun(run);
         return;
       }
       const ok = await uploadViaPut({
         url: presign.upload_url,
         headers: presign.upload_headers ?? { "Content-Type": contentType },
         file,
-        pool: xhrPoolRef.current,
+        pool: run.pool,
         onProgress: (percent) =>
+          !isRunCancelled(run) &&
           setPhase({ kind: "uploading", percent, label: "Uploading to storage" }),
       });
+      if (isRunCancelled(run)) {
+        void cancelRemoteUpload(run);
+        finishRun(run);
+        return;
+      }
       if (!ok.success) {
         setPhase({
           kind: "error",
           message: ok.message ?? "Direct storage upload failed.",
         });
+        finishRun(run);
         return;
       }
     } else if (presign.upload_method === "MULTIPART") {
@@ -224,6 +302,7 @@ export function UploadFlow({
           message:
             "Backend returned multipart upload without part URLs or part size.",
         });
+        finishRun(run);
         return;
       }
       const multipart = await uploadMultipart({
@@ -231,15 +310,21 @@ export function UploadFlow({
         partSize: presign.part_size_bytes,
         parts: presign.part_urls,
         contentType,
-        pool: xhrPoolRef.current,
+        pool: run.pool,
         onProgress: (percent, label) =>
-          setPhase({ kind: "uploading", percent, label }),
+          !isRunCancelled(run) && setPhase({ kind: "uploading", percent, label }),
       });
+      if (isRunCancelled(run)) {
+        void cancelRemoteUpload(run);
+        finishRun(run);
+        return;
+      }
       if (!multipart.success) {
         setPhase({
           kind: "error",
           message: multipart.message ?? "Multipart upload failed.",
         });
+        finishRun(run);
         return;
       }
       completePayload = { parts: multipart.parts };
@@ -248,6 +333,7 @@ export function UploadFlow({
         kind: "error",
         message: `Unsupported upload method "${presign.upload_method}".`,
       });
+      finishRun(run);
       return;
     }
 
@@ -258,11 +344,20 @@ export function UploadFlow({
         {
           method: "POST",
           json: completePayload,
+          signal: run.controller.signal,
         },
       );
+      if (isRunCancelled(run)) {
+        finishRun(run);
+        return;
+      }
       setPhase({ kind: "done", videoId: complete.id });
       router.refresh();
     } catch (err) {
+      if (isRunCancelled(run)) {
+        finishRun(run);
+        return;
+      }
       setPhase({
         kind: "error",
         message:
@@ -271,6 +366,18 @@ export function UploadFlow({
             : "The storage upload succeeded but completion failed.",
       });
     }
+    finishRun(run);
+  }
+
+  function handleCancelUpload() {
+    const run = activeRunRef.current;
+    if (!run) {
+      return;
+    }
+    abortRun(run);
+    setPhase({ kind: "cancelled" });
+    void cancelRemoteUpload(run);
+    finishRun(run);
   }
 
   return (
@@ -363,13 +470,24 @@ export function UploadFlow({
         </div>
       )}
 
-      <button
-        type="submit"
-        disabled={isBusy(phase)}
-        className="rounded-md bg-[color:var(--color-nbu-text)] px-4 py-2 text-sm font-medium text-[color:var(--color-nbu-bg)] transition hover:opacity-90 disabled:opacity-50"
-      >
-        {phaseButtonLabel(phase)}
-      </button>
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="submit"
+          disabled={isBusy(phase)}
+          className="rounded-md bg-[color:var(--color-nbu-text)] px-4 py-2 text-sm font-medium text-[color:var(--color-nbu-bg)] transition hover:opacity-90 disabled:opacity-50"
+        >
+          {phaseButtonLabel(phase)}
+        </button>
+        {isCancelable(phase) && (
+          <button
+            type="button"
+            onClick={handleCancelUpload}
+            className="rounded-md border border-[color:var(--color-nbu-border)] px-4 py-2 text-sm font-medium transition hover:bg-[color:var(--color-nbu-surface)]"
+          >
+            Cancel upload
+          </button>
+        )}
+      </div>
 
       <UploadPhaseFeedback phase={phase} />
     </form>
@@ -395,6 +513,13 @@ function UploadPhaseFeedback({ phase }: { phase: Phase }) {
         >
           Track processing status →
         </a>
+      </p>
+    );
+  }
+  if (phase.kind === "cancelled") {
+    return (
+      <p role="status" className="text-sm text-[color:var(--color-nbu-text-muted)]">
+        Upload cancelled. Start a fresh upload when ready.
       </p>
     );
   }
@@ -473,6 +598,14 @@ function isBusy(phase: Phase): boolean {
   );
 }
 
+function isCancelable(phase: Phase): boolean {
+  return (
+    phase.kind === "presigning" ||
+    phase.kind === "uploading" ||
+    phase.kind === "hashing"
+  );
+}
+
 function phaseButtonLabel(phase: Phase): string {
   switch (phase.kind) {
     case "presigning":
@@ -485,8 +618,23 @@ function phaseButtonLabel(phase: Phase): string {
       return "Finalizing…";
     case "done":
       return "Upload another";
+    case "cancelled":
+      return "Start upload";
     default:
       return "Start upload";
+  }
+}
+
+function abortRun(run: UploadRun | null) {
+  if (!run) return;
+  run.pool.aborted = true;
+  run.controller.abort();
+  for (const xhr of run.pool.active) {
+    try {
+      xhr.abort();
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -726,6 +874,7 @@ function resolveUploadContentType(file: File): string | null {
 async function computeSha256Hex(
   file: File,
   onProgress: (percent: number) => void,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   if (file.size > CHECKSUM_MAX_BYTES) {
     return null;
@@ -737,13 +886,25 @@ async function computeSha256Hex(
   const buffer = new Uint8Array(total);
   let offset = 0;
   while (offset < total) {
+    if (signal?.aborted) {
+      return null;
+    }
     const end = Math.min(offset + CHECKSUM_READ_CHUNK, total);
     const chunk = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+    if (signal?.aborted) {
+      return null;
+    }
     buffer.set(chunk, offset);
     offset = end;
     onProgress(total === 0 ? 100 : Math.round((offset / total) * 95));
   }
+  if (signal?.aborted) {
+    return null;
+  }
   const digest = await crypto.subtle.digest("SHA-256", buffer);
+  if (signal?.aborted) {
+    return null;
+  }
   onProgress(100);
   const bytes = new Uint8Array(digest);
   let hex = "";

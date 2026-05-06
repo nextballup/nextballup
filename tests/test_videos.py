@@ -973,6 +973,43 @@ async def test_complete_multipart_requires_parts(storage_client: AsyncClient) ->
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_cancel_multipart_upload_aborts_storage_and_marks_failed(
+    storage_client: AsyncClient,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+) -> None:
+    _, game = await _setup_coach_team_game(
+        storage_client, coach_email="cancel-multipart@example.com"
+    )
+    initiate = (
+        await storage_client.post(
+            f"{API}/videos/upload",
+            json=_upload_body(game["id"], file_size_bytes=1_500_000_000),
+        )
+    ).json()
+    video_id = uuid.UUID(initiate["id"])
+
+    response = await storage_client.post(f"{API}/videos/{video_id}/cancel-upload")
+
+    assert response.status_code == 204, response.text
+    assert fake_storage.aborted_multiparts[-1]["upload_id"] == initiate["upload_id"]
+    video = await db_session.scalar(select(Video).where(Video.id == video_id))
+    assert video is not None
+    assert video.status is VideoStatus.FAILED
+    assert video.upload_id is None
+    assert video.upload_expires_at is None
+    audit = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.resource_id == video_id,
+            AuditLog.action == AuditAction.VIDEO_UPLOAD_ABANDONED,
+        )
+    )
+    assert audit is not None
+    assert audit.extra is not None
+    assert audit.extra["reason"] == "user_cancelled"
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_complete_multipart_with_parts_succeeds(
     storage_client: AsyncClient, fake_storage: FakeStorage
 ) -> None:

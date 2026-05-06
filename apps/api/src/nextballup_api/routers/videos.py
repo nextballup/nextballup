@@ -38,6 +38,7 @@ from nextballup_api.storage import (
     StorageFailureError,
     StoragePresigner,
     get_storage_presigner,
+    storage_abort_multipart,
     storage_complete_multipart,
     storage_delete_object,
     storage_head_object,
@@ -927,6 +928,73 @@ async def initiate_upload(
 
 
 # ---- POST /videos/{video_id}/complete -------------------------------------
+
+
+@router.post(
+    "/{video_id:uuid}/cancel-upload",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def cancel_upload(
+    video_id: uuid.UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+    storage: StoragePresigner | None = Depends(get_storage),
+) -> None:
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video_for_update(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    if video.status is VideoStatus.FAILED:
+        return None
+    if video.status is not VideoStatus.PENDING_UPLOAD:
+        raise ConflictError(
+            "Video is not awaiting upload cancellation",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"current_status": video.status.value},
+        )
+
+    presigner = _require_storage(storage)
+    upload_id = video.upload_id
+    storage_key = video.storage_key_raw
+    if upload_id is not None and storage_key:
+        await storage_abort_multipart(presigner, key=storage_key, upload_id=upload_id)
+    elif storage_key:
+        await _delete_raw_object_best_effort(presigner, storage_key)
+
+    video.status = VideoStatus.FAILED
+    video.upload_id = None
+    video.upload_expires_at = None
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_UPLOAD_ABANDONED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="video",
+        resource_id=video.id,
+        team_id=video.team_id,
+        extra={
+            "reason": "user_cancelled",
+            "storage_key": storage_key,
+            "multipart": upload_id is not None,
+        },
+    )
+    await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=video.team_id,
+    )
+    return None
 
 
 @router.post(
