@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from nextballup_core.settings import Settings
 from scripts.configure_runtime_db_role import _set_runtime_role_password
@@ -40,12 +40,33 @@ async def test_configure_runtime_db_role_quotes_password_server_side() -> None:
 
     assert connection.scalar_statement is not None
     assert "format('ALTER ROLE %I WITH LOGIN PASSWORD %L'" in connection.scalar_statement
+    assert "CAST(:role AS text)" in connection.scalar_statement
+    assert "CAST(:password AS text)" in connection.scalar_statement
     assert connection.scalar_params == {"role": "nextballup_app", "password": "p'ass:word"}
     assert connection.driver_statement == (
         "ALTER ROLE nextballup_app WITH LOGIN PASSWORD 'p''ass:word'"
     )
     assert "$1" not in connection.driver_statement
     assert ":password" not in connection.driver_statement
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_configure_runtime_db_role_password_statement_executes_with_asyncpg(
+    engine: AsyncEngine,
+) -> None:
+    role = "nextballup_runtime_role_test"
+    async with engine.begin() as connection:
+        await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
+        await connection.execute(text(f"CREATE ROLE {role} NOLOGIN"))
+        try:
+            await _set_runtime_role_password(connection, role, "p'ass:word+/=")
+            has_login = await connection.scalar(
+                text("SELECT rolcanlogin FROM pg_roles WHERE rolname = :role"),
+                {"role": role},
+            )
+            assert has_login is True
+        finally:
+            await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
 
 
 @pytest.mark.asyncio(loop_scope="session")

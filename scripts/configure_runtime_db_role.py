@@ -30,7 +30,13 @@ async def _set_runtime_role_password(connection: Any, role: str, password: str) 
     client-side string interpolation of role names or secrets.
     """
     statement = await connection.scalar(
-        text("SELECT format('ALTER ROLE %I WITH LOGIN PASSWORD %L', :role, :password)"),
+        text(
+            "SELECT format("
+            "'ALTER ROLE %I WITH LOGIN PASSWORD %L', "
+            "CAST(:role AS text), "
+            "CAST(:password AS text)"
+            ")"
+        ),
         {"role": role, "password": password},
     )
     if not statement:
