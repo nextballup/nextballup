@@ -231,6 +231,7 @@ async def test_runtime_role_can_initiate_video_upload_through_api(
     await dispose_engine()
     reset_engine_for_url(runtime_url)
     storage = _RuntimeUploadStorage()
+    team_id: str | None = None
     try:
         app.dependency_overrides[get_storage] = lambda: storage
         transport = ASGITransport(app=app)
@@ -298,6 +299,24 @@ async def test_runtime_role_can_initiate_video_upload_through_api(
         await dispose_engine()
         reset_engine_for_url(owner_url)
         app.dependency_overrides.clear()
+        if team_id is not None:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text("SELECT set_config('app.current_team_id', CAST(:team_id AS text), true)"),
+                    {"team_id": team_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        UPDATE processing_jobs
+                        SET status = CAST('completed' AS processing_job_status),
+                            completed_at = now()
+                        WHERE team_id = CAST(:team_id AS uuid)
+                          AND status = CAST('pending' AS processing_job_status)
+                        """
+                    ),
+                    {"team_id": team_id},
+                )
 
 
 @pytest.mark.asyncio(loop_scope="session")
