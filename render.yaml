@@ -226,6 +226,10 @@ envVarGroups:
         value: "true"
       - key: WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED
         value: "false"
+      - key: CELERY_WORKER_CONCURRENCY
+        value: "1"
+      - key: CELERY_WORKER_MAX_TASKS_PER_CHILD
+        value: "5"
       - key: OBSERVABILITY_METRICS_ENABLED
         value: "false"
       - key: OBSERVABILITY_WORKER_METRICS_ENABLED
