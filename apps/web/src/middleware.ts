@@ -3,9 +3,10 @@ import type { NextRequest } from "next/server";
 
 /**
  * Per-request CSP nonce. Next.js auto-propagates the `x-nonce` request header
- * to the <script> tags it injects during streaming SSR, so emitting a strict
- * `script-src 'self' 'nonce-<value>' 'strict-dynamic'` is enough to lock down
- * inline script injection without breaking framework hydration.
+ * to the inline <script> tags it injects during streaming SSR. We still keep
+ * `'self'` as an explicit script source because `strict-dynamic` causes
+ * modern browsers to ignore host allow-lists, which can block framework
+ * chunks that Next serves from `/_next/static/*` without a nonce.
  *
  * We keep `'unsafe-inline'` in `style-src` intentionally: Tailwind's runtime
  * CSS injection and third-party libraries (hls.js player chrome) rely on it,
@@ -38,11 +39,11 @@ export function middleware(request: NextRequest) {
     "img-src 'self' data: blob: https:",
     `media-src 'self' blob: https:${devLocalStorageOrigins.length ? ` ${devLocalStorageOrigins.join(" ")}` : ""}`,
     "object-src 'none'",
-    // `strict-dynamic` makes modern browsers trust scripts loaded by a
-    // nonce-trusted script, so Next's runtime can load chunks without each
-    // chunk needing its own nonce. `'unsafe-inline'` is left as a fallback
-    // that `strict-dynamic` explicitly overrides on modern browsers.
-    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
+    // Keep `_next/static/*` chunks executable via `'self'` while preserving
+    // nonces for framework inline scripts. Avoid `strict-dynamic` here: it
+    // makes browsers ignore `'self'`, which breaks hydration when an external
+    // framework chunk lacks a nonce.
+    `script-src 'self' 'nonce-${nonce}' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
     "style-src 'self' 'unsafe-inline'",
     `connect-src 'self' https:${isDev ? ` ws: wss: ${devLocalStorageOrigins.join(" ")}` : ""}`,
     "worker-src 'self' blob:",
