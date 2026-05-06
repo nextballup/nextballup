@@ -6,11 +6,14 @@ from typing import Any, cast
 import pytest
 from httpx import ASGITransport, AsyncClient
 from nextballup_api.main import app
+from nextballup_api.routers.videos import get_storage
+from nextballup_api.storage import PresignedPart, PresignedUpload
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from nextballup_core.constants import AuditAction, ErrorCode
+from nextballup_core.enums import UploadMethod
 from nextballup_core.settings import reload_settings
 from nextballup_db.engine import dispose_engine, reset_engine_for_url
 from nextballup_db.models.audit import AuditLog
@@ -82,6 +85,33 @@ async def _audit_actions_for_team(session: AsyncSession, team_id: str) -> list[s
 async def _force_team_rls(session: AsyncSession) -> None:
     for table in ("teams", "team_memberships", "team_invites", "audit_logs"):
         await session.execute(text(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"))
+
+
+class _RuntimeUploadStorage:
+    def is_configured(self) -> bool:
+        return True
+
+    def presign_upload(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        file_size_bytes: int,
+        checksum_sha256: str | None = None,
+    ) -> PresignedUpload:
+        parts = tuple(
+            PresignedPart(
+                part_number=part_number,
+                url=f"https://fake-storage.test/{key}?partNumber={part_number}",
+            )
+            for part_number in range(1, 4)
+        )
+        return PresignedUpload(
+            method=UploadMethod.MULTIPART,
+            upload_id="runtime-upload-test",
+            parts=parts,
+            part_size_bytes=100 * 1024 * 1024,
+        )
 
 
 # ---- POST /teams -----------------------------------------------------------
@@ -162,6 +192,81 @@ async def test_runtime_role_can_create_team_through_api_without_owner_override(
         reset_engine_for_url(owner_url)
         app.dependency_overrides.clear()
         _ = (team_id, user_id)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_runtime_role_can_initiate_video_upload_through_api(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    password = "RuntimeRoleApiUploadTest1"
+    owner_url = os.environ["DATABASE_URL"]
+    runtime_url = owner_url.replace(
+        "nextballup:nextballup_dev@",
+        f"nextballup_app:{password}@",
+    )
+    async with engine.begin() as connection:
+        await _set_runtime_role_password(connection, "nextballup_app", password)
+
+    monkeypatch.setenv("DATABASE_URL_RUNTIME", runtime_url)
+    reload_settings()
+    await dispose_engine()
+    reset_engine_for_url(runtime_url)
+    try:
+        app.dependency_overrides[get_storage] = lambda: _RuntimeUploadStorage()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            event_hooks={"request": [make_csrf_mirror_hook()]},
+        ) as runtime_client:
+            register = await runtime_client.post(
+                f"{API}/auth/register",
+                json=_coach_payload("runtime-upload@example.com"),
+            )
+            assert register.status_code == 201, register.text
+
+            team = await runtime_client.post(
+                f"{API}/teams",
+                json=_team_create_body(name="Runtime Upload Team", level="aau_club"),
+            )
+            assert team.status_code == 201, team.text
+            team_id = team.json()["id"]
+
+            game = await runtime_client.post(
+                f"{API}/games",
+                json={
+                    "team_id": team_id,
+                    "opponent_name": "Runtime Opponent",
+                    "game_type": "scrimmage",
+                    "date": "2026-05-06",
+                    "is_home": True,
+                },
+            )
+            assert game.status_code == 201, game.text
+
+            upload = await runtime_client.post(
+                f"{API}/videos/upload",
+                json={
+                    "game_id": game.json()["id"],
+                    "filename": "runtime-upload.mov",
+                    "content_type": "video/quicktime",
+                    "file_size_bytes": 2 * 1024 * 1024 * 1024,
+                    "camera_position": "sideline",
+                    "camera_height": "elevated",
+                },
+            )
+            assert upload.status_code == 201, upload.text
+            body = upload.json()
+            assert body["upload_method"] == UploadMethod.MULTIPART
+            assert body["upload_id"] == "runtime-upload-test"
+            assert len(body["part_urls"]) == 3
+    finally:
+        monkeypatch.delenv("DATABASE_URL_RUNTIME", raising=False)
+        reload_settings()
+        await dispose_engine()
+        reset_engine_for_url(owner_url)
+        app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio(loop_scope="session")
