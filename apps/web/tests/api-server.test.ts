@@ -75,7 +75,7 @@ describe("serverApi helpers", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("http://localhost:8000/api/v1/auth/me");
+    expect(url).toBe(`${resolveApiUpstream()}/api/v1/auth/me`);
     expect(init?.cache).toBe("no-store");
     const headers = init?.headers as Headers;
     expect(headers.get("Cookie")).toBe(
