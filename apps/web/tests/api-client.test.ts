@@ -1,10 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { http, HttpResponse } from "msw";
 import { ApiError } from "@/lib/errors";
 import { apiJson } from "@/lib/api-client";
 import { server } from "./setup";
 
 describe("apiJson", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("decodes a happy response", async () => {
     server.use(
       http.get("/api/v1/auth/me", () =>
@@ -177,6 +181,35 @@ describe("apiJson", () => {
       // Restore any prior cookies (e.g. if tests later add auth cookies).
       if (original) document.cookie = original;
     }
+  });
+
+  it("warns when a mutating request is missing the CSRF cookie", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    server.use(
+      http.patch("/api/v1/games/g1", () =>
+        HttpResponse.json({ id: "g1", status: "scheduled" }),
+      ),
+    );
+
+    await apiJson("/games/g1", { method: "PATCH", json: { status: "scheduled" } });
+
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/CSRF cookie is missing/i));
+  });
+
+  it("does not warn for anonymous CSRF-optional auth mutations", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    server.use(
+      http.post("/api/v1/auth/login", () =>
+        HttpResponse.json({ access_token_expires_at: "2026-05-06T00:00:00Z" }),
+      ),
+    );
+
+    await apiJson("/auth/login", {
+      method: "POST",
+      json: { email: "pilot@example.com", password: "Password1!" },
+    });
+
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("does not attach X-CSRF-Token on GET requests", async () => {

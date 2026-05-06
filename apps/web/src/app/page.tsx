@@ -13,6 +13,11 @@ function publicRegistrationMode(): PublicRegistrationMode {
   if (raw === "open" || raw === "invite_only" || raw === "allowlist" || raw === "disabled") {
     return raw;
   }
+  if (raw) {
+    console.warn(
+      `Unknown NEXT_PUBLIC_REGISTRATION_MODE "${raw}"; public registration CTA is disabled.`,
+    );
+  }
   return "disabled";
 }
 

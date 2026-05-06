@@ -4,6 +4,10 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState, type FormEvent } from "react";
 import { apiJson } from "@/lib/api-client";
+import {
+  clearEmailVerificationRetryNeeded,
+  markEmailVerificationRetryNeeded,
+} from "@/lib/email-verification-state";
 import { ApiError } from "@/lib/errors";
 import { useRetryAfterGate } from "@/lib/retry-after";
 import type {
@@ -91,9 +95,11 @@ export default function RegisterPage() {
           method: "POST",
           json: {},
         });
+        clearEmailVerificationRetryNeeded(email);
       } catch {
         // The signed-in app shell exposes a retry control. Registration should
         // not strand the user if the transactional provider is briefly down.
+        markEmailVerificationRetryNeeded(email);
       }
       router.replace("/games");
     } catch (err) {
@@ -126,28 +132,31 @@ export default function RegisterPage() {
             : "Registration is currently closed on this deployment. If you have an existing account, you can still sign in."}
         </p>
       )}
-      <div
-        role="radiogroup"
-        aria-label="Account type"
-        className="grid grid-cols-2 gap-2 rounded-md border border-[color:var(--color-nbu-border)] p-1"
-      >
+      <fieldset className="grid grid-cols-2 gap-2 rounded-md border border-[color:var(--color-nbu-border)] p-1">
+        <legend className="sr-only">Account type</legend>
         {(["coach", "player"] as Role[]).map((option) => (
-          <button
+          <label
             key={option}
-            type="button"
-            role="radio"
-            aria-checked={role === option}
-            onClick={() => setRole(option)}
-            className={`rounded px-3 py-1.5 text-sm font-medium transition ${
+            htmlFor={`role-${option}`}
+            className={`cursor-pointer rounded px-3 py-1.5 text-center text-sm font-medium transition focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-[color:var(--color-nbu-text)] ${
               role === option
                 ? "bg-[color:var(--color-nbu-text)] text-[color:var(--color-nbu-bg)]"
                 : "text-[color:var(--color-nbu-text-muted)]"
             }`}
           >
+            <input
+              id={`role-${option}`}
+              type="radio"
+              name="role"
+              value={option}
+              checked={role === option}
+              onChange={() => setRole(option)}
+              className="sr-only"
+            />
             {option === "coach" ? "I'm a coach" : "I'm a player"}
-          </button>
+          </label>
         ))}
-      </div>
+      </fieldset>
       <form className="space-y-4" onSubmit={handleSubmit} aria-label="Create account">
         <label className="block space-y-1">
           <span className="text-sm font-medium">Full name</span>

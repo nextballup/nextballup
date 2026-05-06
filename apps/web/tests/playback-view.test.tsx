@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { render, screen, act, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, act, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { VideoPlaybackView } from "@/app/(app)/videos/[videoId]/video-playback-view";
@@ -252,6 +252,36 @@ describe("VideoPlaybackView", () => {
         "https://signed.example/v1/manifest.m3u8?sig=zzz",
       );
     });
+  });
+
+  it("shows a playback error message when the video element fails", async () => {
+    const video = baseVideo({
+      status: "processed",
+      playback_url: "https://signed.example/v1.mp4?sig=abc",
+      playback_format: "mp4",
+      playback_token: "tok",
+      token_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+    });
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          stage: null,
+          progress_percent: 100,
+          stages: { transcode: { status: "completed" } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    fireEvent.error(await screen.findByTestId("video-player"));
+
+    expect(await screen.findByTestId("playback-error")).toHaveTextContent(
+      /refresh the page/i,
+    );
   });
 
   it("hides the admin requeue control from non-admin viewers", async () => {

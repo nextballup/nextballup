@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { BrandLink } from "@/components/brand-link";
 import { EmailVerificationBanner } from "@/components/email-verification-banner";
@@ -15,6 +15,12 @@ const BASE_NAV_ITEMS: Array<{ href: string; label: string }> = [
   { href: "/teams", label: "Teams" },
 ];
 const ADMIN_NAV_ITEM = { href: "/admin/audit", label: "Audit" };
+const SESSION_CHANNEL = "nextballup-session";
+
+function openSessionChannel(): BroadcastChannel | null {
+  if (typeof BroadcastChannel === "undefined") return null;
+  return new BroadcastChannel(SESSION_CHANNEL);
+}
 
 export function AppShell({
   user,
@@ -34,6 +40,26 @@ export function AppShell({
   const navItems =
     user.role === "admin" ? [...BASE_NAV_ITEMS, ADMIN_NAV_ITEM] : BASE_NAV_ITEMS;
 
+  const clearSessionAndNavigate = useCallback(() => {
+    queryClient.clear();
+    router.replace("/login");
+  }, [queryClient, router]);
+
+  useEffect(() => {
+    const channel = openSessionChannel();
+    if (!channel) return;
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data === "logout") {
+        clearSessionAndNavigate();
+      }
+    };
+    channel.addEventListener("message", handleMessage);
+    return () => {
+      channel.removeEventListener("message", handleMessage);
+      channel.close();
+    };
+  }, [clearSessionAndNavigate]);
+
   async function handleLogout() {
     setLoggingOut(true);
     try {
@@ -44,8 +70,10 @@ export function AppShell({
     } finally {
       // Whether the API call succeeds or fails (e.g. token already expired),
       // clear client-side cached data before navigating to the login shell.
-      queryClient.clear();
-      router.replace("/login");
+      const channel = openSessionChannel();
+      channel?.postMessage("logout");
+      channel?.close();
+      clearSessionAndNavigate();
     }
   }
 

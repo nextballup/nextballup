@@ -6,13 +6,15 @@ import { JoinTeamForm } from "@/app/(app)/teams/join/join-team-form";
 import { server } from "./setup";
 
 const replace = vi.fn();
+const refresh = vi.fn();
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ replace }),
+  useRouter: () => ({ replace, refresh }),
 }));
 
 describe("JoinTeamForm", () => {
   it("joins via invite code and navigates to the team page", async () => {
     replace.mockReset();
+    refresh.mockReset();
     let captured: unknown = null;
     server.use(
       http.post("/api/v1/teams/join", async ({ request }) => {
@@ -51,6 +53,7 @@ describe("JoinTeamForm", () => {
     await waitFor(() =>
       expect(replace).toHaveBeenCalledWith("/teams/joined-team"),
     );
+    expect(refresh).toHaveBeenCalled();
   });
 
   it("translates jersey collision errors into a coach-friendly message", async () => {

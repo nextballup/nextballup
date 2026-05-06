@@ -42,6 +42,23 @@ describe("serverApi helpers", () => {
     expect(resolveApiUpstream({})).toBe("http://localhost:8000");
   });
 
+  it("fails production builds without an explicit upstream", () => {
+    expect(() =>
+      resolveApiUpstream({
+        NODE_ENV: "production",
+      }),
+    ).toThrow(/API_UPSTREAM_URL/);
+  });
+
+  it("allows an explicit local fallback override for local-only production builds", () => {
+    expect(
+      resolveApiUpstream({
+        NODE_ENV: "production",
+        ALLOW_LOCAL_API_UPSTREAM: "true",
+      }),
+    ).toBe("http://localhost:8000");
+  });
+
   it("forwards only NextBallUp auth cookies to the upstream API", async () => {
     cookiesMock.mockResolvedValue({
       getAll: () => [

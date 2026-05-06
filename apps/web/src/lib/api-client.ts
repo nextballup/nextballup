@@ -4,6 +4,14 @@ const PUBLIC_API_BASE = "/api/v1";
 const CSRF_HEADER = "X-CSRF-Token";
 const CSRF_COOKIE_NAMES = ["__Host-nbu_csrf_token", "nbu_csrf_token"];
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const CSRF_OPTIONAL_PATHS = new Set([
+  "/auth/login",
+  "/auth/register",
+  "/auth/refresh",
+  "/auth/password/forgot",
+  "/auth/password/reset",
+  "/auth/email/verify/confirm",
+]);
 
 function readCsrfCookie(): string | null {
   if (typeof document === "undefined") {
@@ -92,6 +100,13 @@ export async function apiFetch(
       const csrf = readCsrfCookie();
       if (csrf) {
         requestHeaders.set(CSRF_HEADER, csrf);
+      } else if (
+        typeof console !== "undefined" &&
+        !CSRF_OPTIONAL_PATHS.has(path)
+      ) {
+        console.warn(
+          "CSRF cookie is missing for a mutating request; the backend will reject this request until the session is refreshed.",
+        );
       }
     }
     return requestHeaders;

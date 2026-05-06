@@ -59,6 +59,7 @@ export function JoinTeamForm({ initialCode }: { initialCode: string }) {
         },
       });
       document.cookie = `${ACTIVE_TEAM_COOKIE}=${encodeURIComponent(joined.id)}; Path=/; Max-Age=${60 * 60 * 24 * 30}; SameSite=Lax`;
+      router.refresh();
       router.replace(`/teams/${joined.id}`);
     } catch (err) {
       if (err instanceof ApiError) {

@@ -7,8 +7,9 @@ import type { TeamListEntry } from "@/lib/contract";
 import { server } from "./setup";
 
 const replace = vi.fn();
+const refresh = vi.fn();
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ replace }),
+  useRouter: () => ({ replace, refresh }),
 }));
 
 function coachTeam(overrides: Partial<TeamListEntry> = {}): TeamListEntry {
@@ -31,6 +32,7 @@ function coachTeam(overrides: Partial<TeamListEntry> = {}): TeamListEntry {
 describe("CreateGameForm", () => {
   it("POSTs /games with the selected team and fields, then redirects", async () => {
     replace.mockReset();
+    refresh.mockReset();
     let captured: unknown = null;
     server.use(
       http.post("/api/v1/games", async ({ request }) => {
@@ -81,6 +83,7 @@ describe("CreateGameForm", () => {
     await waitFor(() =>
       expect(replace).toHaveBeenCalledWith("/games/new-game"),
     );
+    expect(refresh).toHaveBeenCalled();
   });
 
   it("surfaces a coach-only error when the backend rejects", async () => {

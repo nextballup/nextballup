@@ -65,6 +65,7 @@ export function CreateGameForm({
           notes: notes.trim() || null,
         },
       });
+      router.refresh();
       router.replace(`/games/${created.id}`);
     } catch (err) {
       if (err instanceof ApiError) {

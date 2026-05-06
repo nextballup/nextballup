@@ -6,13 +6,15 @@ import { CreateTeamForm } from "@/app/(app)/teams/new/create-team-form";
 import { server } from "./setup";
 
 const replace = vi.fn();
+const refresh = vi.fn();
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ replace }),
+  useRouter: () => ({ replace, refresh }),
 }));
 
 describe("CreateTeamForm", () => {
   it("POSTs /teams with the entered fields and navigates to the new team", async () => {
     replace.mockReset();
+    refresh.mockReset();
     let captured: unknown = null;
     server.use(
       http.post("/api/v1/teams", async ({ request }) => {
@@ -52,6 +54,7 @@ describe("CreateTeamForm", () => {
       sport: "basketball",
     });
     await waitFor(() => expect(replace).toHaveBeenCalledWith("/teams/new-team"));
+    expect(refresh).toHaveBeenCalled();
   });
 
   it("tells a player-account user that only coaches can create teams", async () => {

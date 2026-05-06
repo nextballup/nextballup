@@ -16,18 +16,26 @@ import { ApiError, toApiError } from "./errors";
 type ApiUpstreamEnv = {
   API_UPSTREAM_URL?: string;
   API_UPSTREAM_HOSTPORT?: string;
+  ALLOW_LOCAL_API_UPSTREAM?: string;
+  NODE_ENV?: string;
 };
 
 export function resolveApiUpstream(
   env: ApiUpstreamEnv = {
     API_UPSTREAM_URL: process.env.API_UPSTREAM_URL,
     API_UPSTREAM_HOSTPORT: process.env.API_UPSTREAM_HOSTPORT,
+    ALLOW_LOCAL_API_UPSTREAM: process.env.ALLOW_LOCAL_API_UPSTREAM,
+    NODE_ENV: process.env.NODE_ENV,
   },
 ): string {
-  return (
-    env.API_UPSTREAM_URL ??
-    (env.API_UPSTREAM_HOSTPORT ? `http://${env.API_UPSTREAM_HOSTPORT}` : "http://localhost:8000")
-  );
+  if (env.API_UPSTREAM_URL) return env.API_UPSTREAM_URL;
+  if (env.API_UPSTREAM_HOSTPORT) return `http://${env.API_UPSTREAM_HOSTPORT}`;
+  if (env.NODE_ENV === "production" && env.ALLOW_LOCAL_API_UPSTREAM !== "true") {
+    throw new Error(
+      "API_UPSTREAM_URL or API_UPSTREAM_HOSTPORT must be set for production frontend builds.",
+    );
+  }
+  return "http://localhost:8000";
 }
 
 const UPSTREAM = resolveApiUpstream();

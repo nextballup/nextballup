@@ -79,25 +79,34 @@ export default async function TeamDetailPage({
             Roster · {team.member_count}
           </h2>
         </div>
-        <ul className="divide-y divide-[color:var(--color-nbu-border)] rounded-lg border border-[color:var(--color-nbu-border)]">
-          {team.members.map((member) => (
-            <li
-              key={member.user_id}
-              className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm"
-            >
-              <div>
-                <div className="font-medium">{member.full_name}</div>
-                <div className="text-xs text-[color:var(--color-nbu-text-muted)]">
-                  {TEAM_ROLE_LABELS[member.team_role] ?? member.team_role}
-                  {COACH_SEAT.has(member.team_role) ? " · coach" : ""}
+        {team.members.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-[color:var(--color-nbu-border)] px-4 py-6 text-sm text-[color:var(--color-nbu-text-muted)]">
+            No roster members are visible yet.
+            {canManageInvites && team.invite_code
+              ? " Share the team invite code above to add players."
+              : " Ask a coach for an invite code if this looks wrong."}
+          </div>
+        ) : (
+          <ul className="divide-y divide-[color:var(--color-nbu-border)] rounded-lg border border-[color:var(--color-nbu-border)]">
+            {team.members.map((member) => (
+              <li
+                key={member.user_id}
+                className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm"
+              >
+                <div>
+                  <div className="font-medium">{member.full_name}</div>
+                  <div className="text-xs text-[color:var(--color-nbu-text-muted)]">
+                    {TEAM_ROLE_LABELS[member.team_role] ?? member.team_role}
+                    {COACH_SEAT.has(member.team_role) ? " · coach" : ""}
+                  </div>
                 </div>
-              </div>
-              <div className="text-xs font-mono text-[color:var(--color-nbu-text-muted)]">
-                {member.jersey_number != null ? `#${member.jersey_number}` : ""}
-              </div>
-            </li>
-          ))}
-        </ul>
+                <div className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+                  {member.jersey_number != null ? `#${member.jersey_number}` : ""}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
     </section>
   );

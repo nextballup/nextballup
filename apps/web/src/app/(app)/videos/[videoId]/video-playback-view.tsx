@@ -452,10 +452,12 @@ function VideoPlayer({
   poster?: string;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
 
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
+    setPlaybackError(null);
     if (format !== "hls") {
       // mp4 / anything that native <video> handles — just set src.
       el.src = url;
@@ -476,6 +478,14 @@ function VideoPlayer({
         return;
       }
       const hls = new Hls({ enableWorker: true });
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        const detail = data.details ? ` (${data.details})` : "";
+        setPlaybackError(
+          data.fatal
+            ? `Playback failed while loading the signed video stream${detail}. Refresh the page to request a fresh playback URL.`
+            : `Playback is having trouble loading part of the stream${detail}.`,
+        );
+      });
       hls.loadSource(url);
       hls.attachMedia(videoRef.current);
       hlsInstance = hls;
@@ -487,13 +497,29 @@ function VideoPlayer({
   }, [url, format]);
 
   return (
-    <video
-      ref={videoRef}
-      controls
-      playsInline
-      poster={poster}
-      className="aspect-video w-full rounded-lg bg-black"
-      data-testid="video-player"
-    />
+    <div className="space-y-2">
+      <video
+        ref={videoRef}
+        controls
+        playsInline
+        poster={poster}
+        onError={() => {
+          setPlaybackError(
+            "Playback failed while loading the signed video stream. Refresh the page to request a fresh playback URL.",
+          );
+        }}
+        className="aspect-video w-full rounded-lg bg-black"
+        data-testid="video-player"
+      />
+      {playbackError && (
+        <p
+          role="alert"
+          data-testid="playback-error"
+          className="text-sm text-[color:var(--color-nbu-error)]"
+        >
+          {playbackError}
+        </p>
+      )}
+    </div>
   );
 }

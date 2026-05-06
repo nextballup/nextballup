@@ -2,8 +2,13 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { useEffect } from "react";
 import { ACTIVE_TEAM_COOKIE } from "@/lib/active-team";
 import type { TeamListEntry } from "@/lib/contract";
+
+function writeActiveTeamCookie(teamId: string) {
+  document.cookie = `${ACTIVE_TEAM_COOKIE}=${encodeURIComponent(teamId)}; Path=/; Max-Age=${60 * 60 * 24 * 30}; SameSite=Lax`;
+}
 
 /**
  * Lightweight team picker for the top nav. The selection lives in a
@@ -20,6 +25,13 @@ export function TeamPicker({
   activeTeamId: string | null;
 }) {
   const router = useRouter();
+  const resolvedTeamId = activeTeamId ?? teams[0]?.id ?? null;
+
+  useEffect(() => {
+    if (resolvedTeamId) {
+      writeActiveTeamCookie(resolvedTeamId);
+    }
+  }, [resolvedTeamId]);
 
   if (teams.length === 0) {
     return (
@@ -48,10 +60,7 @@ export function TeamPicker({
 
   function handleChange(event: React.ChangeEvent<HTMLSelectElement>) {
     const value = event.target.value;
-    // 30-day non-httpOnly cookie; Path=/ so every page sees the selection.
-    // SameSite=Lax is the browser default, but we set it explicitly for older
-    // browsers that default to None.
-    document.cookie = `${ACTIVE_TEAM_COOKIE}=${encodeURIComponent(value)}; Path=/; Max-Age=${60 * 60 * 24 * 30}; SameSite=Lax`;
+    writeActiveTeamCookie(value);
     router.refresh();
   }
 
@@ -60,7 +69,7 @@ export function TeamPicker({
       <span className="sr-only">Active team</span>
       <select
         aria-label="Active team"
-        value={activeTeamId ?? teams[0].id}
+        value={resolvedTeamId ?? teams[0].id}
         onChange={handleChange}
         className="rounded-full border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-1 text-xs transition hover:border-[color:var(--color-nbu-text)] focus:border-[color:var(--color-nbu-text)] focus:outline-none"
       >

@@ -1,9 +1,10 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import LandingPage from "@/app/page";
 import RegisterPage from "@/app/(auth)/register/page";
+import { emailVerificationRetryStorageKey } from "@/lib/email-verification-state";
 import { server } from "./setup";
 
 vi.mock("next/navigation", () => ({
@@ -13,6 +14,7 @@ vi.mock("next/navigation", () => ({
 const originalMode = process.env.NEXT_PUBLIC_REGISTRATION_MODE;
 
 afterEach(() => {
+  vi.restoreAllMocks();
   if (originalMode === undefined) {
     delete process.env.NEXT_PUBLIC_REGISTRATION_MODE;
   } else {
@@ -53,6 +55,17 @@ describe("registration channel UI", () => {
       "/register",
     );
     expect(screen.queryByRole("link", { name: /have an invite/i })).not.toBeInTheDocument();
+  });
+
+  it("fails closed and warns when the public registration mode is unknown", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.NEXT_PUBLIC_REGISTRATION_MODE = "invite-ony";
+
+    render(<LandingPage />);
+
+    expect(screen.queryByRole("link", { name: /have an invite/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/public access is not yet open/i)).toBeInTheDocument();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/unknown/i));
   });
 
   it("keeps the register form disabled until status loads", () => {
@@ -145,5 +158,75 @@ describe("registration channel UI", () => {
     ]);
     expect(statusRequests[0]?.cache).toBe("no-store");
     expect(verificationRequests).toHaveLength(1);
+  });
+
+  it("keeps role selection as native radios", async () => {
+    server.use(
+      http.get("/api/v1/auth/registration/status", () =>
+        HttpResponse.json({
+          mode: "open",
+          invite_code_required: false,
+          is_open_to_public: true,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+
+    render(<RegisterPage />);
+
+    const playerRadio = await screen.findByRole("radio", { name: /i'm a player/i });
+    await user.click(playerRadio);
+    expect(playerRadio).toBeChecked();
+    expect(screen.getByRole("radio", { name: /i'm a coach/i })).not.toBeChecked();
+  });
+
+  it("records a retry hint when registration email delivery fails", async () => {
+    sessionStorage.clear();
+    server.use(
+      http.get("/api/v1/auth/registration/status", () =>
+        HttpResponse.json({
+          mode: "open",
+          invite_code_required: false,
+          is_open_to_public: true,
+        }),
+      ),
+      http.post("/api/v1/auth/register", () =>
+        HttpResponse.json(
+          {
+            id: "user-1",
+            email: "pilot@example.com",
+            full_name: "Pilot User",
+            role: "coach",
+            created_at: "2026-05-04T00:00:00Z",
+          },
+          { status: 201 },
+        ),
+      ),
+      http.post("/api/v1/auth/email/verify/request", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "EMAIL_DELIVERY_UNAVAILABLE",
+              message: "Email delivery is temporarily unavailable",
+            },
+          },
+          { status: 503 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+
+    render(<RegisterPage />);
+
+    await user.type(screen.getByLabelText(/full name/i), "Pilot User");
+    await user.type(screen.getByLabelText(/email/i), "pilot@example.com");
+    await user.type(screen.getByLabelText(/password/i), "Password1!");
+    await user.click(await screen.findByRole("button", { name: /^create account$/i }));
+
+    await waitFor(() => {
+      expect(
+        sessionStorage.getItem(emailVerificationRetryStorageKey("pilot@example.com")),
+      ).toBe("1");
+    });
   });
 });

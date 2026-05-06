@@ -96,6 +96,9 @@ export function CreateTeamForm() {
       // UX state only (see lib/active-team.ts), so writing it client-side is
       // safe.
       document.cookie = `${ACTIVE_TEAM_COOKIE}=${encodeURIComponent(created.id)}; Path=/; Max-Age=${60 * 60 * 24 * 30}; SameSite=Lax`;
+      // Invalidate the shared app layout so the server-rendered team picker
+      // sees the new membership instead of reusing its previous shell state.
+      router.refresh();
       router.replace(`/teams/${created.id}`);
     } catch (err) {
       if (err instanceof ApiError) {

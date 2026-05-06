@@ -95,4 +95,20 @@ describe("TeamDetailPage", () => {
       await screen.findByText(/privacy consent evidence/i),
     ).toBeInTheDocument();
   });
+
+  it("renders an empty roster state with recovery copy", async () => {
+    serverApiOptional.mockResolvedValue(
+      teamDetail({
+        member_count: 0,
+        members: [],
+      }),
+    );
+
+    render(
+      await TeamDetailPage({ params: Promise.resolve({ teamId: "team-1" }) }),
+    );
+
+    expect(screen.getByText(/no roster members are visible yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/share the team invite code/i)).toBeInTheDocument();
+  });
 });

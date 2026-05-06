@@ -1,5 +1,5 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TeamPicker } from "@/components/team-picker";
 import type { TeamListEntry } from "@/lib/contract";
@@ -68,5 +68,14 @@ describe("TeamPicker", () => {
     expect(
       screen.getByRole("link", { name: /solo/i }).getAttribute("href"),
     ).toBe("/teams/solo");
+  });
+
+  it("repairs a stale active-team cookie to the resolved active team", async () => {
+    document.cookie = `${ACTIVE_TEAM_COOKIE}=deleted-team; Path=/; Max-Age=60`;
+    render(<TeamPicker teams={[team({ id: "current" })]} activeTeamId="current" />);
+
+    await waitFor(() => {
+      expect(document.cookie).toContain(`${ACTIVE_TEAM_COOKIE}=current`);
+    });
   });
 });

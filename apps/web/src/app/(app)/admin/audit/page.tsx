@@ -153,66 +153,105 @@ export default async function AuditLogPage_({
           No audit rows match these filters.
         </div>
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-[color:var(--color-nbu-border)]">
-          <table className="w-full min-w-[900px] text-left text-sm">
-            <thead className="bg-[color:var(--color-nbu-surface)] text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
-              <tr>
-                <th className="px-3 py-2">When (UTC)</th>
-                <th className="px-3 py-2">Action</th>
-                <th className="px-3 py-2">Actor</th>
-                <th className="px-3 py-2">Team</th>
-                <th className="px-3 py-2">Resource</th>
-                <th className="px-3 py-2">Request</th>
-              </tr>
-            </thead>
-            <tbody>
-              {page.items.map((row) => (
-                <tr
-                  key={row.id}
-                  className="border-t border-[color:var(--color-nbu-border)] align-top"
-                >
-                  <td className="whitespace-nowrap px-3 py-2 font-mono text-xs">
-                    {row.created_at.replace("T", " ").slice(0, 19)}
-                  </td>
-                  <td className="px-3 py-2 font-mono text-xs">{row.action}</td>
-                  <td className="px-3 py-2">
-                    <div className="font-mono text-xs">
-                      {row.actor_email ?? "—"}
+        <>
+          <ul className="space-y-3 md:hidden">
+            {page.items.map((row) => (
+              <li
+                key={row.id}
+                className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] p-3 text-sm"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="break-all font-mono text-xs">{row.action}</div>
+                    <div className="mt-1 font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
+                      {row.created_at.replace("T", " ").slice(0, 19)} UTC
                     </div>
-                    {row.actor_user_id && (
-                      <div className="font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
-                        {row.actor_user_id}
-                      </div>
-                    )}
-                  </td>
-                  <td className="px-3 py-2 font-mono text-xs">
-                    {row.team_id ?? "—"}
-                  </td>
-                  <td className="px-3 py-2">
-                    <div className="font-mono text-xs">
-                      {row.resource_type ?? "—"}
-                    </div>
-                    {row.resource_id && (
-                      <div className="font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
-                        {row.resource_id}
-                      </div>
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    <div className="font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
-                      {row.request_id ?? "—"}
-                    </div>
-                    {row.ip_address && (
-                      <div className="font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
-                        ip: {row.ip_address}
-                      </div>
-                    )}
-                  </td>
+                  </div>
+                  <div className="shrink-0 rounded-full border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+                    {row.resource_type ?? "event"}
+                  </div>
+                </div>
+                <dl className="grid gap-2 text-xs">
+                  <div>
+                    <dt className="text-[color:var(--color-nbu-text-muted)]">Actor</dt>
+                    <dd className="break-all font-mono">{row.actor_email ?? "—"}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-[color:var(--color-nbu-text-muted)]">Team</dt>
+                    <dd className="break-all font-mono">{row.team_id ?? "—"}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-[color:var(--color-nbu-text-muted)]">Request</dt>
+                    <dd className="break-all font-mono">{row.request_id ?? "—"}</dd>
+                  </div>
+                </dl>
+              </li>
+            ))}
+          </ul>
+
+          <div className="hidden overflow-x-auto rounded-lg border border-[color:var(--color-nbu-border)] md:block">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-[color:var(--color-nbu-surface)] text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+                <tr>
+                  <th className="px-3 py-2">When (UTC)</th>
+                  <th className="px-3 py-2">Action</th>
+                  <th className="px-3 py-2">Actor</th>
+                  <th className="px-3 py-2">Team</th>
+                  <th className="px-3 py-2">Resource</th>
+                  <th className="px-3 py-2">Request</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {page.items.map((row) => (
+                  <tr
+                    key={row.id}
+                    className="border-t border-[color:var(--color-nbu-border)] align-top"
+                  >
+                    <td className="whitespace-nowrap px-3 py-2 font-mono text-xs">
+                      {row.created_at.replace("T", " ").slice(0, 19)}
+                    </td>
+                    <td className="max-w-[220px] break-all px-3 py-2 font-mono text-xs">
+                      {row.action}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="break-all font-mono text-xs">
+                        {row.actor_email ?? "—"}
+                      </div>
+                      {row.actor_user_id && (
+                        <div className="break-all font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
+                          {row.actor_user_id}
+                        </div>
+                      )}
+                    </td>
+                    <td className="max-w-[170px] break-all px-3 py-2 font-mono text-xs">
+                      {row.team_id ?? "—"}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="break-all font-mono text-xs">
+                        {row.resource_type ?? "—"}
+                      </div>
+                      {row.resource_id && (
+                        <div className="break-all font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
+                          {row.resource_id}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="break-all font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
+                        {row.request_id ?? "—"}
+                      </div>
+                      {row.ip_address && (
+                        <div className="break-all font-mono text-[10px] text-[color:var(--color-nbu-text-muted)]">
+                          ip: {row.ip_address}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
       )}
 
       <nav

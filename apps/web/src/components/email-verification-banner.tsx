@@ -1,7 +1,12 @@
 "use client";
 
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { apiJson } from "@/lib/api-client";
+import {
+  clearEmailVerificationRetryNeeded,
+  emailVerificationRetryNeeded,
+} from "@/lib/email-verification-state";
 import { ApiError } from "@/lib/errors";
 import type {
   EmailVerificationStatusResponse,
@@ -14,32 +19,35 @@ type BannerState = {
 };
 
 export function EmailVerificationBanner({ email }: { email: string }) {
-  const [state, setState] = useState<BannerState | null>(null);
+  const queryClient = useQueryClient();
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryNeeded, setRetryNeeded] = useState(false);
+  const statusQueryKey = ["email-verification-status", email] as const;
 
   useEffect(() => {
-    let cancelled = false;
-    apiJson<EmailVerificationStatusResponse>("/auth/email/verify/status", {
-      method: "GET",
-      cache: "no-store",
-    })
-      .then((status) => {
-        if (!cancelled) {
-          setState({
-            isVerified: status.is_verified,
-            pendingRequest: status.pending_request,
-          });
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setState({ isVerified: true, pendingRequest: false });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    setRetryNeeded(emailVerificationRetryNeeded(email));
+  }, [email]);
+
+  const statusQuery = useQuery<BannerState>({
+    queryKey: statusQueryKey,
+    queryFn: async () => {
+      const status = await apiJson<EmailVerificationStatusResponse>(
+        "/auth/email/verify/status",
+        {
+          method: "GET",
+          cache: "no-store",
+        },
+      );
+      return {
+        isVerified: status.is_verified,
+        pendingRequest: status.pending_request,
+      };
+    },
+    retry: false,
+    staleTime: 60_000,
+  });
 
   async function requestVerification() {
     setSubmitting(true);
@@ -50,7 +58,12 @@ export function EmailVerificationBanner({ email }: { email: string }) {
         method: "POST",
         json: {},
       });
-      setState({ isVerified: false, pendingRequest: true });
+      clearEmailVerificationRetryNeeded(email);
+      setRetryNeeded(false);
+      queryClient.setQueryData<BannerState>(statusQueryKey, {
+        isVerified: false,
+        pendingRequest: true,
+      });
       setMessage(`Verification email sent to ${email}.`);
     } catch (err) {
       if (err instanceof ApiError) {
@@ -63,21 +76,25 @@ export function EmailVerificationBanner({ email }: { email: string }) {
     }
   }
 
-  if (state === null || state.isVerified) {
+  if (statusQuery.isPending || statusQuery.isError || statusQuery.data.isVerified) {
     return null;
   }
+
+  const state = statusQuery.data;
+  const bodyMessage =
+    message ??
+    (retryNeeded && !state.pendingRequest
+      ? `We tried to send a verification email to ${email}, but delivery was unavailable. Try again.`
+      : state.pendingRequest
+        ? `Check your inbox at ${email}.`
+        : `Send a verification link to ${email}.`);
 
   return (
     <div className="border-b border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)]">
       <div className="mx-auto flex max-w-5xl flex-col gap-3 px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between">
         <div className="space-y-1">
           <p className="font-medium">Verify your email to unlock team creation.</p>
-          <p className="text-[color:var(--color-nbu-text-muted)]">
-            {message ??
-              (state.pendingRequest
-                ? `Check your inbox at ${email}.`
-                : `Send a verification link to ${email}.`)}
-          </p>
+          <p className="text-[color:var(--color-nbu-text-muted)]">{bodyMessage}</p>
           {error && (
             <p role="alert" className="text-[color:var(--color-nbu-error)]">
               {error}
