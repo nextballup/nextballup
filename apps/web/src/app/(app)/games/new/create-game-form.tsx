@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { apiJson } from "@/lib/api-client";
-import { ApiError } from "@/lib/errors";
+import { ApiError, isEmailVerificationRequiredError } from "@/lib/errors";
 import type { GameSummary, GameType, TeamListEntry } from "@/lib/contract";
 
 const GAME_TYPES: GameType[] = [
@@ -68,11 +68,15 @@ export function CreateGameForm({
       router.replace(`/games/${created.id}`);
     } catch (err) {
       if (err instanceof ApiError) {
-        setError(
-          err.status === 403
-            ? "You need coach access on this team to create games."
-            : err.message,
-        );
+        if (isEmailVerificationRequiredError(err)) {
+          setError("Verify your email before creating a game.");
+        } else {
+          setError(
+            err.status === 403
+              ? "You need coach access on this team to create games."
+              : err.message,
+          );
+        }
       } else {
         setError("Could not create game.");
       }

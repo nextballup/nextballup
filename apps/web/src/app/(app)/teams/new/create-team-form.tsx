@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { ACTIVE_TEAM_COOKIE } from "@/lib/active-team";
 import { apiJson } from "@/lib/api-client";
-import { ApiError } from "@/lib/errors";
+import { ApiError, isEmailVerificationRequiredError } from "@/lib/errors";
 import type {
   InstitutionType,
   Sport,
@@ -49,11 +49,7 @@ function currentSeason(): string {
 }
 
 function createTeamErrorMessage(err: ApiError): string {
-  if (
-    err.status === 403 &&
-    (err.details?.reason === "email_unverified" ||
-      err.message.toLowerCase().includes("email verification"))
-  ) {
+  if (isEmailVerificationRequiredError(err)) {
     return "Verify your email before creating a team.";
   }
   if (err.status === 403) {

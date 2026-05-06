@@ -37,7 +37,7 @@ export default async function GameUploadPage({
           part, not the whole file.
         </p>
       </div>
-      <UploadFlow gameId={game.id} />
+      <UploadFlow gameId={game.id} teamId={game.team_id} />
     </section>
   );
 }

@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { serverApiOptional } from "@/lib/api-server";
 import type { TeamDetailResponse } from "@/lib/contract";
 import { InvitePanel } from "./invite-panel";
+import { PrivacyConsentPanel } from "./privacy-consent-panel";
 
 const TEAM_ROLE_LABELS: Record<string, string> = {
   head_coach: "Head coach",
@@ -56,7 +57,10 @@ export default async function TeamDetailPage({
       </header>
 
       {canManageInvites && team.invite_code ? (
-        <InvitePanel teamId={team.id} defaultInviteCode={team.invite_code} />
+        <>
+          <InvitePanel teamId={team.id} defaultInviteCode={team.invite_code} />
+          <PrivacyConsentPanel teamId={team.id} />
+        </>
       ) : (
         <section className="rounded-lg border border-[color:var(--color-nbu-border)] p-4">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">

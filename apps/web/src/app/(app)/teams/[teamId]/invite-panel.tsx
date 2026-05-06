@@ -2,7 +2,7 @@
 
 import { useState, type FormEvent } from "react";
 import { apiJson } from "@/lib/api-client";
-import { ApiError } from "@/lib/errors";
+import { ApiError, isEmailVerificationRequiredError } from "@/lib/errors";
 import type { CreateInviteResponse, TeamRole } from "@/lib/contract";
 
 const INVITE_ROLES: TeamRole[] = [
@@ -55,11 +55,15 @@ export function InvitePanel({
       setGenerated(response);
     } catch (err) {
       if (err instanceof ApiError) {
-        setError(
-          err.status === 403
-            ? "You need coach access on this team to issue invites."
-            : err.message,
-        );
+        if (isEmailVerificationRequiredError(err)) {
+          setError("Verify your email before issuing team invites.");
+        } else {
+          setError(
+            err.status === 403
+              ? "You need coach access on this team to issue invites."
+              : err.message,
+          );
+        }
       } else {
         setError("Could not create invite.");
       }

@@ -140,6 +140,31 @@ export type TeamDetailResponse = {
   member_count: number;
 };
 
+export type TeamPrivacyConsentResponse = {
+  id: string;
+  team_id: string;
+  recorded_by: string | null;
+  label: string;
+  consent_source: string;
+  covers_video_uploads: boolean;
+  covers_cv_processing: boolean;
+  commercial_ml_training_allowed: boolean;
+  minors_authorized: boolean;
+  athlete_pii_authorized: boolean;
+  evidence_uri: string | null;
+  evidence_sha256: string | null;
+  effective_at: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  is_active: boolean;
+  created_at: string;
+};
+
+export type TeamPrivacyConsentListResponse = {
+  consents: TeamPrivacyConsentResponse[];
+  total: number;
+};
+
 export type TeamCreatedResponse = {
   id: string;
   name: string;

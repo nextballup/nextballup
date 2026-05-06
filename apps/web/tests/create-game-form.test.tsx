@@ -106,4 +106,28 @@ describe("CreateGameForm", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/coach access/i);
   });
+
+  it("surfaces email verification errors separately from coach access", async () => {
+    replace.mockReset();
+    server.use(
+      http.post("/api/v1/games", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "FORBIDDEN",
+              message: "Email verification is required before this action",
+              details: { reason: "email_unverified" },
+            },
+          },
+          { status: 403 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<CreateGameForm teams={[coachTeam()]} defaultTeamId="team-1" />);
+    await user.click(screen.getByRole("button", { name: /create game/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/verify your email/i);
+    expect(alert.textContent).not.toMatch(/coach access/i);
+  });
 });

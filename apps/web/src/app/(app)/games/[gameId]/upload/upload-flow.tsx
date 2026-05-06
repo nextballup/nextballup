@@ -3,10 +3,12 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { apiJson } from "@/lib/api-client";
-import { ApiError } from "@/lib/errors";
+import { ApiError, isEmailVerificationRequiredError } from "@/lib/errors";
 import type {
   CompleteUploadResponse,
   CreateUploadResponse,
+  TeamPrivacyConsentListResponse,
+  TeamPrivacyConsentResponse,
 } from "@/lib/contract";
 
 const SINGLE_PUT_LIMIT = 1_073_741_824; // Backend caps single PUT at 1 GB.
@@ -44,7 +46,22 @@ type Phase =
 
 type XhrPool = { active: Set<XMLHttpRequest>; aborted: boolean };
 
-export function UploadFlow({ gameId }: { gameId: string }) {
+function consentSupportsUpload(consent: TeamPrivacyConsentResponse): boolean {
+  return (
+    consent.is_active &&
+    consent.covers_video_uploads &&
+    consent.covers_cv_processing &&
+    consent.athlete_pii_authorized
+  );
+}
+
+export function UploadFlow({
+  gameId,
+  teamId,
+}: {
+  gameId: string;
+  teamId?: string;
+}) {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement | null>(null);
   // We used to keep a single-xhr ref. Multipart needs to abort every in-flight
@@ -53,6 +70,9 @@ export function UploadFlow({ gameId }: { gameId: string }) {
   const [cameraPosition, setCameraPosition] = useState<string>("sideline");
   const [cameraHeight, setCameraHeight] = useState<string>("elevated");
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  const [consents, setConsents] = useState<TeamPrivacyConsentResponse[]>([]);
+  const [selectedConsentId, setSelectedConsentId] = useState("");
+  const [consentLoadError, setConsentLoadError] = useState<string | null>(null);
 
   useEffect(
     () => () => {
@@ -67,6 +87,33 @@ export function UploadFlow({ gameId }: { gameId: string }) {
     },
     [],
   );
+
+  useEffect(() => {
+    if (!teamId) return;
+    let cancelled = false;
+    apiJson<TeamPrivacyConsentListResponse>(
+      `/teams/${teamId}/privacy-consents`,
+      {
+        method: "GET",
+        cache: "no-store",
+      },
+    )
+      .then((response) => {
+        if (cancelled) return;
+        const uploadConsents = response.consents.filter(consentSupportsUpload);
+        setConsents(uploadConsents);
+        setSelectedConsentId((current) => current || uploadConsents[0]?.id || "");
+        setConsentLoadError(null);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setConsentLoadError("Consent records are unavailable.");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [teamId]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -117,6 +164,7 @@ export function UploadFlow({ gameId }: { gameId: string }) {
           ...(checksum ? { checksum_sha256: checksum } : {}),
           camera_position: cameraPosition,
           camera_height: cameraHeight,
+          ...(selectedConsentId ? { privacy_consent_id: selectedConsentId } : {}),
         },
       });
     } catch (err) {
@@ -277,6 +325,43 @@ export function UploadFlow({ gameId }: { gameId: string }) {
           </select>
         </label>
       </div>
+      {teamId && (
+        <div className="space-y-2 rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] p-3 text-sm">
+          {consents.length > 0 ? (
+            <label className="block space-y-1">
+              <span className="text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+                Privacy consent evidence
+              </span>
+              <select
+                value={selectedConsentId}
+                onChange={(e) => setSelectedConsentId(e.target.value)}
+                className="w-full rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-bg)] px-3 py-2 outline-none focus:border-[color:var(--color-nbu-text)]"
+                disabled={isBusy(phase)}
+              >
+                {consents.map((consent) => (
+                  <option key={consent.id} value={consent.id}>
+                    {consent.label}
+                    {consent.minors_authorized ? " · minors authorized" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : (
+            <p className="text-[color:var(--color-nbu-text-muted)]">
+              Youth/K-12 uploads may need consent evidence recorded on the team
+              page before upload.
+            </p>
+          )}
+          {consentLoadError && (
+            <p role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
+              {consentLoadError}
+            </p>
+          )}
+          <a href={`/teams/${teamId}`} className="text-xs font-medium underline">
+            Manage consent evidence
+          </a>
+        </div>
+      )}
 
       <button
         type="submit"
@@ -344,6 +429,9 @@ function UploadPhaseFeedback({ phase }: { phase: Phase }) {
 }
 
 function describeInitiationError(err: ApiError): string {
+  if (isEmailVerificationRequiredError(err)) {
+    return "Verify your email before uploading video.";
+  }
   switch (err.code) {
     case "STORAGE_NOT_CONFIGURED":
       return "Object storage isn't configured on this environment. Ask an admin to set the S3 values.";
@@ -361,6 +449,10 @@ function describeInitiationError(err: ApiError): string {
       return "That file size is not valid.";
     case "GAME_NOT_FOUND":
       return "That game is no longer available.";
+    case "PRIVACY_CONSENT_REQUIRED":
+      return "Record or select current privacy consent evidence before uploading this team film.";
+    case "PRIVACY_CONSENT_INVALID":
+      return "Selected privacy consent evidence is not current or does not cover this upload.";
     case "FORBIDDEN":
       return "You need coach permissions on this team to upload video.";
     default:

@@ -58,4 +58,27 @@ describe("InvitePanel", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/coach access/i);
   });
+
+  it("surfaces email verification errors separately from coach access", async () => {
+    server.use(
+      http.post("/api/v1/teams/t1/invite", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "FORBIDDEN",
+              message: "Email verification is required before this action",
+              details: { reason: "email_unverified" },
+            },
+          },
+          { status: 403 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<InvitePanel teamId="t1" defaultInviteCode="X" />);
+    await user.click(screen.getByRole("button", { name: /generate invite/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/verify your email/i);
+    expect(alert.textContent).not.toMatch(/coach access/i);
+  });
 });

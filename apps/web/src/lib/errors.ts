@@ -69,3 +69,11 @@ export async function toApiError(
 export function isApiError(value: unknown): value is ApiError {
   return value instanceof ApiError;
 }
+
+export function isEmailVerificationRequiredError(error: ApiError): boolean {
+  return (
+    error.status === 403 &&
+    (error.details?.reason === "email_unverified" ||
+      error.message.toLowerCase().includes("email verification"))
+  );
+}

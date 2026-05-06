@@ -168,6 +168,108 @@ describe("UploadFlow", () => {
     expect(alert.textContent).toMatch(/storage isn't configured/i);
   });
 
+  it("includes the selected privacy consent id when uploading team film", async () => {
+    const originalXHR = window.XMLHttpRequest;
+    window.XMLHttpRequest = MockXHR as unknown as typeof XMLHttpRequest;
+    let initiated: Record<string, unknown> | null = null;
+    server.use(
+      http.get("/api/v1/teams/t1/privacy-consents", () =>
+        HttpResponse.json({
+          consents: [
+            {
+              id: "consent-1",
+              team_id: "t1",
+              recorded_by: "u1",
+              label: "Club tournament waiver",
+              consent_source: "written_permission",
+              covers_video_uploads: true,
+              covers_cv_processing: true,
+              commercial_ml_training_allowed: false,
+              minors_authorized: true,
+              athlete_pii_authorized: true,
+              evidence_uri: "r2://evidence/waiver.pdf",
+              evidence_sha256: null,
+              effective_at: "2026-05-06T00:00:00Z",
+              expires_at: null,
+              revoked_at: null,
+              is_active: true,
+              created_at: "2026-05-06T00:00:00Z",
+            },
+          ],
+          total: 1,
+        }),
+      ),
+      http.post("/api/v1/videos/upload", async ({ request }) => {
+        initiated = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(
+          {
+            id: "consented-video",
+            upload_method: "PUT",
+            upload_url: "https://signed.storage.test/consented-video",
+            upload_headers: { "Content-Type": "video/mp4" },
+            upload_id: null,
+            part_size_bytes: null,
+            part_urls: null,
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          { status: 201 },
+        );
+      }),
+      http.post("/api/v1/videos/consented-video/complete", () =>
+        HttpResponse.json({
+          id: "consented-video",
+          status: "queued",
+          estimated_processing_minutes: 45,
+          job_id: "job-1",
+        }),
+      ),
+    );
+
+    const user = userEvent.setup({ applyAccept: false });
+    render(<UploadFlow gameId="g1" teamId="t1" />);
+    expect(await screen.findByLabelText(/privacy consent evidence/i)).toHaveValue(
+      "consent-1",
+    );
+    const file = new File([new Uint8Array(200)], "clip.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+    await waitFor(() => expect(initiated).not.toBeNull());
+    expect(initiated).toMatchObject({
+      game_id: "g1",
+      privacy_consent_id: "consent-1",
+    });
+
+    window.XMLHttpRequest = originalXHR;
+  });
+
+  it("surfaces privacy consent upload gates with an actionable message", async () => {
+    server.use(
+      http.post("/api/v1/videos/upload", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "PRIVACY_CONSENT_REQUIRED",
+              message:
+                "A current athlete/guardian privacy consent record is required for this upload",
+            },
+          },
+          { status: 403 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<UploadFlow gameId="g1" />);
+    const file = new File([new Uint8Array(10)], "clip.mp4", {
+      type: "video/mp4",
+    });
+    await user.upload(screen.getByLabelText(/Video file/i), file);
+    await user.click(screen.getByRole("button", { name: /start upload/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/privacy consent evidence/i);
+  });
+
   it("clamps single-PUT progress when storage over-reports bytes", async () => {
     const originalXHR = window.XMLHttpRequest;
     MockXHR.overReportBytes = 10_000;

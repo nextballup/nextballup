@@ -1,7 +1,9 @@
 import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { http, HttpResponse } from "msw";
 import type { TeamDetailResponse } from "@/lib/contract";
 import TeamDetailPage from "@/app/(app)/teams/[teamId]/page";
+import { server } from "./setup";
 
 const { serverApiOptional } = vi.hoisted(() => ({
   serverApiOptional: vi.fn(),
@@ -48,6 +50,11 @@ function teamDetail(
 describe("TeamDetailPage", () => {
   beforeEach(() => {
     serverApiOptional.mockReset();
+    server.use(
+      http.get("/api/v1/teams/team-1/privacy-consents", () =>
+        HttpResponse.json({ consents: [], total: 0 }),
+      ),
+    );
   });
 
   it("hides invite controls for non-coach members", async () => {
@@ -83,6 +90,9 @@ describe("TeamDetailPage", () => {
     );
     expect(
       screen.getByRole("button", { name: /generate invite/i }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText(/privacy consent evidence/i),
     ).toBeInTheDocument();
   });
 });
