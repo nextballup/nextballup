@@ -205,7 +205,7 @@ envVarGroups:
       - key: EMAIL_DELIVERY_PROVIDER
         value: postmark
       - key: EMAIL_VERIFICATION_FROM_ADDRESS
-        value: no-reply@nextballup.com
+        value: kz@nextballup.com
       - key: POSTMARK_MESSAGE_STREAM
         value: outbound
       - key: BILLING_PROVIDER
