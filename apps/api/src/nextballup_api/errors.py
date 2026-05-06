@@ -92,6 +92,7 @@ def _status_code_to_error_code(status_code: int) -> str:
         401: ErrorCode.UNAUTHENTICATED,
         403: ErrorCode.FORBIDDEN,
         404: ErrorCode.NOT_FOUND,
+        405: ErrorCode.METHOD_NOT_ALLOWED,
         409: ErrorCode.EMAIL_TAKEN,
         429: ErrorCode.RATE_LIMITED,
         422: ErrorCode.VALIDATION_FAILED,

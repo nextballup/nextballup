@@ -383,7 +383,7 @@ async def create_team(
 
 
 @router.post(
-    "/{team_id}/invite",
+    "/{team_id:uuid}/invite",
     response_model=CreateInviteResponse,
     status_code=status.HTTP_201_CREATED,
 )
@@ -452,7 +452,7 @@ async def create_invite(
     )
 
 
-@router.delete("/{team_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{team_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_team(
     team_id: uuid.UUID,
     request: Request,
@@ -489,7 +489,7 @@ async def delete_team(
 
 
 @router.post(
-    "/{team_id}/privacy-consents",
+    "/{team_id:uuid}/privacy-consents",
     response_model=TeamPrivacyConsentResponse,
     status_code=status.HTTP_201_CREATED,
 )
@@ -555,7 +555,7 @@ async def record_privacy_consent(
 
 
 @router.get(
-    "/{team_id}/privacy-consents",
+    "/{team_id:uuid}/privacy-consents",
     response_model=TeamPrivacyConsentListResponse,
 )
 async def list_privacy_consents(
@@ -775,7 +775,7 @@ async def join_team(
     )
 
 
-@router.get("/{team_id}", response_model=TeamDetailResponse)
+@router.get("/{team_id:uuid}", response_model=TeamDetailResponse)
 async def get_team(
     team_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
@@ -821,7 +821,7 @@ async def get_team(
     )
 
 
-@router.get("/{team_id}/members", response_model=TeamMembersResponse)
+@router.get("/{team_id:uuid}/members", response_model=TeamMembersResponse)
 async def list_team_members(
     team_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),

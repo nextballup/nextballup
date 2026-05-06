@@ -930,7 +930,7 @@ async def initiate_upload(
 
 
 @router.post(
-    "/{video_id}/complete",
+    "/{video_id:uuid}/complete",
     response_model=CompleteUploadResponse,
 )
 async def complete_upload(
@@ -1131,7 +1131,7 @@ async def complete_upload(
 # ---- GET /videos/{video_id} -----------------------------------------------
 
 
-@router.get("/{video_id}", response_model=VideoDetailResponse)
+@router.get("/{video_id:uuid}", response_model=VideoDetailResponse)
 async def get_video(
     video_id: uuid.UUID,
     request: Request,
@@ -1193,7 +1193,7 @@ async def get_video(
 # ---- GET /videos/{video_id}/status ----------------------------------------
 
 
-@router.get("/{video_id}/status", response_model=VideoStatusResponse)
+@router.get("/{video_id:uuid}/status", response_model=VideoStatusResponse)
 async def get_video_status(
     video_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
@@ -1219,7 +1219,7 @@ async def get_video_status(
 # ---- GET /videos/{video_id}/events ----------------------------------------
 
 
-@router.get("/{video_id}/events", response_model=VideoEventsResponse)
+@router.get("/{video_id:uuid}/events", response_model=VideoEventsResponse)
 async def list_video_events(
     video_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
@@ -1269,7 +1269,7 @@ async def list_video_events(
 # ---- POST /videos/{video_id}/playback/verify ------------------------------
 
 
-@router.post("/{video_id}/playback/verify", response_model=PlaybackVerifyResponse)
+@router.post("/{video_id:uuid}/playback/verify", response_model=PlaybackVerifyResponse)
 async def verify_playback_token(
     video_id: uuid.UUID,
     payload: PlaybackVerifyRequest,
@@ -1336,7 +1336,7 @@ async def verify_playback_token(
 
 
 @router.post(
-    "/{video_id}/demo-preview",
+    "/{video_id:uuid}/demo-preview",
     response_model=GenerateDemoPreviewResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
@@ -1412,7 +1412,7 @@ async def create_demo_preview(
 # ---- GET /videos/{video_id}/demo-preview/artifact -------------------------
 
 
-@router.get("/{video_id}/demo-preview/artifact")
+@router.get("/{video_id:uuid}/demo-preview/artifact")
 async def get_demo_preview_artifact(
     video_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
@@ -1446,7 +1446,7 @@ async def get_demo_preview_artifact(
 # ---- POST /videos/{video_id}/processing/requeue ---------------------------
 
 
-@router.post("/{video_id}/processing/requeue", response_model=RequeueProcessingResponse)
+@router.post("/{video_id:uuid}/processing/requeue", response_model=RequeueProcessingResponse)
 async def requeue_processing(
     video_id: uuid.UUID,
     payload: RequeueProcessingRequest,

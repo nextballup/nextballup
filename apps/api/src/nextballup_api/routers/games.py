@@ -187,7 +187,7 @@ async def list_games(
     )
 
 
-@router.get("/{game_id}", response_model=GameSummary)
+@router.get("/{game_id:uuid}", response_model=GameSummary)
 async def get_game(
     game_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
@@ -205,7 +205,7 @@ async def get_game(
     return GameSummary.model_validate(game)
 
 
-@router.get("/{game_id}/videos", response_model=VideoListResponse)
+@router.get("/{game_id:uuid}/videos", response_model=VideoListResponse)
 async def list_game_videos(
     game_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
@@ -256,7 +256,7 @@ async def list_game_videos(
     return VideoListResponse(videos=items, total=len(items))
 
 
-@router.patch("/{game_id}", response_model=GameSummary)
+@router.patch("/{game_id:uuid}", response_model=GameSummary)
 async def update_game(
     game_id: uuid.UUID,
     payload: UpdateGameRequest,
