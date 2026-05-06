@@ -92,6 +92,11 @@ jobs:
   frontend:
     name: Frontend (lint, typecheck, test, build)
     runs-on: ubuntu-latest
+    env:
+      # `next lint` and `next build` both load next.config.ts. The config is
+      # intentionally fail-closed for production deploys, so CI must provide
+      # an explicit non-live upstream even though no network call is made.
+      API_UPSTREAM_URL: http://127.0.0.1:8000
     defaults:
       run:
         working-directory: apps/web
@@ -125,10 +130,6 @@ jobs:
         # regressions that lint/typecheck don't (CSS rebasing, Next.js
         # static-analysis constraints, etc).
         run: pnpm build
-        env:
-          # The build does not need to resolve a live upstream; any
-          # plausibly-shaped URL keeps the Next.js rewrites valid.
-          API_UPSTREAM_URL: http://127.0.0.1:8000
 
   security-python:
     name: Security (pip-audit)
@@ -169,6 +170,16 @@ jobs:
           --requirement .ci-third-party-runtime-requirements.txt
           --no-deps --disable-pip
 
+      - name: Verify Python license policy
+        run: |
+          set -euo pipefail
+          licenses="$(uv run --no-sync pip-licenses --format=csv)"
+          if printf '%s\n' "$licenses" | grep -iE ',"[^"]*(GPL|AGPL|SSPL|EUPL|OSL|CPAL)[^"]*"$'; then
+            echo "::error::Copyleft license detected — blocked by project policy"
+            exit 1
+          fi
+          echo "License check passed"
+
   security-node:
     name: Security (pnpm audit)
     runs-on: ubuntu-latest
@@ -198,11 +209,9 @@ jobs:
         # deps are excluded — they don't ship to users.
         run: pnpm audit --audit-level high --prod
 
-  # Secret-detection lives in `.github/workflows/security.yml` via the
-  # trufflehog action, which works for organization repos without a paid
-  # license. The earlier gitleaks-action@v2 job here required a paid
-  # gitleaks.io license for org repos and was dropped to avoid duplicating
-  # trufflehog's coverage with a non-functioning scanner.
+  # Secret-detection remains in `.github/workflows/security.yml`, which now
+  # runs on a weekly/manual cadence. Dependency audits still run on every
+  # push/PR in this CI workflow.
 
   hygiene-gitignore-drift:
     name: Hygiene (gitignore drift)

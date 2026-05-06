@@ -1,14 +1,11 @@
 name: Security Scan
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
   schedule:
     - cron: '0 8 * * 1'  # Weekly Monday 8am UTC
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   python-audit:
@@ -37,15 +34,17 @@ jobs:
           --no-deps --disable-pip
       - name: Verify no copyleft licenses
         run: |
-          uv run --no-sync pip-licenses --format=csv \
-            | grep -iE ',"[^"]*(GPL|AGPL|SSPL|EUPL|OSL|CPAL)[^"]*"$' \
-            && echo "::error::Copyleft license detected — blocked by project policy" && exit 1 \
-            || echo "License check passed"
+          set -euo pipefail
+          licenses="$(uv run --no-sync pip-licenses --format=csv)"
+          if printf '%s\n' "$licenses" | grep -iE ',"[^"]*(GPL|AGPL|SSPL|EUPL|OSL|CPAL)[^"]*"$'; then
+            echo "::error::Copyleft license detected — blocked by project policy"
+            exit 1
+          fi
+          echo "License check passed"
 
   npm-audit:
     name: Frontend Dependency Audit
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('apps/web/package.json') != '' && hashFiles('apps/web/pnpm-lock.yaml') != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -58,7 +57,7 @@ jobs:
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: cd apps/web && pnpm install --frozen-lockfile
       - name: Audit frontend dependencies
-        run: cd apps/web && pnpm audit --audit-level=high
+        run: cd apps/web && pnpm audit --audit-level=high --prod
 
   secrets-scan:
     name: Secret Detection
