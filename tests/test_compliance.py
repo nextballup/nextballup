@@ -29,6 +29,7 @@ from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.auth import RefreshSession
 from nextballup_db.models.email_verification import EmailVerificationToken
 from nextballup_db.models.mfa import MfaRecoveryCode, UserTotpSecret
+from nextballup_db.models.password_reset import PasswordResetToken
 from nextballup_db.models.team import TeamMembership
 from nextballup_db.models.user import User
 
@@ -103,6 +104,7 @@ async def test_export_returns_profile_memberships_and_audits(
     assert AuditAction.TEAM_CREATED in audit_actions
     assert len(body["refresh_sessions"]) >= 1
     assert body["email_verification_tokens"] == []
+    assert body["password_reset_tokens"] == []
     assert body["mfa"] == {
         "enrolled": False,
         "confirmed_at": None,
@@ -261,6 +263,35 @@ async def test_delete_invalidates_pending_email_verification_tokens(
     assert stored.requested_ip is None
     assert stored.requested_user_agent is None
     assert stored.confirmed_ip is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_delete_invalidates_pending_password_reset_tokens(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _register(client, _coach_payload("delete-password-token@example.com"))
+    user_id = uuid.UUID((await client.get(f"{API}/auth/me")).json()["id"])
+    token = PasswordResetToken(
+        user_id=user_id,
+        token_hash=sha256(b"delete-password-token").hexdigest(),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
+        requested_ip="127.0.0.1",
+        requested_user_agent="pytest",
+    )
+    db_session.add(token)
+    await db_session.commit()
+
+    response = await client.delete(f"{API}/auth/me")
+    assert response.status_code == 200, response.text
+
+    stored = await db_session.scalar(
+        select(PasswordResetToken).where(PasswordResetToken.id == token.id)
+    )
+    assert stored is not None
+    assert stored.used_at is not None
+    assert stored.requested_ip is None
+    assert stored.requested_user_agent is None
+    assert stored.reset_ip is None
 
 
 @pytest.mark.asyncio(loop_scope="session")

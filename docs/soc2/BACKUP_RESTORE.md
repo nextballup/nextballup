@@ -12,6 +12,7 @@
 | Audit log table snapshot | Weekly to S3 (parquet) | 7 years | Object lock |
 | Object-storage media (raw / mezzanine / artifacts) | Native bucket versioning | Mezzanine 365d, raw per `RAW_VIDEO_RETENTION_DAYS` | S3 versioning + cross-region replicate |
 | Email-verification token table | Snapshotted with the rest of the DB | DB retention | DB |
+| Password-reset token table | Snapshotted with the rest of the DB | DB retention | DB |
 | Billing tables (plans, accounts, subscriptions, usage_events) | DB | DB | DB |
 
 Secrets, JWT keys, and MFA cipher keys are **not** backed up alongside

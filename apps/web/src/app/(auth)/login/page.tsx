@@ -86,9 +86,20 @@ export default function LoginPage() {
             />
           </label>
         )}
-        <label className="block space-y-1">
-          <span className="text-sm font-medium">Password</span>
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-3">
+            <label htmlFor="password" className="text-sm font-medium">
+              Password
+            </label>
+            <Link
+              href="/forgot-password"
+              className="text-xs font-medium text-[color:var(--color-nbu-text-muted)] underline"
+            >
+              Forgot password?
+            </Link>
+          </div>
           <input
+            id="password"
             type="password"
             required
             autoComplete="current-password"
@@ -97,7 +108,7 @@ export default function LoginPage() {
             onChange={(e) => setPassword(e.target.value)}
             className="w-full rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 outline-none focus:border-[color:var(--color-nbu-text)]"
           />
-        </label>
+        </div>
         {error && (
           <p role="alert" className="text-sm text-[color:var(--color-nbu-error)]">
             {error}

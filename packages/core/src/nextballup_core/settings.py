@@ -4,10 +4,33 @@ from functools import lru_cache
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+def _normalize_async_postgres_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value.startswith("postgres://"):
+        return f"postgresql+asyncpg://{value.removeprefix('postgres://')}"
+    if value.startswith("postgresql://"):
+        return f"postgresql+asyncpg://{value.removeprefix('postgresql://')}"
+    return value
+
+
+def _database_url_with_credentials(database_url: str, *, username: str, password: str) -> str:
+    parsed = urlsplit(_normalize_async_postgres_url(database_url) or database_url)
+    if parsed.hostname is None:
+        raise ValueError("DATABASE_URL must include a hostname")
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    netloc = f"{quote(username, safe='')}:{quote(password, safe='')}@{host}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 class Settings(BaseSettings):
@@ -47,6 +70,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://nextballup:nextballup_dev@localhost:5432/nextballup"
     database_url_sync: str = "postgresql://nextballup:nextballup_dev@localhost:5432/nextballup"
     database_url_runtime: str | None = None
+    database_runtime_username: str = "nextballup_app"
+    database_runtime_password: str | None = None
 
     # ---- Distributed Dependencies ----
     redis_url: str | None = None
@@ -88,6 +113,27 @@ class Settings(BaseSettings):
     playback_token_audience: str = "video:playback"
     auth_rate_limit_attempts: int = 5
     auth_rate_limit_window_seconds: int = 60
+
+    # ---- Registration gate ----
+    # Public/root domain stays marketing/waitlist by default; the app
+    # registration endpoint must not expose open signup outside an explicit
+    # operator decision. Modes:
+    #   * open         — anyone may register (development default)
+    #   * invite_only  — caller must present a code from
+    #                    `registration_invite_codes`
+    #   * allowlist    — caller's email must appear in
+    #                    `registration_email_allowlist`
+    #   * disabled     — registration is rejected outright (public/marketing)
+    # See docs/soc2/DEPLOYMENT_CHANNELS.md and
+    # docs/soc2/PRODUCTION_READINESS.md.
+    registration_mode: Literal["open", "invite_only", "allowlist", "disabled"] = "open"
+    # Plaintext invite codes the operator hands out for invite_only beta. Each
+    # code is shared (no per-user binding); rotate by replacing the env value.
+    # Codes are constant-time-compared so the failed-match path can't be used
+    # as a timing oracle.
+    registration_invite_codes: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Lowercased email addresses allowed to register when mode=allowlist.
+    registration_email_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
     rate_limit_fail_closed: bool | None = None
     team_join_rate_limit_attempts: int = 20
     team_join_rate_limit_window_seconds: int = 60
@@ -107,8 +153,9 @@ class Settings(BaseSettings):
     email_verification_request_rate_window_seconds: int = Field(default=900, ge=60, le=86400)
     # Provider id for the email delivery layer. `logging` is the safe default
     # for dev/test (writes a JSON line to a configured log path); `noop` drops
-    # messages silently for tests; production must wire a real provider id
-    # explicitly. We deliberately do not bake real provider keys into settings.
+    # messages silently for tests; staging/production must use a real provider
+    # such as the built-in Postmark adapter or an explicitly registered
+    # deployment provider.
     email_delivery_provider: str = "logging"
     email_delivery_log_path: Path | None = None
     # Sender shown in the rendered link payload (cosmetic; the real `From:`
@@ -117,6 +164,17 @@ class Settings(BaseSettings):
     # Verification link target — defaults to the frontend `/verify-email`
     # route. The token rides as a URL query param.
     email_verification_redirect_path: str = "/verify-email"
+    postmark_server_token: str | None = None
+    postmark_message_stream: str = "outbound"
+    postmark_send_timeout_seconds: float = Field(default=10.0, gt=0.0, le=60.0)
+
+    # ---- Password reset ----
+    password_reset_token_ttl_minutes: int = Field(default=30, ge=5, le=240)
+    password_reset_request_rate_attempts: int = Field(default=5, ge=1, le=50)
+    password_reset_request_rate_window_seconds: int = Field(default=900, ge=60, le=86400)
+    password_reset_confirm_rate_attempts: int = Field(default=10, ge=1, le=100)
+    password_reset_confirm_rate_window_seconds: int = Field(default=900, ge=60, le=86400)
+    password_reset_redirect_path: str = "/reset-password"
 
     # ---- MFA / TOTP ----
     # Secret used to derive the AES-GCM key that encrypts TOTP shared secrets
@@ -130,10 +188,9 @@ class Settings(BaseSettings):
     mfa_recovery_code_count: int = Field(default=10, ge=4, le=20)
 
     # ---- Billing ----
-    # Stripe-style provider hook. Only `stub` (no-op) is supported in code today;
-    # production deployments will plug in a real provider behind the same
-    # interface. We never store real keys in settings; the stub provider has
-    # no credentials.
+    # Stripe-style provider hook. `stub` is local/dev only. Alpha/staging may
+    # use `billing_disabled` to keep checkout fail-closed while the private CV
+    # POC is not charging users. Production/beta must register a real provider.
     billing_provider: str = "stub"
     # Default plan code assigned to a freshly-provisioned billing account when
     # no subscription has been chosen yet.
@@ -280,6 +337,8 @@ class Settings(BaseSettings):
             "/api/v1/auth/login",
             "/api/v1/auth/register",
             "/api/v1/auth/refresh",
+            "/api/v1/auth/password/forgot",
+            "/api/v1/auth/password/reset",
             "/api/v1/_csp-report",
         ]
     )
@@ -359,6 +418,37 @@ class Settings(BaseSettings):
             return [p.strip() for p in value.split(",") if p.strip()]
         return value
 
+    @field_validator("registration_invite_codes", mode="before")
+    @classmethod
+    def _split_registration_invite_codes(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [c.strip() for c in value.split(",") if c.strip()]
+        return value
+
+    @field_validator("registration_invite_codes")
+    @classmethod
+    def _validate_registration_invite_codes(cls, value: list[str]) -> list[str]:
+        for code in value:
+            if len(code) < 8:
+                raise ValueError("REGISTRATION_INVITE_CODES entries must be at least 8 characters")
+        return value
+
+    @field_validator("registration_email_allowlist", mode="before")
+    @classmethod
+    def _split_registration_email_allowlist(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [e.strip().lower() for e in value.split(",") if e.strip()]
+        if isinstance(value, list):
+            return [str(e).strip().lower() for e in value if str(e).strip()]
+        return value
+
+    @field_validator("database_url", "database_url_runtime", mode="before")
+    @classmethod
+    def _normalize_database_urls(cls, value: object) -> object:
+        if isinstance(value, str):
+            return _normalize_async_postgres_url(value)
+        return value
+
     def storage_configured(self) -> bool:
         return all(
             (
@@ -415,10 +505,17 @@ class Settings(BaseSettings):
         when no separate runtime role is configured (dev convenience)."""
         if self.database_url_runtime:
             return self.database_url_runtime
+        if self.database_runtime_password:
+            return _database_url_with_credentials(
+                self.database_url,
+                username=self.database_runtime_username,
+                password=self.database_runtime_password,
+            )
         if self.app_env in ("staging", "production"):
             raise RuntimeError(
-                "DATABASE_URL_RUNTIME must be configured in staging/production "
-                "(fail-closed; API/worker must use the non-owner runtime role)"
+                "DATABASE_URL_RUNTIME or DATABASE_RUNTIME_PASSWORD must be configured "
+                "in staging/production (fail-closed; API/worker must use the "
+                "non-owner runtime role)"
             )
         return self.database_url
 
@@ -433,6 +530,33 @@ class Settings(BaseSettings):
         if self.require_privacy_consent_for_sensitive_uploads is not None:
             return self.require_privacy_consent_for_sensitive_uploads
         return self.app_env != "test"
+
+    def is_registration_invite_required(self) -> bool:
+        return self.registration_mode == "invite_only"
+
+    def is_registration_disabled(self) -> bool:
+        return self.registration_mode == "disabled"
+
+    def is_registration_email_allowlisted(self, email: str) -> bool:
+        if self.registration_mode != "allowlist":
+            return True
+        return email.strip().lower() in set(self.registration_email_allowlist)
+
+    def is_valid_registration_invite_code(self, code: str | None) -> bool:
+        if not self.is_registration_invite_required():
+            return True
+        if not code:
+            return False
+        submitted = code.strip()
+        # Constant-time compare against every configured code so the failed
+        # path's wall time does not vary with the submitted prefix.
+        import hmac
+
+        match = False
+        for known in self.registration_invite_codes:
+            if hmac.compare_digest(submitted, known):
+                match = True
+        return match
 
     def should_require_verified_email_for_sensitive_actions(self) -> bool:
         """Whether coach/admin state-changing actions require verified email."""
@@ -479,6 +603,13 @@ class Settings(BaseSettings):
         """
         base = self.frontend_app_url.rstrip("/")
         path = self.email_verification_redirect_path or "/verify-email"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        return f"{base}{path}?token={token}"
+
+    def password_reset_link(self, token: str) -> str:
+        base = self.frontend_app_url.rstrip("/")
+        path = self.password_reset_redirect_path or "/reset-password"
         if not path.startswith("/"):
             path = f"/{path}"
         return f"{base}{path}?token={token}"

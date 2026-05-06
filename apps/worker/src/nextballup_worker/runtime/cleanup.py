@@ -19,6 +19,7 @@ from nextballup_core.enums import ProcessingJobStatus, VideoStatus
 from nextballup_core.observability import WORKER_JOBS_STALE_RECOVERED_TOTAL
 from nextballup_core.settings import Settings, get_settings
 from nextballup_db.models.email_verification import EmailVerificationToken
+from nextballup_db.models.password_reset import PasswordResetToken
 from nextballup_db.models.video import ProcessingJob, Video
 from nextballup_worker.audit import write_worker_audit
 from nextballup_worker.runtime.jobs import fail_job, now_utc, set_video_status
@@ -37,6 +38,7 @@ class CleanupReport:
     retried_raw_video_deletes: list[str] = field(default_factory=list)
     expired_demo_previews: list[str] = field(default_factory=list)
     pruned_email_verification_tokens: int = 0
+    pruned_password_reset_tokens: int = 0
     pruned_csp_reports: int = 0
 
 
@@ -429,6 +431,44 @@ async def cleanup_email_verification_tokens(
     return pruned
 
 
+async def cleanup_password_reset_tokens(
+    session: AsyncSession,
+    *,
+    settings: Settings | None = None,
+    request_id: str | None = None,
+) -> int:
+    _ = settings
+    now = now_utc()
+    await set_worker_operator_role(session)
+    stale_ids = (
+        select(PasswordResetToken.id)
+        .where(
+            PasswordResetToken.used_at.is_not(None) | (PasswordResetToken.expires_at < now),
+        )
+        .limit(1000)
+    )
+    rows = await session.execute(
+        delete(PasswordResetToken)
+        .where(PasswordResetToken.id.in_(stale_ids))
+        .returning(PasswordResetToken.id)
+    )
+    pruned = len(rows.scalars().all())
+    if pruned:
+        await write_worker_audit(
+            session,
+            action=AuditAction.USER_PASSWORD_RESET_TOKENS_PRUNED,
+            team_id=None,
+            resource_type="password_reset_token",
+            request_id=request_id,
+            extra={
+                "count": pruned,
+                "criterion": "used_or_expired",
+            },
+        )
+    await session.commit()
+    return pruned
+
+
 async def cleanup_expired_csp_reports(
     session: AsyncSession,
     *,
@@ -471,6 +511,9 @@ async def run_full_cleanup(
     pruned_email_tokens = await cleanup_email_verification_tokens(
         session, settings=settings, request_id=request_id
     )
+    pruned_password_reset_tokens = await cleanup_password_reset_tokens(
+        session, settings=settings, request_id=request_id
+    )
     pruned_csp_reports = await cleanup_expired_csp_reports(
         session, settings=settings, request_id=request_id
     )
@@ -481,5 +524,6 @@ async def run_full_cleanup(
         retried_raw_video_deletes=retried_raw_video_deletes,
         expired_demo_previews=expired_demo_previews,
         pruned_email_verification_tokens=pruned_email_tokens,
+        pruned_password_reset_tokens=pruned_password_reset_tokens,
         pruned_csp_reports=pruned_csp_reports,
     )

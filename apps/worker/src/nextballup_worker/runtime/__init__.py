@@ -12,6 +12,7 @@ from nextballup_worker.runtime.cleanup import (
     cleanup_email_verification_tokens,
     cleanup_expired_csp_reports,
     cleanup_expired_raw_videos,
+    cleanup_password_reset_tokens,
     recover_stale_jobs,
     retry_raw_video_storage_deletes,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "cleanup_email_verification_tokens",
     "cleanup_expired_csp_reports",
     "cleanup_expired_raw_videos",
+    "cleanup_password_reset_tokens",
     "complete_job",
     "dispatch_pending_jobs",
     "execute_cv_stage",

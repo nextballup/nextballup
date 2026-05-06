@@ -10,8 +10,9 @@ Design goals:
     them directly. Richer capability flags live in the `features` JSONB so
     new flags do not need migrations.
   * **No live provider calls.** Stripe-style integration is wired through a
-    Protocol with a shipping no-op stub. Production deployments register a
-    real provider behind the same interface; this repo never embeds keys.
+    Protocol with a local-dev stub and an explicit alpha/staging disabled
+    provider. Production deployments register a real provider behind the same
+    interface; this repo never embeds keys.
 """
 
 from __future__ import annotations
@@ -127,8 +128,34 @@ class StubBillingProvider:
         return None
 
 
+class BillingDisabledProvider:
+    """Fail-closed provider for private alpha/staging channels.
+
+    Alpha POC users should be able to upload and evaluate internal videos
+    without any checkout surface. If a route accidentally tries to start paid
+    billing while this provider is configured, the request is rejected instead
+    of returning a fake URL.
+    """
+
+    name = "billing_disabled"
+
+    def create_checkout_session(
+        self,
+        *,
+        billing_account_id: uuid.UUID,
+        plan_code: str,
+        success_url: str,
+        cancel_url: str,
+    ) -> CheckoutSession:
+        raise ForbiddenError("Billing is disabled for this deployment")
+
+    def cancel_subscription(self, *, external_subscription_id: str) -> None:
+        raise ForbiddenError("Billing is disabled for this deployment")
+
+
 _PROVIDER_FACTORY: dict[str, Callable[[Settings], BillingProvider]] = {
     "stub": lambda _s: StubBillingProvider(),
+    "billing_disabled": lambda _s: BillingDisabledProvider(),
 }
 
 

@@ -1,0 +1,243 @@
+previews:
+  generation: off
+
+services:
+  - type: keyvalue
+    name: nextballup-alpha-redis
+    plan: free
+    region: ohio
+    ipAllowList: []
+    maxmemoryPolicy: noeviction
+
+  - type: pserv
+    name: nextballup-alpha-api
+    runtime: docker
+    plan: starter
+    region: ohio
+    autoDeployTrigger: off
+    dockerfilePath: ./Dockerfile.backend
+    dockerContext: .
+    dockerCommand: sh -c 'uvicorn nextballup_api.main:app --host 0.0.0.0 --port ${PORT:-8000}'
+    preDeployCommand: sh -c 'alembic upgrade head && python scripts/configure_runtime_db_role.py'
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - fromGroup: nextballup-alpha-backend-common
+      - fromGroup: nextballup-alpha-shared-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nextballup-alpha-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: JWT_PRIVATE_KEY
+        sync: false
+      - key: JWT_PUBLIC_KEY
+        sync: false
+      - key: POSTMARK_SERVER_TOKEN
+        sync: false
+      - key: REGISTRATION_INVITE_CODES
+        sync: false
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      - key: S3_BUCKET_RAW
+        value: nextballup-alpha-raw
+      - key: S3_REGION
+        value: auto
+
+  - type: worker
+    name: nextballup-alpha-worker
+    runtime: docker
+    plan: starter
+    region: ohio
+    autoDeployTrigger: off
+    dockerfilePath: ./Dockerfile.backend
+    dockerContext: .
+    dockerCommand: sh -c 'celery -A nextballup_worker.celery_app worker --loglevel=info --queues=nextballup.default,nextballup.transcode,nextballup.maintenance,nextballup.cpu'
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - fromGroup: nextballup-alpha-backend-common
+      - fromGroup: nextballup-alpha-shared-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nextballup-alpha-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      - key: S3_BUCKET_RAW
+        value: nextballup-alpha-raw
+      - key: S3_REGION
+        value: auto
+
+  - type: worker
+    name: nextballup-alpha-beat
+    runtime: docker
+    plan: starter
+    region: ohio
+    autoDeployTrigger: off
+    dockerfilePath: ./Dockerfile.backend
+    dockerContext: .
+    dockerCommand: sh -c 'celery -A nextballup_worker.celery_app beat --loglevel=info'
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - fromGroup: nextballup-alpha-backend-common
+      - fromGroup: nextballup-alpha-shared-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nextballup-alpha-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: keyvalue
+          name: nextballup-alpha-redis
+          property: connectionString
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      - key: S3_BUCKET_RAW
+        value: nextballup-alpha-raw
+      - key: S3_REGION
+        value: auto
+
+  - type: web
+    name: nextballup-alpha-web
+    runtime: node
+    plan: starter
+    region: ohio
+    rootDir: apps/web
+    autoDeployTrigger: off
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    startCommand: pnpm exec next start -p $PORT
+    healthCheckPath: /
+    domains:
+      - alpha.nextballup.com
+    renderSubdomainPolicy: disabled
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NEXT_PUBLIC_REGISTRATION_MODE
+        value: invite_only
+      - key: API_UPSTREAM_HOSTPORT
+        fromService:
+          type: pserv
+          name: nextballup-alpha-api
+          property: hostport
+
+databases:
+  - name: nextballup-alpha-db
+    databaseName: nextballup_alpha
+    plan: basic-256mb
+    region: ohio
+    postgresMajorVersion: "16"
+    ipAllowList: []
+
+envVarGroups:
+  - name: nextballup-alpha-backend-common
+    envVars:
+      - key: APP_ENV
+        value: staging
+      - key: APP_DEBUG
+        value: "false"
+      - key: FRONTEND_APP_URL
+        value: https://alpha.nextballup.com
+      - key: CORS_ORIGINS
+        value: https://alpha.nextballup.com
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: COOKIE_SAMESITE
+        value: strict
+      - key: COOKIE_HOST_PREFIX
+        value: "true"
+      - key: RATE_LIMIT_FAIL_CLOSED
+        value: "true"
+      - key: DATABASE_RUNTIME_USERNAME
+        value: nextballup_app
+      - key: REGISTRATION_MODE
+        value: invite_only
+      - key: EMAIL_DELIVERY_PROVIDER
+        value: postmark
+      - key: EMAIL_VERIFICATION_FROM_ADDRESS
+        value: no-reply@nextballup.com
+      - key: POSTMARK_MESSAGE_STREAM
+        value: outbound
+      - key: BILLING_PROVIDER
+        value: billing_disabled
+      - key: REQUIRE_PRIVACY_CONSENT_FOR_SENSITIVE_UPLOADS
+        value: "true"
+      - key: REQUIRE_VERIFIED_EMAIL_FOR_SENSITIVE_ACTIONS
+        value: "true"
+      - key: CV_PIPELINE_ENABLED
+        value: "false"
+      - key: CV_DEMO_PREVIEW_ENABLED
+        value: "false"
+      - key: WORKER_FFMPEG_BINARY
+        value: ffmpeg
+      - key: WORKER_FFPROBE_BINARY
+        value: ffprobe
+      - key: WORKER_MEDIA_SUBPROCESS_SANDBOX
+        value: "true"
+      - key: WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED
+        value: "false"
+      - key: OBSERVABILITY_METRICS_ENABLED
+        value: "false"
+      - key: OBSERVABILITY_WORKER_METRICS_ENABLED
+        value: "false"
+
+  - name: nextballup-alpha-shared-secrets
+    envVars:
+      - key: DATABASE_RUNTIME_PASSWORD
+        generateValue: true
+      - key: CSRF_SECRET
+        generateValue: true
+      - key: MFA_SECRET_KEY
+        generateValue: true
+      - key: OBSERVABILITY_METRICS_TOKEN
+        generateValue: true

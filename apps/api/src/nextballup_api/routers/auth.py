@@ -17,6 +17,11 @@ from nextballup_api.email_verification import (
     deliver_verification_email,
     issue_verification_token,
 )
+from nextballup_api.password_reset import (
+    consume_password_reset_token,
+    deliver_password_reset_email,
+    issue_password_reset_token,
+)
 from nextballup_api.request_meta import client_ip
 from nextballup_api.security.cookies import clear_auth_cookies, set_auth_cookies
 from nextballup_api.security.csrf import (
@@ -35,15 +40,21 @@ from nextballup_core.errors import (
     AppError,
     AuthenticationError,
     ConflictError,
+    ForbiddenError,
     InvalidCredentialsError,
 )
 from nextballup_core.schemas.auth import (
     LoginRequest,
     LoginResponse,
+    PasswordResetConfirmRequest,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
     RefreshRequest,
     RefreshResponse,
     RegisterRequest,
     RegisterResponse,
+    RegistrationStatusResponse,
     TeamMembershipSummary,
     UserPublic,
 )
@@ -54,6 +65,7 @@ from nextballup_core.schemas.compliance import (
     CspReportExport,
     EmailVerificationTokenExport,
     MfaEnrollmentExport,
+    PasswordResetTokenExport,
     RefreshSessionExport,
     TeamMembershipExport,
     TeamPrivacyConsentExport,
@@ -76,6 +88,7 @@ from nextballup_db.models.billing import BillingAccount, UsageEvent
 from nextballup_db.models.csp import CspReport
 from nextballup_db.models.email_verification import EmailVerificationToken
 from nextballup_db.models.mfa import MfaRecoveryCode, UserTotpSecret
+from nextballup_db.models.password_reset import PasswordResetToken
 from nextballup_db.models.team import TeamMembership, TeamPrivacyConsent
 from nextballup_db.models.user import User
 from nextballup_db.models.video import Video
@@ -339,6 +352,93 @@ async def _user_from_refresh_token(
     return user, refresh_session
 
 
+async def _enforce_registration_gate(
+    payload: RegisterRequest,
+    *,
+    request: Request,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """Reject registration when the deployment channel says it should be closed.
+
+    Audit the rejection (without logging the submitted invite code) before
+    raising so denied attempts are observable in the audit log.
+    """
+    email_normalized = payload.email.lower()
+    if settings.is_registration_disabled():
+        await write_audit(
+            session,
+            action=AuditAction.USER_REGISTER_FAILED,
+            request=request,
+            actor_email=email_normalized,
+            extra={"reason": ErrorCode.REGISTRATION_DISABLED},
+        )
+        await session.commit()
+        raise ForbiddenError(
+            "Registration is disabled on this deployment",
+            code=ErrorCode.REGISTRATION_DISABLED,
+        )
+    if settings.is_registration_invite_required():
+        if not payload.invite_code:
+            await write_audit(
+                session,
+                action=AuditAction.USER_REGISTER_FAILED,
+                request=request,
+                actor_email=email_normalized,
+                extra={"reason": ErrorCode.REGISTRATION_INVITE_REQUIRED},
+            )
+            await session.commit()
+            raise ForbiddenError(
+                "An invite code is required to register on this deployment",
+                code=ErrorCode.REGISTRATION_INVITE_REQUIRED,
+            )
+        if not settings.is_valid_registration_invite_code(payload.invite_code):
+            await write_audit(
+                session,
+                action=AuditAction.USER_REGISTER_FAILED,
+                request=request,
+                actor_email=email_normalized,
+                extra={"reason": ErrorCode.REGISTRATION_INVITE_INVALID},
+            )
+            await session.commit()
+            raise ForbiddenError(
+                "Invite code is not valid",
+                code=ErrorCode.REGISTRATION_INVITE_INVALID,
+            )
+    if not settings.is_registration_email_allowlisted(email_normalized):
+        await write_audit(
+            session,
+            action=AuditAction.USER_REGISTER_FAILED,
+            request=request,
+            actor_email=email_normalized,
+            extra={"reason": ErrorCode.REGISTRATION_NOT_ALLOWLISTED},
+        )
+        await session.commit()
+        raise ForbiddenError(
+            "This email is not on the registration allowlist",
+            code=ErrorCode.REGISTRATION_NOT_ALLOWLISTED,
+        )
+
+
+@router.get(
+    "/registration/status",
+    response_model=RegistrationStatusResponse,
+)
+async def registration_status(
+    response: Response,
+    settings: Settings = Depends(get_app_settings),
+) -> RegistrationStatusResponse:
+    """Surface the current registration gate so the frontend can render the
+    right UI on the public landing and register pages without leaking the
+    configured codes or allowlist."""
+    response.headers["Cache-Control"] = "no-store"
+    return RegistrationStatusResponse(
+        mode=settings.registration_mode,
+        invite_code_required=settings.is_registration_invite_required(),
+        is_open_to_public=settings.registration_mode == "open",
+    )
+
+
 @router.post(
     "/register",
     response_model=RegisterResponse,
@@ -358,6 +458,15 @@ async def register(
         scope="auth_register",
         subject=email_normalized,
     )
+    await enforce_rate_limit(
+        request=request,
+        settings=settings,
+        scope="auth_register_ip",
+        subject="registration",
+        max_attempts=settings.auth_rate_limit_attempts,
+        window_seconds=settings.auth_rate_limit_window_seconds,
+    )
+    await _enforce_registration_gate(payload, request=request, session=session, settings=settings)
 
     existing = await session.scalar(select(User.id).where(User.email == email_normalized))
     if existing is not None:
@@ -651,6 +760,177 @@ async def logout(
     return response
 
 
+@router.post(
+    "/password/forgot",
+    response_model=PasswordResetRequestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def request_password_reset(
+    payload: PasswordResetRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> PasswordResetRequestResponse:
+    email_normalized = payload.email.lower()
+    await enforce_rate_limit(
+        request=request,
+        settings=settings,
+        scope="password_reset_request",
+        subject=email_normalized,
+        max_attempts=settings.password_reset_request_rate_attempts,
+        window_seconds=settings.password_reset_request_rate_window_seconds,
+    )
+    user = await session.scalar(select(User).where(User.email == email_normalized))
+    requested_at = datetime.now(tz=UTC)
+    if user is None or not user.is_active:
+        await write_audit(
+            session,
+            action=AuditAction.USER_PASSWORD_RESET_REQUESTED,
+            request=request,
+            actor_email=email_normalized,
+            extra={"result": "accepted"},
+        )
+        await session.commit()
+        return PasswordResetRequestResponse(
+            requested_at=requested_at,
+            delivery=settings.email_delivery_provider,
+        )
+
+    issued = await issue_password_reset_token(
+        session,
+        user=user,
+        request=request,
+        settings=settings,
+    )
+    await write_audit(
+        session,
+        action=AuditAction.USER_PASSWORD_RESET_REQUESTED,
+        request=request,
+        actor_user_id=user.id,
+        actor_email=user.email,
+        resource_type="password_reset_token",
+        resource_id=issued.record.id,
+        extra={
+            "expires_at": issued.expires_at.isoformat(),
+            "provider": settings.email_delivery_provider,
+        },
+    )
+    await session.commit()
+
+    try:
+        deliver_password_reset_email(user=user, raw_token=issued.raw_token, settings=settings)
+        await write_audit(
+            session,
+            action=AuditAction.USER_PASSWORD_RESET_SENT,
+            request=request,
+            actor_user_id=user.id,
+            actor_email=user.email,
+            resource_type="password_reset_token",
+            resource_id=issued.record.id,
+            extra={"provider": settings.email_delivery_provider},
+        )
+    except Exception:
+        failure_at = datetime.now(tz=UTC)
+        await session.execute(
+            update(PasswordResetToken)
+            .where(
+                PasswordResetToken.id == issued.record.id,
+                PasswordResetToken.used_at.is_(None),
+            )
+            .values(used_at=failure_at)
+        )
+        await write_audit(
+            session,
+            action=AuditAction.USER_PASSWORD_RESET_REJECTED,
+            request=request,
+            actor_user_id=user.id,
+            actor_email=user.email,
+            resource_type="password_reset_token",
+            resource_id=issued.record.id,
+            extra={"reason": "delivery_failed", "provider": settings.email_delivery_provider},
+        )
+    await session.commit()
+    return PasswordResetRequestResponse(
+        requested_at=requested_at,
+        delivery=settings.email_delivery_provider,
+    )
+
+
+@router.post("/password/reset", response_model=PasswordResetConfirmResponse)
+async def reset_password(
+    payload: PasswordResetConfirmRequest,
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> PasswordResetConfirmResponse:
+    await enforce_rate_limit(
+        request=request,
+        settings=settings,
+        scope="password_reset_confirm",
+        subject="password_reset_confirm",
+        max_attempts=settings.password_reset_confirm_rate_attempts,
+        window_seconds=settings.password_reset_confirm_rate_window_seconds,
+    )
+    consumed, reason = await consume_password_reset_token(
+        session,
+        raw_token=payload.token,
+        request=request,
+        settings=settings,
+    )
+    if consumed is None:
+        await write_audit(
+            session,
+            action=AuditAction.USER_PASSWORD_RESET_REJECTED,
+            request=request,
+            extra={"reason": reason or "invalid"},
+        )
+        await session.commit()
+        if reason == "expired":
+            raise AppError(
+                "Password reset link has expired",
+                code=ErrorCode.PASSWORD_RESET_TOKEN_EXPIRED,
+                status_code=400,
+            )
+        if reason == "used":
+            raise AppError(
+                "Password reset link has already been used",
+                code=ErrorCode.PASSWORD_RESET_TOKEN_USED,
+                status_code=409,
+            )
+        raise AppError(
+            "Password reset link is not valid",
+            code=ErrorCode.PASSWORD_RESET_TOKEN_INVALID,
+            status_code=400,
+        )
+
+    user = consumed.user
+    user.password_hash = hash_password(payload.new_password)
+    user.session_version += 1
+    await _revoke_refresh_sessions(session, user_id=user.id, reason="password_reset")
+    await session.execute(
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.used_at.is_(None),
+        )
+        .values(used_at=consumed.reset_at)
+    )
+    await write_audit(
+        session,
+        action=AuditAction.USER_PASSWORD_RESET_SUCCEEDED,
+        request=request,
+        actor_user_id=user.id,
+        actor_email=user.email,
+        resource_type="user",
+        resource_id=user.id,
+    )
+    await session.commit()
+    clear_auth_cookies(response, settings=settings)
+    clear_csrf_cookie(response, settings=settings)
+    return PasswordResetConfirmResponse(reset_at=consumed.reset_at)
+
+
 @router.get("/me", response_model=UserPublic)
 async def me(current_user: User = Depends(get_current_user)) -> UserPublic:
     return _user_public(current_user)
@@ -703,6 +983,13 @@ async def export_my_data(
         .order_by(EmailVerificationToken.created_at.desc())
     )
     email_tokens = email_tokens_result.scalars().all()
+
+    password_reset_result = await session.execute(
+        select(PasswordResetToken)
+        .where(PasswordResetToken.user_id == current_user.id)
+        .order_by(PasswordResetToken.created_at.desc())
+    )
+    password_reset_tokens = password_reset_result.scalars().all()
 
     totp_record = await session.scalar(
         select(UserTotpSecret).where(UserTotpSecret.user_id == current_user.id)
@@ -826,6 +1113,18 @@ async def export_my_data(
             )
             for t in email_tokens
         ],
+        password_reset_tokens=[
+            PasswordResetTokenExport(
+                id=t.id,
+                created_at=t.created_at,
+                expires_at=t.expires_at,
+                used_at=t.used_at,
+                requested_ip=str(t.requested_ip) if t.requested_ip else None,
+                requested_user_agent=t.requested_user_agent,
+                reset_ip=str(t.reset_ip) if t.reset_ip else None,
+            )
+            for t in password_reset_tokens
+        ],
         mfa=MfaEnrollmentExport(
             enrolled=totp_record is not None and totp_record.disabled_at is None,
             confirmed_at=totp_record.confirmed_at if totp_record is not None else None,
@@ -907,6 +1206,7 @@ async def export_my_data(
             "audit_events": len(audit_events),
             "refresh_sessions": len(refresh_sessions),
             "email_verification_tokens": len(email_tokens),
+            "password_reset_tokens": len(password_reset_tokens),
             "usage_events": len(usage_events),
             "csp_reports": len(csp_reports),
         },
@@ -1012,6 +1312,28 @@ async def delete_my_account(
             requested_ip=None,
             requested_user_agent=None,
             confirmed_ip=None,
+        )
+    )
+    await session.execute(
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.user_id == current_user.id,
+            PasswordResetToken.used_at.is_(None),
+        )
+        .values(
+            used_at=deleted_at,
+            requested_ip=None,
+            requested_user_agent=None,
+            reset_ip=None,
+        )
+    )
+    await session.execute(
+        update(PasswordResetToken)
+        .where(PasswordResetToken.user_id == current_user.id)
+        .values(
+            requested_ip=None,
+            requested_user_agent=None,
+            reset_ip=None,
         )
     )
     await session.execute(delete(MfaRecoveryCode).where(MfaRecoveryCode.user_id == current_user.id))

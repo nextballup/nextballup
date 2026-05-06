@@ -10,13 +10,17 @@ DSAR types without operator intervention:
 
 - **Access (GDPR Art. 15 / CCPA "Right to Know"):**
   `GET /api/v1/auth/me/export`. Returns a JSON bundle containing the
-  user's profile fields, team memberships, videos they uploaded, and
-  audit events where they were the actor.
+  user's profile fields, team memberships, videos they uploaded, audit
+  events where they were the actor, auth session metadata, verification
+  and password-reset token metadata, MFA enrollment summary, owned
+  billing accounts, recorded privacy consents, and attributed CSP
+  reports. Token hashes and secret material are excluded.
 - **Erasure (GDPR Art. 17 / CCPA "Right to Delete"):**
   `DELETE /api/v1/auth/me`. Anonymizes the user's row (preserving
   audit lineage as `actor_user_id` references), clears biometric
   fields, voids the password hash, deactivates memberships, and
-  revokes every refresh session.
+  revokes every refresh session. Pending verification and password reset
+  tokens are invalidated and request IP/User-Agent fields are scrubbed.
 - **Email-verification status:** `GET /api/v1/auth/email/verify/status`
   exposes whether the account is verified and when.
 - **MFA status:** `GET /api/v1/auth/mfa/status`.

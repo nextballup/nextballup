@@ -1,6 +1,6 @@
 """Email delivery provider abstraction.
 
-The platform never embeds real provider credentials. Two providers ship in
+The platform never embeds real provider credentials. Three providers ship in
 the repo:
 
   * `logging` (default for dev/test): records each message as a JSON line
@@ -8,11 +8,12 @@ the repo:
     when the path is unset. Useful for local development and CI.
   * `noop`: drops messages on the floor. Useful for unit tests that exercise
     code paths without recording anything.
+  * `postmark`: sends transactional email through Postmark. Credentials are
+    supplied by deployment secrets, never by source control.
 
-A production deployment is expected to register a real provider (SES, SendGrid,
-Postmark, …) by registering an `EmailDeliveryProvider` instance under the
-`production` provider id. That registration intentionally lives outside the
-default codebase so credentials are never committed.
+Deployments can still register alternate providers (SES, SendGrid, …) behind
+the same narrow interface. Registration intentionally uses explicit provider
+ids so a misconfigured environment cannot instantiate arbitrary callables.
 
 `EmailMessage` is intentionally narrow: subject + plaintext body + a single
 known link. We do not render arbitrary HTML in the platform-side template
@@ -25,9 +26,12 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 from typing import Protocol
 
@@ -55,6 +59,10 @@ class EmailDeliveryProvider(Protocol):
     name: str
 
     def send(self, message: EmailMessage) -> None: ...
+
+
+class EmailDeliveryError(RuntimeError):
+    """Provider failure that is safe to surface internally without secrets."""
 
 
 class NoopDeliveryProvider:
@@ -105,9 +113,117 @@ class LoggingDeliveryProvider:
                 handle.write("\n")
 
 
+PostmarkOpener = Callable[[urllib.request.Request, float], bytes]
+
+
+def _default_postmark_opener(request: urllib.request.Request, timeout: float) -> bytes:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return bytes(response.read())
+
+
+def _postmark_error_message(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    if body:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            message = payload.get("Message")
+            code = payload.get("ErrorCode")
+            if isinstance(message, str) and message:
+                if isinstance(code, int):
+                    return f"{message} (Postmark error {code})"
+                return message
+    try:
+        phrase = HTTPStatus(exc.code).phrase
+    except ValueError:
+        phrase = "HTTP error"
+    return f"{phrase} ({exc.code})"
+
+
+class PostmarkDeliveryProvider:
+    """Transactional email provider for staging/production deployments.
+
+    The adapter sends plaintext-only messages because platform templates are
+    deliberately narrow and link-only. Postmark may render richer templates in
+    the future, but this keeps account recovery usable without committing
+    provider-specific template state to the repo.
+    """
+
+    name = "postmark"
+    _API_URL = "https://api.postmarkapp.com/email"
+
+    def __init__(
+        self,
+        *,
+        server_token: str | None,
+        from_address: str,
+        message_stream: str,
+        timeout_seconds: float,
+        opener: PostmarkOpener | None = None,
+    ) -> None:
+        token = (server_token or "").strip()
+        sender = from_address.strip()
+        stream = message_stream.strip()
+        if not token:
+            raise RuntimeError("POSTMARK_SERVER_TOKEN must be configured for Postmark delivery")
+        if not sender or sender.endswith(".invalid"):
+            raise RuntimeError(
+                "EMAIL_VERIFICATION_FROM_ADDRESS must be a verified sender for Postmark delivery"
+            )
+        if not stream:
+            raise RuntimeError("POSTMARK_MESSAGE_STREAM must be configured for Postmark delivery")
+        self._server_token = token
+        self._from_address = sender
+        self._message_stream = stream
+        self._timeout_seconds = timeout_seconds
+        self._opener = opener or _default_postmark_opener
+
+    def send(self, message: EmailMessage) -> None:
+        payload = {
+            "From": self._from_address,
+            "To": message.to_address,
+            "Subject": message.subject,
+            "TextBody": message.body_plaintext,
+            "MessageStream": self._message_stream,
+            "Metadata": {
+                **message.metadata,
+                "template_id": message.template_id,
+            },
+        }
+        request = urllib.request.Request(
+            self._API_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Postmark-Server-Token": self._server_token,
+            },
+            method="POST",
+        )
+        try:
+            self._opener(request, self._timeout_seconds)
+        except urllib.error.HTTPError as exc:
+            raise EmailDeliveryError(
+                f"Postmark rejected email delivery: {_postmark_error_message(exc)}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise EmailDeliveryError("Postmark email delivery failed: network error") from exc
+
+
 _PROVIDER_FACTORY: dict[str, Callable[[Settings], EmailDeliveryProvider]] = {
     "logging": lambda s: LoggingDeliveryProvider(log_path=s.email_delivery_log_path),
     "noop": lambda _s: NoopDeliveryProvider(),
+    "postmark": lambda s: PostmarkDeliveryProvider(
+        server_token=s.postmark_server_token,
+        from_address=s.email_verification_from_address,
+        message_stream=s.postmark_message_stream,
+        timeout_seconds=s.postmark_send_timeout_seconds,
+    ),
 }
 
 

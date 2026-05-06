@@ -29,10 +29,27 @@ step (see [CHANGE_MANAGEMENT.md](./CHANGE_MANAGEMENT.md)).
 - [ ] `COOKIE_SAMESITE=strict`.
 - [ ] `COOKIE_HOST_PREFIX=true`.
 - [ ] `COOKIE_DOMAIN` is unset (required for `__Host-` prefix).
+- [ ] `FRONTEND_APP_URL` is the exact HTTPS origin for the deployed app
+      channel and does not point at localhost. Startup validation refuses
+      staging/production localhost values.
 - [ ] Frontend reaches the API via a same-origin proxy (Next.js
       `next.config.ts` rewrite, or an equivalent edge rule).
 - [ ] CORS origins list (`CORS_ORIGINS`) is the production frontend(s)
       only. No wildcards. No HTTP origins in production.
+
+## Deployment channel
+
+- [ ] The deploy target is one of the channels in
+      [DEPLOYMENT_CHANNELS.md](./DEPLOYMENT_CHANNELS.md).
+- [ ] `nextballup.com` / `www.nextballup.com` remains a public
+      marketing/waitlist/docs surface unless the operator intentionally opens
+      public app signups.
+- [ ] `alpha.nextballup.com` is locked down at the edge and uses isolated
+      staging resources.
+- [ ] `beta.nextballup.com` is invite-only and uses isolated production-grade
+      resources.
+- [ ] Public copy does not claim production CV analytics until a commercial
+      dataset, passing eval report, and active commercial artifact exist.
 
 ## Data tier
 
@@ -61,9 +78,9 @@ step (see [CHANGE_MANAGEMENT.md](./CHANGE_MANAGEMENT.md)).
 - [ ] `REQUIRE_PRIVACY_CONSENT_FOR_SENSITIVE_UPLOADS=true`.
 - [ ] `REQUIRE_VERIFIED_EMAIL_FOR_SENSITIVE_ACTIONS=true` (this is the
       env-driven kill-switch over `should_require_verified_email_for_sensitive_actions`).
-- [ ] Email delivery provider registered (`EMAIL_DELIVERY_PROVIDER` set to
-      a real provider id; `logging` is dev-only). The real provider's keys
-      are in the deploy secret store, not in the image.
+- [ ] Email delivery provider configured (`EMAIL_DELIVERY_PROVIDER=postmark`
+      or an explicitly registered real provider; `logging`/`noop` are dev-only).
+      Provider keys are in the deploy secret store, not in the image.
 - [ ] Privacy policy / data-retention pages on the marketing site reflect
       the matrix in [DATA_RETENTION.md](./DATA_RETENTION.md).
 

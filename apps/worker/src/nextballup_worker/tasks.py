@@ -470,6 +470,7 @@ def run_cleanup_task() -> dict[str, list[str] | int]:
                 "retried_raw_video_deletes": report.retried_raw_video_deletes,
                 "expired_demo_previews": report.expired_demo_previews,
                 "pruned_email_verification_tokens": report.pruned_email_verification_tokens,
+                "pruned_password_reset_tokens": report.pruned_password_reset_tokens,
                 "pruned_csp_reports": report.pruned_csp_reports,
             }
 

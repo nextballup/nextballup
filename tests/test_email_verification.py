@@ -18,16 +18,22 @@ Coverage:
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime, timedelta
+from email.message import Message
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pytest
 from httpx import AsyncClient
 from nextballup_api.email_delivery import (
+    EmailDeliveryError,
     EmailMessage,
     LoggingDeliveryProvider,
     NoopDeliveryProvider,
+    PostmarkDeliveryProvider,
     register_email_provider,
 )
 from nextballup_api.email_verification import (
@@ -367,6 +373,102 @@ def test_noop_provider_drops_messages_silently() -> None:
             metadata={},
         )
     )
+
+
+def test_postmark_provider_sends_plaintext_message_without_logging_token() -> None:
+    captured: dict[str, object] = {}
+
+    def opener(request: urllib.request.Request, timeout: float) -> bytes:
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["headers"] = dict(request.header_items())
+        request_data = request.data
+        assert isinstance(request_data, bytes)
+        captured["body"] = json.loads(request_data.decode("utf-8"))
+        return b'{"Message":"OK"}'
+
+    provider = PostmarkDeliveryProvider(
+        server_token="postmark-secret-token",
+        from_address="no-reply@nextballup.com",
+        message_stream="outbound",
+        timeout_seconds=7.5,
+        opener=opener,
+    )
+    provider.send(
+        EmailMessage(
+            to_address="dest@example.com",
+            subject="Verify",
+            body_plaintext="Body text",
+            link_url="https://nextballup.com/verify-email?token=abc",
+            template_id="email_verification",
+            metadata={"user_id": "user-1"},
+        )
+    )
+
+    assert captured["url"] == "https://api.postmarkapp.com/email"
+    assert captured["timeout"] == 7.5
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    normalized_headers = {key.lower(): value for key, value in headers.items()}
+    assert normalized_headers["x-postmark-server-token"] == "postmark-secret-token"
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["From"] == "no-reply@nextballup.com"
+    assert body["To"] == "dest@example.com"
+    assert body["TextBody"] == "Body text"
+    assert body["MessageStream"] == "outbound"
+    assert body["Metadata"]["template_id"] == "email_verification"
+    assert "link_url" not in body["Metadata"]
+
+
+def test_postmark_provider_rejects_missing_token_or_unverified_sender() -> None:
+    with pytest.raises(RuntimeError, match="POSTMARK_SERVER_TOKEN"):
+        PostmarkDeliveryProvider(
+            server_token="",
+            from_address="no-reply@nextballup.com",
+            message_stream="outbound",
+            timeout_seconds=10.0,
+        )
+    with pytest.raises(RuntimeError, match="EMAIL_VERIFICATION_FROM_ADDRESS"):
+        PostmarkDeliveryProvider(
+            server_token="token",
+            from_address="no-reply@nextballup.invalid",
+            message_stream="outbound",
+            timeout_seconds=10.0,
+        )
+
+
+def test_postmark_provider_error_message_excludes_token() -> None:
+    def opener(request: urllib.request.Request, timeout: float) -> bytes:
+        raise urllib.error.HTTPError(
+            url=request.full_url,
+            code=422,
+            msg="Unprocessable Entity",
+            hdrs=Message(),
+            fp=BytesIO(b'{"ErrorCode":300,"Message":"Invalid recipient"}'),
+        )
+
+    provider = PostmarkDeliveryProvider(
+        server_token="postmark-secret-token",
+        from_address="no-reply@nextballup.com",
+        message_stream="outbound",
+        timeout_seconds=10.0,
+        opener=opener,
+    )
+    with pytest.raises(EmailDeliveryError) as excinfo:
+        provider.send(
+            EmailMessage(
+                to_address="bad@example.com",
+                subject="Verify",
+                body_plaintext="Body text",
+                link_url="https://nextballup.com/verify-email?token=abc",
+                template_id="email_verification",
+                metadata={},
+            )
+        )
+    message = str(excinfo.value)
+    assert "Invalid recipient" in message
+    assert "postmark-secret-token" not in message
 
 
 def test_register_provider_round_trip() -> None:

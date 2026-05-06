@@ -27,8 +27,9 @@ production data, the data class it sees, and our review status. Auditor
 
 | Vendor | Status | Notes |
 | --- | --- | --- |
-| _Stripe_ | Candidate | Interface stub lives at `apps/api/src/nextballup_api/billing.py` (`StubBillingProvider`). |
-| _SendGrid / Postmark / SES_ | Candidate | Provider abstraction at `apps/api/src/nextballup_api/email_delivery.py` accepts a registration; production deploys plug in their own provider implementation. |
+| _Stripe_ | Candidate | Billing interface lives at `apps/api/src/nextballup_api/billing.py`; `stub` is dev-only and `billing_disabled` is alpha/staging-only. |
+| Postmark | Candidate | Built-in transactional email adapter lives at `apps/api/src/nextballup_api/email_delivery.py`; requires deployment secret `POSTMARK_SERVER_TOKEN` and a verified sender address. |
+| _SendGrid / SES_ | Candidate | Alternate email providers can be registered behind the same provider abstraction if Postmark is replaced later. |
 
 ## Per-vendor onboarding checklist
 

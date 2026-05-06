@@ -115,9 +115,28 @@ host/container. The API endpoint is not a cross-process worker metrics proxy.
 
 ## Auth Routes — `/auth`
 
+### GET `/auth/registration/status`
+
+Return the deployment's registration posture without leaking invite codes or
+allowlisted emails. Public pages use this to render the correct registration
+UI; the backend remains authoritative.
+
+**Response: 200**
+```json
+{
+  "mode": "invite_only",
+  "invite_code_required": true,
+  "is_open_to_public": false
+}
+```
+
+`mode` is one of `open`, `invite_only`, `allowlist`, or `disabled`.
+
 ### POST `/auth/register`
 
-Create a new user account. User chooses role at registration.
+Create a new user account. User chooses role at registration. Deployments can
+gate this endpoint with `REGISTRATION_MODE`; staging/production refuse to boot
+with public-open registration.
 
 **Request:**
 ```json
@@ -127,7 +146,8 @@ Create a new user account. User chooses role at registration.
   "full_name": "Mike Johnson",
   "role": "coach",
   "phone": "+15551234567",       // optional
-  "institution": "Lincoln High"  // optional, free text
+  "institution": "Lincoln High", // optional, free text
+  "invite_code": "PILOT-CODE-AAAA" // required only when mode=invite_only
 }
 ```
 
@@ -136,6 +156,8 @@ Create a new user account. User chooses role at registration.
 - `email` must be unique, valid format
 - `password` minimum 8 characters, at least 1 number and 1 uppercase letter
 - `phone` and `institution` are optional, max-length-bounded free-text fields
+- `invite_code` is optional in open/allowlist/disabled modes and required in
+  `invite_only` mode
 
 **Current scope note:**
 - COPPA / parental-consent onboarding is **not** implemented in this phase.
@@ -158,7 +180,8 @@ prefixed with `__Host-` when `COOKIE_HOST_PREFIX=true` and
 `COOKIE_SECURE=true`. The refresh cookie intentionally stays unprefixed so
 it can be scoped narrowly to `/api/v1/auth/refresh`.
 
-**Errors:** 409 email exists · 422 validation failed · 429 rate limited
+**Errors:** 403 registration disabled / invite required / invite invalid /
+not allowlisted · 409 email exists · 422 validation failed · 429 rate limited
 
 ### POST `/auth/login`
 
@@ -189,6 +212,54 @@ Access, refresh, and CSRF cookies are set on the response. JWTs are never
 included in the response body.
 
 **Errors:** 401 invalid credentials · 429 rate limited (5/min)
+
+### POST `/auth/password/forgot`
+
+Request a password-reset email. The response is intentionally generic and
+does not reveal whether the email belongs to an active account.
+
+**Request:**
+```json
+{
+  "email": "coach@example.com"
+}
+```
+
+**Response: 202**
+```json
+{
+  "requested_at": "2026-05-01T00:00:00Z",
+  "delivery": "ses"
+}
+```
+
+The stored reset token is SHA-256 hashed, single-use, supersedes any
+older unused reset tokens for the same user, and expires after
+`PASSWORD_RESET_TOKEN_TTL_MINUTES`.
+
+**Errors:** 422 validation failed · 429 rate limited
+
+### POST `/auth/password/reset`
+
+Consume a password-reset token and set a new password. On success, the
+server bumps `session_version`, revokes refresh sessions with reason
+`password_reset`, marks pending reset tokens used, and clears auth/CSRF
+cookies on the response.
+
+**Request:**
+```json
+{
+  "token": "opaque-reset-token-from-email",
+  "new_password": "NewPassword1!"
+}
+```
+
+**Response: 200**
+```json
+{ "reset_at": "2026-05-01T00:00:00Z" }
+```
+
+**Errors:** 400 invalid/expired token · 409 token already used · 422 weak password
 
 ### POST `/auth/refresh`
 
@@ -229,7 +300,11 @@ Returns current user profile.
 
 GDPR Art. 15 self-serve access: returns every row keyed to the caller
 (profile, active + inactive memberships, videos they uploaded, audit
-events where they were the actor) in a single JSON bundle.
+events where they were the actor, refresh sessions, verification and
+reset-token metadata, MFA enrollment summary, owned billing accounts,
+member-team usage events, recorded privacy consents, and attributed CSP
+reports) in a single JSON bundle. Secret material and token hashes are
+not returned.
 
 **Response: 200**
 ```json
@@ -1463,7 +1538,9 @@ rejected with `403 CSRF_FAILED` before the router runs.
 Bearer-authenticated requests are CSRF-exempt by construction — a
 cross-origin browser attacker cannot set `Authorization` headers. The
 following paths are also exempt so the auth bootstrap still works:
-`/auth/login`, `/auth/register`, `/auth/refresh`.
+`/auth/login`, `/auth/register`, `/auth/refresh`,
+`/auth/password/forgot`, `/auth/password/reset`, and
+`/_csp-report`.
 
 ### Error responses
 

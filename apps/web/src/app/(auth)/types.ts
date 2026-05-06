@@ -21,3 +21,20 @@ export type RegisterResponse = {
 export type RefreshResponse = {
   refreshed_at: string;
 };
+
+export type PasswordResetRequestResponse = {
+  requested_at: string;
+  delivery: string;
+};
+
+export type PasswordResetConfirmResponse = {
+  reset_at: string;
+};
+
+export type RegistrationMode = "open" | "invite_only" | "allowlist" | "disabled";
+
+export type RegistrationStatusResponse = {
+  mode: RegistrationMode;
+  invite_code_required: boolean;
+  is_open_to_public: boolean;
+};

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -42,11 +42,20 @@ class RegisterRequest(BaseModel):
     role: UserRole
     phone: str | None = Field(default=None, max_length=20)
     institution: str | None = Field(default=None, max_length=255)
+    invite_code: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator("password")
     @classmethod
     def _check_password(cls, value: str) -> str:
         return _validate_password(value)
+
+    @field_validator("invite_code", mode="before")
+    @classmethod
+    def _trim_invite_code(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
     @field_validator("role")
     @classmethod
@@ -129,3 +138,44 @@ class RefreshResponse(BaseModel):
     """
 
     refreshed_at: datetime
+
+
+class PasswordResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+
+
+class PasswordResetRequestResponse(BaseModel):
+    requested_at: datetime
+    delivery: str
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=16, max_length=256)
+    new_password: Password
+
+    @field_validator("new_password")
+    @classmethod
+    def _check_password(cls, value: str) -> str:
+        return _validate_password(value)
+
+
+class PasswordResetConfirmResponse(BaseModel):
+    reset_at: datetime
+
+
+class RegistrationStatusResponse(BaseModel):
+    """Whether the public can call /auth/register and how.
+
+    The frontend uses this to render the right UI: hide the CTA when
+    registration is disabled, show an invite-code field when invite_only,
+    or expose an allowlist hint. The endpoint deliberately does **not**
+    leak the configured codes or allowlisted emails.
+    """
+
+    mode: Literal["open", "invite_only", "allowlist", "disabled"]
+    invite_code_required: bool
+    is_open_to_public: bool

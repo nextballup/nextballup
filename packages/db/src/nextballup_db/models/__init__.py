@@ -22,6 +22,7 @@ from nextballup_db.models.cv import (
 from nextballup_db.models.email_verification import EmailVerificationToken
 from nextballup_db.models.game import Game
 from nextballup_db.models.mfa import MfaRecoveryCode, UserTotpSecret
+from nextballup_db.models.password_reset import PasswordResetToken
 from nextballup_db.models.team import Team, TeamInvite, TeamMembership, TeamPrivacyConsent
 from nextballup_db.models.user import User
 from nextballup_db.models.video import ProcessingJob, Video
@@ -36,6 +37,7 @@ __all__ = [
     "EmailVerificationToken",
     "Game",
     "MfaRecoveryCode",
+    "PasswordResetToken",
     "Plan",
     "ProcessingJob",
     "RefreshSession",

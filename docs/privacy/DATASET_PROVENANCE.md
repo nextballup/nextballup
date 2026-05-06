@@ -46,6 +46,19 @@ Datasets with `commercial_use_allowed=false` may **not** be referenced
 by an artifact whose `commercial_use_allowed=true`. Add a periodic
 check to the promotion CI.
 
+## Pre-commercial public datasets
+
+Permissive labels on a public dataset are not enough for production model
+lineage if the underlying media came from third-party broadcasts or league
+footage. BARD, SpaceJam, and similar basketball research datasets may be used
+for internal research, taxonomy design, pre-labeling experiments, and proof of
+concept work only when recorded as `demo_only=true` and
+`commercial_use_allowed=false`.
+
+Do not promote an artifact trained on those sources into beta/production
+analytics unless counsel and the operator approve the media-rights position
+and the dataset registry is updated with a structured evidence reference.
+
 ## Promotion gate
 
 Before flipping an artifact's `status` to `active`:

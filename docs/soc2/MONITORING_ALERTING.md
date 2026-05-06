@@ -16,6 +16,7 @@ which signals matter, how they're observed, and which fire pages.
 | Auth failure rate (`auth.login.failed`) | Audit log | > 100/min from one IP → page | Credential stuffing detection. |
 | Refresh-replay (`auth.refresh.failed` with `replay_detected` reason) | Audit log | Any spike → page | Account compromise. |
 | Email delivery failure (`auth.email_verification.rejected` with `delivery_failed`) | Audit log | > 5/hour → page | Provider outage. |
+| Password reset delivery failure (`auth.password_reset.rejected` with `delivery_failed`) | Audit log | > 5/hour → page | Provider outage / account recovery broken. |
 | MFA failures (`auth.mfa.totp.disabled` with invalid code) | Audit log | > 10/min/user → page | Targeted attack on a known account. |
 | Worker queue depth | Redis | > 100 pending dispatches → page | Worker stalled. |
 | Worker stale-job recoveries | Audit log | > 5/hour → page | Worker crash loop. |

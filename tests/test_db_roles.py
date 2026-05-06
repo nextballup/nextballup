@@ -69,6 +69,45 @@ async def test_app_role_has_crud_on_tenant_tables(db_session: AsyncSession) -> N
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_password_reset_tokens_have_force_rls_and_expected_policies(
+    db_session: AsyncSession,
+) -> None:
+    rel = (
+        await db_session.execute(
+            text(
+                "SELECT relrowsecurity, relforcerowsecurity "
+                "FROM pg_class WHERE oid = 'password_reset_tokens'::regclass"
+            )
+        )
+    ).one()
+    assert tuple(rel) == (True, True)
+
+    rows = (
+        await db_session.execute(
+            text(
+                """
+                SELECT policyname, cmd, qual, with_check
+                FROM pg_policies
+                WHERE schemaname = 'public'
+                  AND tablename = 'password_reset_tokens'
+                """
+            )
+        )
+    ).mappings()
+    policies = {row["policyname"]: row for row in rows}
+    assert set(policies) == {
+        "password_reset_tokens_select_access",
+        "password_reset_tokens_insert_owner",
+        "password_reset_tokens_update_access",
+        "password_reset_tokens_delete_admin",
+    }
+    assert policies["password_reset_tokens_select_access"]["cmd"] == "SELECT"
+    assert "app.current_password_reset_token_hash" in (
+        policies["password_reset_tokens_select_access"]["qual"] or ""
+    )
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_app_role_has_append_only_table_grants(db_session: AsyncSession) -> None:
     for table in ("audit_logs", "csp_reports", "usage_events"):
         privs = {
@@ -137,5 +176,5 @@ def test_runtime_database_url_requires_explicit_runtime_role_in_production() -> 
         jwt_private_key="test-private-key",
         jwt_public_key="test-public-key",
     )
-    with pytest.raises(RuntimeError, match="DATABASE_URL_RUNTIME must be configured"):
+    with pytest.raises(RuntimeError, match="DATABASE_URL_RUNTIME or DATABASE_RUNTIME_PASSWORD"):
         settings.runtime_database_url()

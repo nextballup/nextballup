@@ -2,11 +2,14 @@
 
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { apiJson } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
 import { useRetryAfterGate } from "@/lib/retry-after";
-import type { RegisterResponse } from "@/app/(auth)/types";
+import type {
+  RegisterResponse,
+  RegistrationStatusResponse,
+} from "@/app/(auth)/types";
 
 type Role = "coach" | "player";
 
@@ -20,13 +23,53 @@ export default function RegisterPage() {
   const [password, setPassword] = useState("");
   const [fullName, setFullName] = useState("");
   const [institution, setInstitution] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<RegistrationStatusResponse | null>(null);
   const { retryAfterSeconds, retryBlocked, startRetryAfter } = useRetryAfterGate();
+
+  useEffect(() => {
+    let cancelled = false;
+    apiJson<RegistrationStatusResponse>("/auth/registration/status", {
+      method: "GET",
+      cache: "no-store",
+      noRefreshOn401: true,
+    })
+      .then((response) => {
+        if (!cancelled) setStatus(response);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setStatus({
+            mode: "disabled",
+            invite_code_required: false,
+            is_open_to_public: false,
+          });
+          setError("Registration status is unavailable. Please try again later.");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const inviteRequired = status?.invite_code_required ?? false;
+  const statusPending = status === null;
+  const registrationDisabled = status?.mode === "disabled";
+  const submitLabel = statusPending
+    ? "Checking registration"
+    : registrationDisabled
+      ? "Registration closed"
+      : retryBlocked
+        ? `Try again in ${retryAfterSeconds}s`
+        : submitting
+          ? "Creating account…"
+          : "Create account";
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (retryBlocked) return;
+    if (retryBlocked || statusPending || registrationDisabled) return;
     setSubmitting(true);
     setError(null);
     try {
@@ -38,6 +81,7 @@ export default function RegisterPage() {
           full_name: fullName,
           role,
           institution: institution || undefined,
+          invite_code: inviteRequired ? inviteCode : undefined,
         },
         noRefreshOn401: true,
       });
@@ -62,6 +106,16 @@ export default function RegisterPage() {
           Coaches create teams and upload film. Players join via invite.
         </p>
       </div>
+      {(statusPending || registrationDisabled) && (
+        <p
+          role="status"
+          className="rounded-md border border-[color:var(--color-nbu-border)] p-3 text-sm text-[color:var(--color-nbu-text-muted)]"
+        >
+          {statusPending
+            ? "Checking registration availability."
+            : "Registration is currently closed on this deployment. If you have an existing account, you can still sign in."}
+        </p>
+      )}
       <div
         role="radiogroup"
         aria-label="Account type"
@@ -135,6 +189,21 @@ export default function RegisterPage() {
             className="w-full rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 outline-none focus:border-[color:var(--color-nbu-text)]"
           />
         </label>
+        {inviteRequired && (
+          <label className="block space-y-1">
+            <span className="text-sm font-medium">Invite code</span>
+            <input
+              required
+              autoComplete="off"
+              value={inviteCode}
+              onChange={(e) => setInviteCode(e.target.value)}
+              className="w-full rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 outline-none focus:border-[color:var(--color-nbu-text)]"
+            />
+            <span className="block text-xs text-[color:var(--color-nbu-text-muted)]">
+              Pilot users received this code from NextBallUp directly.
+            </span>
+          </label>
+        )}
         {error && (
           <p role="alert" className="text-sm text-[color:var(--color-nbu-error)]">
             {error}
@@ -142,14 +211,10 @@ export default function RegisterPage() {
         )}
         <button
           type="submit"
-          disabled={submitting || retryBlocked}
+          disabled={submitting || retryBlocked || statusPending || registrationDisabled}
           className="w-full rounded-md bg-[color:var(--color-nbu-text)] px-4 py-2 text-sm font-medium text-[color:var(--color-nbu-bg)] transition hover:opacity-90 disabled:opacity-50"
         >
-          {retryBlocked
-            ? `Try again in ${retryAfterSeconds}s`
-            : submitting
-              ? "Creating account…"
-              : "Create account"}
+          {submitLabel}
         </button>
       </form>
       <p className="text-center text-sm text-[color:var(--color-nbu-text-muted)]">

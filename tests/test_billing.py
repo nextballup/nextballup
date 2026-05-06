@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from httpx import AsyncClient
 from nextballup_api.billing import (
+    BillingDisabledProvider,
     StubBillingProvider,
     artifact_meets_entitlement,
     check_video_storage_quota,
@@ -47,6 +48,7 @@ from nextballup_core.enums import (
     TeamLevel,
     UserRole,
 )
+from nextballup_core.errors import ForbiddenError
 from nextballup_core.settings import Settings, get_settings
 from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.billing import (
@@ -464,6 +466,25 @@ def test_stub_provider_returns_obvious_placeholder_url() -> None:
     # broken rather than silently shipping the user nowhere useful.
     assert out.checkout_url.startswith("about:blank#stub-checkout-")
     assert "pro" in out.checkout_url
+
+
+def test_billing_disabled_provider_fails_closed() -> None:
+    provider = BillingDisabledProvider()
+    with pytest.raises(ForbiddenError, match="Billing is disabled"):
+        provider.create_checkout_session(
+            billing_account_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+            plan_code="pro",
+            success_url="https://example.test/success",
+            cancel_url="https://example.test/cancel",
+        )
+    with pytest.raises(ForbiddenError, match="Billing is disabled"):
+        provider.cancel_subscription(external_subscription_id="sub_123")
+
+
+def test_billing_disabled_provider_is_registered() -> None:
+    fake_settings = Settings.model_construct(billing_provider="billing_disabled")
+    resolved = get_billing_provider(fake_settings)
+    assert isinstance(resolved, BillingDisabledProvider)
 
 
 def test_billing_provider_registry_round_trip() -> None:

@@ -75,6 +75,13 @@ describe("auth Retry-After handling", () => {
 
   it("disables registration submission while rate-limited", async () => {
     server.use(
+      http.get("/api/v1/auth/registration/status", () =>
+        HttpResponse.json({
+          mode: "open",
+          invite_code_required: false,
+          is_open_to_public: true,
+        }),
+      ),
       http.post("/api/v1/auth/register", () =>
         HttpResponse.json(
           { error: { code: "RATE_LIMITED", message: "Too many attempts" } },

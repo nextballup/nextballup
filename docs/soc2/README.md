@@ -13,6 +13,7 @@ the platform does today.
 | Document | Purpose |
 | --- | --- |
 | [PRODUCTION_READINESS.md](./PRODUCTION_READINESS.md) | Pre-deploy checklist: secrets, dependencies, monitoring, key rotation. |
+| [DEPLOYMENT_CHANNELS.md](./DEPLOYMENT_CHANNELS.md) | Domain/channel split for public, alpha, and beta deployments. |
 | [INCIDENT_RESPONSE.md](./INCIDENT_RESPONSE.md) | Severity matrix, on-call rotation, declaration / escalation playbook, postmortem template. |
 | [BACKUP_RESTORE.md](./BACKUP_RESTORE.md) | Backup cadence, retention, restore drill cadence, verification scripts. |
 | [ACCESS_REVIEW.md](./ACCESS_REVIEW.md) | Who reviews what, on what cadence. Quarterly checklist + evidence shape. |

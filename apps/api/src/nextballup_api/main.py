@@ -4,11 +4,14 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from nextballup_api import __version__
+from nextballup_api.billing import get_billing_provider
+from nextballup_api.email_delivery import get_email_provider
 from nextballup_api.errors import register_exception_handlers
 from nextballup_api.middleware.csrf import CsrfMiddleware
 from nextballup_api.middleware.request_id import RequestIDMiddleware, current_request_id
@@ -97,13 +100,25 @@ def _validate_startup_secrets() -> None:
             )
         if settings.email_delivery_provider in {"logging", "noop"}:
             failures.append(
-                "EMAIL_DELIVERY_PROVIDER must be a registered production provider "
-                "in staging/production"
+                "EMAIL_DELIVERY_PROVIDER must be a real registered provider in staging/production"
             )
+        else:
+            try:
+                get_email_provider(settings)
+            except RuntimeError as exc:
+                failures.append(str(exc))
         if settings.billing_provider == "stub":
+            failures.append("BILLING_PROVIDER must not be 'stub' in staging/production")
+        elif settings.app_env == "production" and settings.billing_provider == "billing_disabled":
             failures.append(
-                "BILLING_PROVIDER must be a real registered provider in staging/production"
+                "BILLING_PROVIDER must be a real registered provider in production "
+                "(`billing_disabled` is alpha/staging only)"
             )
+        else:
+            try:
+                get_billing_provider(settings)
+            except RuntimeError as exc:
+                failures.append(str(exc))
         if settings.observability_metrics_enabled and not settings.observability_metrics_token:
             failures.append(
                 "OBSERVABILITY_METRICS_TOKEN must be configured when metrics are enabled"
@@ -112,6 +127,28 @@ def _validate_startup_secrets() -> None:
             failures.append(
                 "COOKIE_DOMAIN must be unset in staging/production when using __Host- cookies"
             )
+        # docs/soc2/DEPLOYMENT_CHANNELS.md requires alpha/beta to be locked
+        # at the edge or invite-only; refuse to boot a non-dev channel that
+        # leaves /auth/register open to the public.
+        if settings.registration_mode == "open":
+            failures.append(
+                "REGISTRATION_MODE must not be 'open' in staging/production "
+                "(public/alpha/beta channels require invite_only, allowlist, or disabled)"
+            )
+        if settings.registration_mode == "invite_only" and not settings.registration_invite_codes:
+            failures.append(
+                "REGISTRATION_INVITE_CODES must be configured when REGISTRATION_MODE='invite_only'"
+            )
+        if settings.registration_mode == "allowlist" and not settings.registration_email_allowlist:
+            failures.append(
+                "REGISTRATION_EMAIL_ALLOWLIST must be configured when REGISTRATION_MODE='allowlist'"
+            )
+        frontend_url = urlparse(settings.frontend_app_url)
+        frontend_host = (frontend_url.hostname or "").lower()
+        if frontend_url.scheme not in {"http", "https"} or not frontend_url.netloc:
+            failures.append("FRONTEND_APP_URL must be an absolute http/https URL")
+        elif frontend_host in {"localhost", "127.0.0.1", "::1"}:
+            failures.append("FRONTEND_APP_URL must not point at localhost in staging/production")
         if failures:
             raise RuntimeError(" / ".join(failures))
     if settings.cv_demo_preview_enabled and settings.app_env not in ("development", "test"):

@@ -104,6 +104,16 @@ class EmailVerificationTokenExport(BaseModel):
     confirmed_ip: str | None
 
 
+class PasswordResetTokenExport(BaseModel):
+    id: uuid.UUID
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None
+    requested_ip: str | None
+    requested_user_agent: str | None
+    reset_ip: str | None
+
+
 class MfaEnrollmentExport(BaseModel):
     enrolled: bool
     confirmed_at: datetime | None
@@ -172,6 +182,7 @@ class UserDataExport(BaseModel):
     audit_events: list[AuditEventExport]
     refresh_sessions: list[RefreshSessionExport]
     email_verification_tokens: list[EmailVerificationTokenExport]
+    password_reset_tokens: list[PasswordResetTokenExport]
     mfa: MfaEnrollmentExport
     billing_accounts_owned: list[BillingAccountExport]
     usage_events_for_member_teams: list[UsageEventExport]

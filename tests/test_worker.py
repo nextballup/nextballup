@@ -30,6 +30,7 @@ from nextballup_worker.runtime import (
     cleanup_abandoned_uploads,
     cleanup_email_verification_tokens,
     cleanup_expired_raw_videos,
+    cleanup_password_reset_tokens,
     complete_job,
     dispatch_pending_jobs,
     execute_cv_stage,
@@ -67,6 +68,7 @@ from nextballup_core.errors import ConflictError, ServiceUnavailableError
 from nextballup_core.settings import Settings, get_settings, reload_settings
 from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.email_verification import EmailVerificationToken
+from nextballup_db.models.password_reset import PasswordResetToken
 from nextballup_db.models.user import User
 from nextballup_db.models.video import ProcessingJob, Video
 
@@ -422,6 +424,59 @@ async def test_cleanup_email_verification_tokens_prunes_used_or_expired_tokens(
     assert set(remaining.all()) == {"3" * 64}
     audit = await db_session.scalar(
         select(AuditLog).where(AuditLog.action == AuditAction.USER_EMAIL_VERIFICATION_TOKENS_PRUNED)
+    )
+    assert audit is not None
+    assert (audit.extra or {}).get("count") == 2
+    assert (audit.extra or {}).get("criterion") == "used_or_expired"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_cleanup_password_reset_tokens_prunes_used_or_expired_tokens(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    email = "password-token-cleanup@example.com"
+    response = await storage_client.post(f"{API}/auth/register", json=_coach(email))
+    assert response.status_code == 201, response.text
+    user = await db_session.scalar(select(User).where(User.email == email))
+    assert user is not None
+    now = datetime.now(tz=UTC)
+    expired = PasswordResetToken(
+        user_id=user.id,
+        token_hash="a" * 64,
+        expires_at=now - timedelta(minutes=1),
+        created_at=now - timedelta(days=1),
+    )
+    used = PasswordResetToken(
+        user_id=user.id,
+        token_hash="b" * 64,
+        expires_at=now + timedelta(minutes=30),
+        used_at=now,
+        created_at=now - timedelta(minutes=5),
+    )
+    active = PasswordResetToken(
+        user_id=user.id,
+        token_hash="c" * 64,
+        expires_at=now + timedelta(minutes=30),
+        created_at=now - timedelta(minutes=5),
+    )
+    db_session.add_all([expired, used, active])
+    await db_session.flush()
+
+    pruned = await cleanup_password_reset_tokens(
+        db_session,
+        settings=Settings(),
+        request_id="test.password_token_cleanup",
+    )
+    assert pruned == 2
+    remaining = await db_session.scalars(
+        select(PasswordResetToken.token_hash).where(
+            PasswordResetToken.token_hash.in_(["a" * 64, "b" * 64, "c" * 64])
+        )
+    )
+    assert set(remaining.all()) == {"c" * 64}
+    audit = await db_session.scalar(
+        select(AuditLog).where(AuditLog.action == AuditAction.USER_PASSWORD_RESET_TOKENS_PRUNED)
     )
     assert audit is not None
     assert (audit.extra or {}).get("count") == 2
@@ -1471,7 +1526,7 @@ def test_worker_startup_requires_runtime_db_role_in_production(
     monkeypatch.setenv("DATABASE_URL_RUNTIME", "")
     reload_settings()
     try:
-        with pytest.raises(RuntimeError, match="DATABASE_URL_RUNTIME must be configured"):
+        with pytest.raises(RuntimeError, match="DATABASE_URL_RUNTIME or DATABASE_RUNTIME_PASSWORD"):
             _ensure_runtime_broker_configured()
     finally:
         monkeypatch.setenv("APP_ENV", "test")
