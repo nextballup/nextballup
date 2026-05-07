@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
+import { CancelUploadButton } from "@/components/cancel-upload-button";
 import { apiJson } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
 import {
@@ -89,6 +90,7 @@ export function VideoPlaybackView({
   return (
     <div className="space-y-4">
       <PlaybackPanel video={video} />
+      <PendingUploadRecoveryPanel video={video} viewerRole={viewerRole} />
       <DemoPreviewPanel video={video} viewerRole={viewerRole} />
       <MetadataPanel video={video} />
       <ProcessingPanel
@@ -97,6 +99,38 @@ export function VideoPlaybackView({
         viewerRole={viewerRole}
       />
     </div>
+  );
+}
+
+function PendingUploadRecoveryPanel({
+  video,
+  viewerRole,
+}: {
+  video: VideoDetailResponse;
+  viewerRole: UserRole | null;
+}) {
+  const queryClient = useQueryClient();
+  const canCancel = viewerRole === "coach" || viewerRole === "admin";
+  if (video.status !== "pending_upload" || !canCancel) {
+    return null;
+  }
+  return (
+    <section className="space-y-2 rounded-lg border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] p-4 text-sm">
+      <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+        Upload not finalized
+      </h2>
+      <p className="text-[color:var(--color-nbu-text-muted)]">
+        This upload is still reserving team quota. If the browser upload is no
+        longer running, cancel it to release the slot and start a fresh upload.
+      </p>
+      <CancelUploadButton
+        videoId={video.id}
+        onCancelled={() => {
+          queryClient.invalidateQueries({ queryKey: ["video", video.id] });
+          queryClient.invalidateQueries({ queryKey: ["video-status", video.id] });
+        }}
+      />
+    </section>
   );
 }
 
@@ -223,9 +257,9 @@ function PlaybackPanel({ video }: { video: VideoDetailResponse }) {
           </p>
         ) : (
           <p className="mt-1">
-            The worker is still processing this upload. Status polls
-            automatically — you will see a player here as soon as the
-            mezzanine output is ready.
+            {video.status === "pending_upload"
+              ? "The original browser upload has not been finalized yet. If it is stuck, cancel it to release quota and start a fresh upload."
+              : "The worker is still processing this upload. Status polls automatically; you will see a player here as soon as the mezzanine output is ready."}
           </p>
         )}
       </div>

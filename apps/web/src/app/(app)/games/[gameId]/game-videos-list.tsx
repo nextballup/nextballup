@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { CancelUploadButton } from "@/components/cancel-upload-button";
 import { serverApiOptional } from "@/lib/api-server";
 import type { VideoListResponse } from "@/lib/contract";
 import { PLAYBACK_STATUS_LABELS } from "@/lib/video-status";
@@ -64,9 +65,14 @@ export async function GameVideosList({ gameId }: { gameId: string }) {
                   {video.camera_position ? ` · ${video.camera_position}` : ""}
                 </div>
               </div>
-              <span className="rounded-full border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
-                {PLAYBACK_STATUS_LABELS[video.playback_status] ?? video.playback_status}
-              </span>
+              <div className="flex items-center gap-2">
+                {video.status === "pending_upload" ? (
+                  <CancelUploadButton videoId={video.id} compact />
+                ) : null}
+                <span className="rounded-full border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+                  {PLAYBACK_STATUS_LABELS[video.playback_status] ?? video.playback_status}
+                </span>
+              </div>
             </li>
           ))}
         </ul>

@@ -351,7 +351,7 @@ def raw_video_retention_days(
 async def videos_used_this_period(
     session: AsyncSession, *, billing_account_id: uuid.UUID, period_start: datetime
 ) -> int:
-    return int(
+    used = int(
         await session.scalar(
             select(func.coalesce(func.sum(UsageEvent.quantity), 0)).where(
                 UsageEvent.billing_account_id == billing_account_id,
@@ -361,6 +361,7 @@ async def videos_used_this_period(
         )
         or 0
     )
+    return max(0, used)
 
 
 async def storage_bytes_reserved(session: AsyncSession, *, billing_account_id: uuid.UUID) -> int:
@@ -404,6 +405,33 @@ async def record_usage(
     session.add(event)
     await session.flush()
     return event
+
+
+async def release_video_upload_quota_reservation(
+    session: AsyncSession,
+    *,
+    team_id: uuid.UUID,
+    video_id: uuid.UUID,
+    reason: str,
+) -> UsageEvent | None:
+    """Release the monthly upload slot reserved at presign time.
+
+    The platform reserves one upload-count unit before issuing storage URLs so
+    clients cannot mint unlimited presigned uploads. If that upload never
+    finalizes and is explicitly cancelled or abandoned, we write a compensating
+    usage event instead of mutating the original ledger row.
+    """
+    plan_ctx = await resolve_team_plan(session, team_id=team_id)
+    if plan_ctx is None:
+        return None
+    return await record_usage(
+        session,
+        billing_account_id=plan_ctx.account_id,
+        event_key="video.upload.initiated",
+        quantity=-1,
+        team_id=team_id,
+        metadata={"video_id": str(video_id), "reason": reason},
+    )
 
 
 @dataclass(frozen=True)

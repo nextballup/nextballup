@@ -17,6 +17,7 @@ from nextballup_api.billing import (
     check_video_upload_quota,
     quota_exceeded_error,
     record_usage,
+    release_video_upload_quota_reservation,
     resolve_team_plan,
 )
 from nextballup_api.demo_preview import (
@@ -988,6 +989,12 @@ async def cancel_upload(
     video.status = VideoStatus.FAILED
     video.upload_id = None
     video.upload_expires_at = None
+    await release_video_upload_quota_reservation(
+        session,
+        team_id=video.team_id,
+        video_id=video.id,
+        reason="user_cancelled",
+    )
     await write_audit(
         session,
         action=AuditAction.VIDEO_UPLOAD_ABANDONED,

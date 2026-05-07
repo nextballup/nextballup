@@ -978,7 +978,7 @@ async def test_cancel_multipart_upload_aborts_storage_and_marks_failed(
     fake_storage: FakeStorage,
     db_session: AsyncSession,
 ) -> None:
-    _, game = await _setup_coach_team_game(
+    team, game = await _setup_coach_team_game(
         storage_client, coach_email="cancel-multipart@example.com"
     )
     initiate = (
@@ -998,6 +998,13 @@ async def test_cancel_multipart_upload_aborts_storage_and_marks_failed(
     assert video.status is VideoStatus.FAILED
     assert video.upload_id is None
     assert video.upload_expires_at is None
+    usage_sum = await db_session.scalar(
+        select(func.coalesce(func.sum(UsageEvent.quantity), 0)).where(
+            UsageEvent.team_id == uuid.UUID(team["id"]),
+            UsageEvent.event_key == "video.upload.initiated",
+        )
+    )
+    assert usage_sum == 0
     audit = await db_session.scalar(
         select(AuditLog).where(
             AuditLog.resource_id == video_id,

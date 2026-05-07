@@ -67,6 +67,7 @@ from nextballup_core.enums import (
 from nextballup_core.errors import ConflictError, ServiceUnavailableError
 from nextballup_core.settings import Settings, get_settings, reload_settings
 from nextballup_db.models.audit import AuditLog
+from nextballup_db.models.billing import UsageEvent
 from nextballup_db.models.email_verification import EmailVerificationToken
 from nextballup_db.models.password_reset import PasswordResetToken
 from nextballup_db.models.user import User
@@ -1133,6 +1134,13 @@ async def test_cleanup_abandoned_uploads_aborts_multipart_and_marks_failed(
     video_after = await _load_video(db_session, video_id)
     assert video_after.status is VideoStatus.FAILED
     assert video_after.upload_id is None
+    usage_sum = await db_session.scalar(
+        select(func.coalesce(func.sum(UsageEvent.quantity), 0)).where(
+            UsageEvent.team_id == uuid.UUID(team["id"]),
+            UsageEvent.event_key == "video.upload.initiated",
+        )
+    )
+    assert usage_sum == 0
 
     assert fake_storage.aborted_multiparts, "abort_multipart was not invoked"
     assert fake_storage.aborted_multiparts[-1]["upload_id"] == original_upload_id

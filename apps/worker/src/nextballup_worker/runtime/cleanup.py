@@ -4,6 +4,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from nextballup_api.billing import release_video_upload_quota_reservation
 from nextballup_api.storage import (
     StoragePresigner,
     get_storage_presigner,
@@ -164,6 +165,12 @@ async def cleanup_abandoned_uploads(
                 upload_id=None,
                 upload_expires_at=None,
             )
+        )
+        await release_video_upload_quota_reservation(
+            session,
+            team_id=video.team_id,
+            video_id=video.id,
+            reason="abandoned_upload_cleanup",
         )
         await write_worker_audit(
             session,

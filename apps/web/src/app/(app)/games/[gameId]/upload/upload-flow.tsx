@@ -563,7 +563,7 @@ function describeInitiationError(err: ApiError): string {
     case "STORAGE_FAILURE":
       return "Object storage rejected the upload setup. Check the alpha R2 endpoint, bucket, token permissions, and CORS settings.";
     case "BILLING_QUOTA_EXCEEDED":
-      return "This team has reached its current upload or storage quota.";
+      return "This team has reached its current upload or storage quota. Cancel any stuck pending uploads on the game page, then try again.";
     case "INVALID_CONTENT_TYPE":
       return "Unsupported file type. Use MP4, MOV, or MKV.";
     case "CONTENT_TYPE_EXTENSION_MISMATCH":

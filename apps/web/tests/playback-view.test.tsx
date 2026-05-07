@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, act, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
@@ -8,6 +8,12 @@ import type {
   VideoDetailResponse,
 } from "@/lib/contract";
 import { server } from "./setup";
+
+const refresh = vi.fn();
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ refresh }),
+}));
 
 function wrap(ui: React.ReactElement) {
   const client = new QueryClient({
@@ -91,6 +97,43 @@ describe("VideoPlaybackView", () => {
     expect(
       screen.getByText(/Playback not available yet/i),
     ).toBeInTheDocument();
+  });
+
+  it("lets coaches cancel a stuck pending upload from the detail page", async () => {
+    const video = baseVideo({
+      status: "pending_upload",
+      playback_status: "uploading",
+      processing: { transcode: "pending" },
+    });
+    let cancelled = false;
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "pending_upload",
+          playback_status: "uploading",
+          stage: null,
+          progress_percent: 0,
+          stages: { transcode: { status: "pending" } },
+        }),
+      ),
+      http.post("/api/v1/videos/v1/cancel-upload", () => {
+        cancelled = true;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    expect(screen.getByText("Upload not finalized")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /cancel upload/i }));
+
+    await waitFor(() => {
+      expect(cancelled).toBe(true);
+    });
+    expect(refresh).toHaveBeenCalled();
   });
 
   it("explains processed-but-missing artifacts without implying raw passthrough playback", async () => {
