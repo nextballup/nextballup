@@ -285,6 +285,58 @@ async def test_create_browser_mezzanine_hashes_and_uploads_output_metadata(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_create_browser_mezzanine_uses_configured_media_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = _MP4_PAYLOAD + b"scratch-object"
+    output_payload = b"browser-safe-mp4"
+    video = Video(
+        id=uuid.uuid4(),
+        team_id=uuid.uuid4(),
+        storage_key_raw="raw/team/video/input.mp4",
+        filename="input.mp4",
+        content_type="video/mp4",
+    )
+    storage = _DownloadedObjectStorage(payload)
+    scratch_dir = tmp_path / "media-scratch"
+    seen_output_path: Path | None = None
+
+    def _fake_run_subprocess(**kwargs: Any) -> None:
+        nonlocal seen_output_path
+        cmd = kwargs["cmd"]
+        seen_output_path = Path(cmd[-1])
+        assert seen_output_path.is_relative_to(scratch_dir)
+        Path(cmd[-1]).write_bytes(output_payload)
+
+    monkeypatch.setattr(
+        media_module, "_select_transcoder", lambda _settings: ("ffmpeg", ["ffmpeg"])
+    )
+    monkeypatch.setattr(media_module, "_run_subprocess", _fake_run_subprocess)
+    monkeypatch.setattr(
+        media_module,
+        "_probe_output_sync",
+        lambda _path, _settings: SimpleNamespace(
+            duration_seconds=1.0,
+            width=640,
+            height=360,
+            fps=30.0,
+            codec="h264",
+        ),
+    )
+
+    artifact = await create_browser_mezzanine(
+        video=video,
+        presigner=storage,
+        settings=get_settings().model_copy(update={"worker_media_temp_dir": scratch_dir}),
+    )
+
+    assert artifact.output_size_bytes == len(output_payload)
+    assert seen_output_path is not None
+    assert scratch_dir.exists()
+    assert list(scratch_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_create_browser_mezzanine_rejects_magic_type_mismatch() -> None:
     video = Video(
         id=uuid.uuid4(),

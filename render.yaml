@@ -71,6 +71,10 @@ services:
     dockerContext: .
     dockerCommand: /bin/sh scripts/render_start_worker.sh
     maxShutdownDelaySeconds: 300
+    disk:
+      name: alpha-worker-media-scratch
+      mountPath: /var/data
+      sizeGB: 20
     envVars:
       - fromGroup: nextballup-alpha-backend-common
       - fromGroup: nextballup-alpha-shared-secrets
@@ -103,6 +107,8 @@ services:
         value: nextballup-alpha-raw
       - key: S3_REGION
         value: auto
+      - key: WORKER_MEDIA_TEMP_DIR
+        value: /var/data/nextballup-transcode
 
   - type: worker
     name: nextballup-alpha-beat

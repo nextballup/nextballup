@@ -114,6 +114,12 @@ shape that the production checklist expects. Keep
 `WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED=true` for production/beta transcode
 workers on infrastructure that supports that hardened container profile.
 
+The worker must not use Render's small `/tmp` volume for full-game transcode
+scratch space. The Blueprint attaches `alpha-worker-media-scratch` at
+`/var/data` and sets `WORKER_MEDIA_TEMP_DIR=/var/data/nextballup-transcode`.
+If a worker event says `/tmp exceeded the limit of 2GB`, the worker is not on
+the current Blueprint/env or the scratch disk is missing.
+
 ## Alpha Detector Preview
 
 The alpha detector preview is disabled by default and must stay separate from

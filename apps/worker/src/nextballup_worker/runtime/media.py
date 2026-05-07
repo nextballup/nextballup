@@ -396,6 +396,25 @@ def _probe_output_sync(output_path: Path, settings: Settings) -> _ProbeResult:
     )
 
 
+def _media_temp_parent(settings: Settings) -> str | None:
+    if settings.worker_media_temp_dir is None:
+        return None
+    temp_parent = settings.worker_media_temp_dir.expanduser()
+    try:
+        temp_parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PermanentProcessingError(
+            "Worker media scratch directory is not writable",
+            code=ErrorCode.PROCESSING_TRANSCODE_FAILED,
+        ) from exc
+    if not temp_parent.is_dir():
+        raise PermanentProcessingError(
+            "Worker media scratch path is not a directory",
+            code=ErrorCode.PROCESSING_TRANSCODE_FAILED,
+        )
+    return str(temp_parent)
+
+
 async def create_browser_mezzanine(
     *,
     video: Video,
@@ -414,7 +433,10 @@ async def create_browser_mezzanine(
     )
     source_suffix = Path(video.filename or "upload").suffix.lower() or ".bin"
 
-    with tempfile.TemporaryDirectory(prefix="nbu-transcode-") as tempdir:
+    with tempfile.TemporaryDirectory(
+        prefix="nbu-transcode-",
+        dir=_media_temp_parent(settings),
+    ) as tempdir:
         tempdir_path = Path(tempdir)
         input_path = tempdir_path / f"input{source_suffix}"
         output_path = tempdir_path / "video.mp4"
