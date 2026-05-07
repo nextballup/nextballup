@@ -166,6 +166,42 @@ describe("VideoPlaybackView", () => {
     ).toBeInTheDocument();
   });
 
+  it("surfaces failed transcode errors instead of saying the worker is still processing", async () => {
+    const video = baseVideo({
+      status: "failed",
+      playback_status: "failed",
+      processing: { transcode: "failed" },
+    });
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "failed",
+          playback_status: "failed",
+          stage: null,
+          progress_percent: 0,
+          stages: {
+            transcode: {
+              status: "failed",
+              progress_percent: 0,
+              error_message: "[processing.transcode_failed] Video transcoding failed",
+            },
+          },
+        }),
+      ),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    expect(screen.getByText("Processing failed.")).toBeInTheDocument();
+    expect(screen.queryByText(/worker is still processing/i)).not.toBeInTheDocument();
+    expect(
+      await screen.findByText(/\[processing\.transcode_failed\] Video transcoding failed/i),
+    ).toBeInTheDocument();
+  });
+
   it("renders a video element with the signed mp4 URL when processed", async () => {
     const video = baseVideo({
       status: "processed",

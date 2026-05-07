@@ -242,14 +242,23 @@ function DemoPreviewPanel({
 function PlaybackPanel({ video }: { video: VideoDetailResponse }) {
   if (!video.playback_url || !video.playback_format) {
     const processedWithoutArtifact = video.status === "processed";
+    const processingFailed = video.status === "failed";
     return (
       <div className="rounded-lg border border-dashed border-[color:var(--color-nbu-border)] px-4 py-8 text-center text-sm text-[color:var(--color-nbu-text-muted)]">
         <p className="font-medium">
-          {processedWithoutArtifact
-            ? "Playback not available for this upload yet."
-            : "Playback not available yet."}
+          {processingFailed
+            ? "Processing failed."
+            : processedWithoutArtifact
+              ? "Playback not available for this upload yet."
+              : "Playback not available yet."}
         </p>
-        {processedWithoutArtifact ? (
+        {processingFailed ? (
+          <p className="mt-1">
+            This upload reached the processing pipeline, but the worker could
+            not create a browser-safe playback file. Check the failed stage
+            below for the recorded error.
+          </p>
+        ) : processedWithoutArtifact ? (
           <p className="mt-1">
             This upload finished processing, but its sanitized playback artifact
             is unavailable. For privacy and compatibility, the original upload
@@ -343,6 +352,7 @@ function ProcessingPanel({
           const statusValue = detail.status;
           const progress =
             "progress_percent" in detail ? detail.progress_percent : undefined;
+          const errorMessage = detail.error_message;
           const canRequeue =
             isAdmin && REQUEUEABLE_STAGE_STATES.has(statusValue);
           return (
@@ -360,6 +370,14 @@ function ProcessingPanel({
               {canRequeue && (
                 <RequeueButton videoId={video.id} stage={stage} />
               )}
+              {errorMessage ? (
+                <p
+                  role="alert"
+                  className="rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-2 py-1 text-xs text-[color:var(--color-nbu-error)]"
+                >
+                  {errorMessage}
+                </p>
+              ) : null}
             </li>
           );
         })}
