@@ -63,6 +63,7 @@ async def queue_next_stage_if_enabled(
     """
     if not settings.cv_pipeline_enabled:
         return None
+    await set_worker_context(session, team_id=video.team_id)
     next_stage = _NEXT_STAGE.get(completed_stage)
     if next_stage is None:
         return None
@@ -141,7 +142,12 @@ async def execute_cv_stage(
         await clear_worker_context(session)
         return CVStageResult(job_id=job.id, status="skipped", retryable=False)
 
-    origin_extra = await originating_user_extra(session, video_id=claimed.video_id)
+    await set_worker_context(session, team_id=claimed.team_id)
+    origin_extra = await originating_user_extra(
+        session,
+        video_id=claimed.video_id,
+        team_id=claimed.team_id,
+    )
     await write_worker_audit(
         session,
         action=AuditAction.VIDEO_PROCESSING_STARTED,
@@ -167,6 +173,7 @@ async def execute_cv_stage(
             request_id=request_id,
         )
 
+    await set_worker_context(session, team_id=claimed.team_id)
     video = await session.scalar(
         select(Video).where(Video.id == claimed.video_id).execution_options(populate_existing=True)
     )
@@ -199,7 +206,9 @@ async def execute_cv_stage(
             request_id=request_id,
         )
 
+    await set_worker_context(session, team_id=claimed.team_id)
     await touch_heartbeat(session, job_id=claimed.id, progress_percent=25)
+    await set_worker_context(session, team_id=claimed.team_id)
     plan_ctx = await resolve_team_plan(session, team_id=video.team_id)
     if plan_ctx is None and _stage_requires_artifact(resolved, claimed.stage):
         return await _terminal_cv_failure(
@@ -232,7 +241,9 @@ async def execute_cv_stage(
         game=game,
         artifact=artifact,
     )
+    await set_worker_context(session, team_id=claimed.team_id)
     await touch_heartbeat(session, job_id=claimed.id, progress_percent=75)
+    await set_worker_context(session, team_id=claimed.team_id)
     await complete_job(session, job_id=claimed.id, result_metadata=metadata)
     await write_worker_audit(
         session,
@@ -269,7 +280,11 @@ async def _terminal_cv_failure(
     request_id: str | None,
 ) -> CVStageResult:
     await set_worker_context(session, team_id=job.team_id)
-    origin_extra = await originating_user_extra(session, video_id=job.video_id)
+    origin_extra = await originating_user_extra(
+        session,
+        video_id=job.video_id,
+        team_id=job.team_id,
+    )
     await fail_job(
         session,
         job_id=job.id,

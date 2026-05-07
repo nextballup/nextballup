@@ -158,6 +158,7 @@ async def _materialize_outputs(
     settings: Settings,
 ) -> dict[str, str | None]:
     """Persist the browser-safe playback artifact metadata onto the video row."""
+    await set_worker_context(session, team_id=video.team_id)
     plan_ctx = await resolve_team_plan(session, team_id=video.team_id)
     retention_days = (
         plan_ctx.raw_video_retention_days
@@ -197,6 +198,7 @@ async def _await_with_heartbeat(
     *,
     session: AsyncSession,
     job_id: uuid.UUID,
+    team_id: uuid.UUID,
     settings: Settings,
     progress_percent: int,
 ) -> Any:
@@ -208,6 +210,7 @@ async def _await_with_heartbeat(
             try:
                 return await asyncio.wait_for(asyncio.shield(task), timeout=interval)
             except TimeoutError:
+                await set_worker_context(session, team_id=team_id)
                 await touch_heartbeat(
                     session,
                     job_id=job_id,
@@ -265,13 +268,18 @@ async def execute_transcode(
         await clear_worker_context(session)
         return TranscodeResult(job_id=job.id, status="skipped", retryable=False, error_code=None)
 
+    await set_worker_context(session, team_id=claimed.team_id)
     await set_video_status(
         session,
         video_id=claimed.video_id,
         new_status=VideoStatus.PROCESSING,
         allowed_from={VideoStatus.QUEUED, VideoStatus.PROCESSING},
     )
-    origin_extra = await originating_user_extra(session, video_id=claimed.video_id)
+    origin_extra = await originating_user_extra(
+        session,
+        video_id=claimed.video_id,
+        team_id=claimed.team_id,
+    )
     await write_worker_audit(
         session,
         action=AuditAction.VIDEO_PROCESSING_STARTED,
@@ -291,7 +299,9 @@ async def execute_transcode(
     # 3. Do the work. Re-verify the uploaded object, then materialize a
     # browser-safe playback mezzanine without exposing the raw upload.
     try:
+        await set_worker_context(session, team_id=claimed.team_id)
         await touch_heartbeat(session, job_id=claimed.id, progress_percent=10)
+        await set_worker_context(session, team_id=claimed.team_id)
         video = await _load_video(session, claimed.video_id)
         if video is None:
             raise PermanentProcessingError(
@@ -307,6 +317,7 @@ async def execute_transcode(
                 code=ErrorCode.STORAGE_NOT_CONFIGURED,
             )
         verification = await _verify_storage(video=video, presigner=resolved_storage)
+        await set_worker_context(session, team_id=claimed.team_id)
         await touch_heartbeat(session, job_id=claimed.id, progress_percent=50)
         transcode_started = time.perf_counter()
         artifact = await _await_with_heartbeat(
@@ -317,6 +328,7 @@ async def execute_transcode(
             ),
             session=session,
             job_id=claimed.id,
+            team_id=claimed.team_id,
             settings=resolved_settings,
             progress_percent=50,
         )
@@ -345,6 +357,7 @@ async def execute_transcode(
             },
         )
         await session.commit()
+        await set_worker_context(session, team_id=claimed.team_id)
         await touch_heartbeat(session, job_id=claimed.id, progress_percent=80)
 
     except (PermanentProcessingError, TransientProcessingError) as exc:
@@ -366,6 +379,7 @@ async def execute_transcode(
         )
 
     # 4. Complete.
+    await set_worker_context(session, team_id=claimed.team_id)
     await complete_job(
         session,
         job_id=claimed.id,
@@ -424,10 +438,15 @@ async def _handle_task_failure(
     request_id: str | None,
     retryable: bool,
 ) -> TranscodeResult:
+    await set_worker_context(session, team_id=job.team_id)
     error_code = getattr(exc, "code", None) or ErrorCode.INTERNAL_ERROR
     error_message = str(exc)[:2000]
     error_details = getattr(exc, "details", None)
-    origin_extra = await originating_user_extra(session, video_id=job.video_id)
+    origin_extra = await originating_user_extra(
+        session,
+        video_id=job.video_id,
+        team_id=job.team_id,
+    )
     if retryable:
         # Transient: return the job to PENDING so Celery's own scheduled retry
         # can claim it again, but keep celery_task_id populated so beat does not

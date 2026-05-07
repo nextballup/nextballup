@@ -47,9 +47,19 @@ from nextballup_worker.runtime.media import (
     create_browser_mezzanine as real_create_browser_mezzanine,
 )
 from nextballup_worker.tasks import _ensure_runtime_broker_configured
-from nextballup_worker.tenant import clear_worker_context, set_worker_operator_role
+from nextballup_worker.tenant import (
+    clear_worker_context,
+    set_worker_context,
+    set_worker_operator_role,
+)
 from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import NullPool
 
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.demo_preview import (
@@ -59,8 +69,14 @@ from nextballup_core.demo_preview import (
     resolve_demo_preview_state,
 )
 from nextballup_core.enums import (
+    CameraHeight,
+    CameraPosition,
+    GameType,
+    InstitutionType,
     ProcessingJobStage,
     ProcessingJobStatus,
+    Sport,
+    TeamLevel,
     UploadMethod,
     VideoStatus,
 )
@@ -69,9 +85,12 @@ from nextballup_core.settings import Settings, get_settings, reload_settings
 from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.billing import UsageEvent
 from nextballup_db.models.email_verification import EmailVerificationToken
+from nextballup_db.models.game import Game
 from nextballup_db.models.password_reset import PasswordResetToken
+from nextballup_db.models.team import Team
 from nextballup_db.models.user import User
 from nextballup_db.models.video import ProcessingJob, Video
+from scripts.configure_runtime_db_role import _set_runtime_role_password
 
 API = "/api/v1"
 _MP4_PAYLOAD = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
@@ -338,6 +357,76 @@ async def _seed_queued_video(
         uuid.UUID(complete["id"]),
         uuid.UUID(complete["job_id"]),
     )
+
+
+async def _seed_committed_worker_video(
+    engine: AsyncEngine,
+    fake_storage: FakeWorkerStorage,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """Seed a committed queued video outside the test session savepoint.
+
+    Runtime-role worker tests use a separate database connection, so they
+    cannot see rows inserted through the normal db_session fixture until those
+    rows are committed on an independent owner connection.
+    """
+    team_id = uuid.uuid4()
+    game_id = uuid.uuid4()
+    video_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    raw_key = f"raw/{team_id}/{video_id}/runtime-worker.mp4"
+    file_size = 250 * 1024 * 1024
+    owner_sessionmaker = async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with owner_sessionmaker() as owner_session:
+        await set_worker_context(owner_session, team_id=team_id)
+        owner_session.add_all(
+            [
+                Team(
+                    id=team_id,
+                    name="Runtime Worker Audit Team",
+                    sport=Sport.BASKETBALL,
+                    level=TeamLevel.AAU_CLUB,
+                    institution_type=InstitutionType.NONE,
+                    season="2026",
+                    invite_code=f"RWA{team_id.hex[:8].upper()}",
+                ),
+                Game(
+                    id=game_id,
+                    team_id=team_id,
+                    opponent_name="Runtime Worker Opponent",
+                    game_type=GameType.SCRIMMAGE,
+                    date=datetime.now(tz=UTC).date(),
+                    is_home=True,
+                ),
+                Video(
+                    id=video_id,
+                    game_id=game_id,
+                    team_id=team_id,
+                    filename="runtime-worker.mp4",
+                    storage_key_raw=raw_key,
+                    status=VideoStatus.QUEUED,
+                    file_size_bytes=file_size,
+                    content_type="video/mp4",
+                    checksum_sha256="a" * 64,
+                    camera_position=CameraPosition.SIDELINE,
+                    camera_height=CameraHeight.ELEVATED,
+                ),
+                ProcessingJob(
+                    id=job_id,
+                    video_id=video_id,
+                    team_id=team_id,
+                    stage=ProcessingJobStage.TRANSCODE,
+                    status=ProcessingJobStatus.PENDING,
+                    progress_percent=0,
+                ),
+            ]
+        )
+        await owner_session.commit()
+    fake_storage.object_sizes[raw_key] = file_size
+    return team_id, video_id, job_id
 
 
 async def _load_job(session: AsyncSession, job_id: uuid.UUID) -> ProcessingJob:
@@ -658,6 +747,61 @@ async def test_execute_transcode_happy_path(
     assert completed_audit is not None
     assert completed_audit.extra is not None
     assert completed_audit.extra["originating_user_id"] == str(video.uploaded_by)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_transcode_runtime_role_rebinds_rls_after_internal_commits(
+    db_session: AsyncSession,
+    engine: AsyncEngine,
+    fake_storage: FakeWorkerStorage,
+) -> None:
+    password = "RuntimeWorkerAuditTest1"
+    owner_url = os.environ["DATABASE_URL"]
+    runtime_url = owner_url.replace(
+        "nextballup:nextballup_dev@",
+        f"nextballup_app:{password}@",
+    )
+    async with engine.begin() as connection:
+        await _set_runtime_role_password(connection, "nextballup_app", password)
+
+    team_id, video_id, job_id = await _seed_committed_worker_video(engine, fake_storage)
+    runtime_engine = create_async_engine(runtime_url, poolclass=NullPool)
+    try:
+        runtime_sessionmaker = async_sessionmaker(
+            runtime_engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with runtime_sessionmaker() as runtime_session:
+            result = await execute_transcode(
+                runtime_session,
+                job_id=job_id,
+                celery_task_id="runtime-worker-audit",
+                request_id="runtime-worker-audit",
+                storage=fake_storage,
+            )
+    finally:
+        await runtime_engine.dispose()
+
+    assert result.status == "completed"
+    video = await _load_video(db_session, video_id)
+    assert video.status is VideoStatus.PROCESSED
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_PROCESSING_STARTED,
+        )
+        == 1
+    )
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_PROCESSING_COMPLETED,
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")

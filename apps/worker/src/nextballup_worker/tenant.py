@@ -22,7 +22,7 @@ async def set_worker_operator_role(session: AsyncSession) -> None:
     the full tenant context next.
     """
     await session.execute(
-        text("SELECT set_config('app.current_user_role', :role, false)").bindparams(
+        text("SELECT set_config('app.current_user_role', :role, true)").bindparams(
             role=UserRole.ADMIN.value
         )
     )
@@ -35,15 +35,19 @@ async def set_worker_context(session: AsyncSession, *, team_id: uuid.UUID) -> No
     `team_id = current_team_id` WITH CHECK clauses, so setting the tenant
     GUC to the row's owning team is how we pass the write policies; the
     admin-role GUC keeps SELECT open for joined lookups across tables.
+
+    The worker uses a per-task engine with NullPool. Any helper that commits
+    may close the current connection, so callers must bind this context again
+    before the next RLS-protected statement.
     """
     await set_worker_operator_role(session)
     await session.execute(
-        text("SELECT set_config('app.current_team_id', :team_id, false)").bindparams(
+        text("SELECT set_config('app.current_team_id', :team_id, true)").bindparams(
             team_id=str(team_id)
         )
     )
 
 
 async def clear_worker_context(session: AsyncSession) -> None:
-    await session.execute(text("SELECT set_config('app.current_team_id', '', false)"))
-    await session.execute(text("SELECT set_config('app.current_user_role', '', false)"))
+    await session.execute(text("SELECT set_config('app.current_team_id', '', true)"))
+    await session.execute(text("SELECT set_config('app.current_user_role', '', true)"))

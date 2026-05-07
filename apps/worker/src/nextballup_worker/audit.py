@@ -8,7 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.video import Video
-from nextballup_worker.tenant import WORKER_ACTOR_EMAIL
+from nextballup_worker.tenant import (
+    WORKER_ACTOR_EMAIL,
+    set_worker_context,
+    set_worker_operator_role,
+)
 
 
 async def write_worker_audit(
@@ -28,6 +32,10 @@ async def write_worker_audit(
     and is set to the Celery task_id (or a dispatcher correlation id) so the
     whole lifecycle can be traced.
     """
+    if team_id is not None:
+        await set_worker_context(session, team_id=team_id)
+    else:
+        await set_worker_operator_role(session)
     entry = AuditLog(
         action=action,
         actor_user_id=None,
@@ -45,7 +53,16 @@ async def write_worker_audit(
     return entry
 
 
-async def originating_user_extra(session: AsyncSession, *, video_id: uuid.UUID) -> dict[str, str]:
+async def originating_user_extra(
+    session: AsyncSession,
+    *,
+    video_id: uuid.UUID,
+    team_id: uuid.UUID | None = None,
+) -> dict[str, str]:
+    if team_id is not None:
+        await set_worker_context(session, team_id=team_id)
+    else:
+        await set_worker_operator_role(session)
     uploader_id = await session.scalar(select(Video.uploaded_by).where(Video.id == video_id))
     if uploader_id is None:
         return {}
