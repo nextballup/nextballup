@@ -50,19 +50,19 @@ async def touch_heartbeat(
     *,
     job_id: uuid.UUID,
     progress_percent: int | None = None,
+    celery_task_id: str | None = None,
 ) -> None:
     """Bump heartbeat_at (and optionally progress_percent) for a running job."""
     values: dict[str, Any] = {"heartbeat_at": func.now()}
     if progress_percent is not None:
         values["progress_percent"] = progress_percent
-    await session.execute(
-        update(ProcessingJob)
-        .where(
-            ProcessingJob.id == job_id,
-            ProcessingJob.status == ProcessingJobStatus.RUNNING,
-        )
-        .values(**values)
+    stmt = update(ProcessingJob).where(
+        ProcessingJob.id == job_id,
+        ProcessingJob.status == ProcessingJobStatus.RUNNING,
     )
+    if celery_task_id is not None:
+        stmt = stmt.where(ProcessingJob.celery_task_id == celery_task_id)
+    await session.execute(stmt.values(**values))
     await session.commit()
 
 
@@ -71,17 +71,19 @@ async def complete_job(
     *,
     job_id: uuid.UUID,
     result_metadata: dict[str, Any] | None = None,
+    celery_task_id: str | None = None,
 ) -> ProcessingJob | None:
     """Transition a RUNNING job to COMPLETED. Does not touch video state — the
     caller decides whether this stage being complete means the pipeline is done
     (Phase 4 only has one stage; downstream phases will fan-out)."""
+    stmt = update(ProcessingJob).where(
+        ProcessingJob.id == job_id,
+        ProcessingJob.status == ProcessingJobStatus.RUNNING,
+    )
+    if celery_task_id is not None:
+        stmt = stmt.where(ProcessingJob.celery_task_id == celery_task_id)
     result = await session.execute(
-        update(ProcessingJob)
-        .where(
-            ProcessingJob.id == job_id,
-            ProcessingJob.status == ProcessingJobStatus.RUNNING,
-        )
-        .values(
+        stmt.values(
             status=ProcessingJobStatus.COMPLETED,
             progress_percent=100,
             completed_at=func.now(),

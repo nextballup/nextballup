@@ -175,6 +175,65 @@ describe("VideoPlaybackView", () => {
     expect(await screen.findByText(/No worker heartbeat for 10m/i)).toBeInTheDocument();
   });
 
+  it("lets coaches cancel a stuck running transcode", async () => {
+    let cancelled = false;
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(
+          baseVideo({
+            status: "processing",
+            processing: { transcode: "running" },
+          }),
+        ),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processing",
+          playback_status: "transcoding",
+          stage: "transcode",
+          progress_percent: 50,
+          stages: {
+            transcode: {
+              status: "running",
+              progress_percent: 50,
+              heartbeat_at: new Date(Date.now() - 10 * 60 * 1_000).toISOString(),
+            },
+          },
+        }),
+      ),
+      http.post("/api/v1/videos/v1/processing/cancel", async ({ request }) => {
+        cancelled = true;
+        expect(await request.json()).toEqual({ stage: "transcode" });
+        return HttpResponse.json({
+          job_id: "j1",
+          stage: "transcode",
+          status: "failed",
+          cancelled_at: "2026-05-07T00:00:00Z",
+        });
+      }),
+    );
+
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({
+              status: "processing",
+              processing: { transcode: "running" },
+            })}
+            viewerRole="coach"
+          />,
+        ),
+      );
+    });
+
+    fireEvent.click(await screen.findByTestId("cancel-processing-transcode"));
+
+    await waitFor(() => {
+      expect(cancelled).toBe(true);
+    });
+  });
+
   it("lets coaches cancel a stuck pending upload from the detail page", async () => {
     const video = baseVideo({
       status: "pending_upload",

@@ -20,7 +20,12 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from nextballup_api.routers.videos import get_storage
-from nextballup_api.storage import PresignedPart, PresignedUpload, StoragePresigner
+from nextballup_api.storage import (
+    PresignedPart,
+    PresignedUpload,
+    StoragePresigner,
+    storage_key_for_mezzanine,
+)
 from nextballup_worker.errors import (
     PermanentProcessingError,
     TransientProcessingError,
@@ -42,6 +47,9 @@ from nextballup_worker.runtime import (
     release_job_for_retry,
     retry_raw_video_storage_deletes,
     touch_heartbeat,
+)
+from nextballup_worker.runtime.media import (
+    BrowserMezzanineArtifact,
 )
 from nextballup_worker.runtime.media import (
     create_browser_mezzanine as real_create_browser_mezzanine,
@@ -747,6 +755,89 @@ async def test_execute_transcode_happy_path(
     assert completed_audit is not None
     assert completed_audit.extra is not None
     assert completed_audit.extra["originating_user_id"] == str(video.uploaded_by)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_transcode_skips_late_completion_after_processing_cancel(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="cancel-race-worker@example.com"
+    )
+
+    async def _cancel_during_transcode(
+        *,
+        video: Video,
+        presigner: StoragePresigner,
+        settings: Settings,
+    ) -> BrowserMezzanineArtifact:
+        mezzanine_key = storage_key_for_mezzanine(
+            team_id=str(video.team_id),
+            video_id=str(video.id),
+        )
+        fake_storage.object_sizes[mezzanine_key] = 123
+        fake_storage.object_metadata[mezzanine_key] = {"nbu-output-sha256": "c" * 64}
+        await set_worker_context(db_session, team_id=team_id)
+        await db_session.execute(
+            update(ProcessingJob)
+            .where(ProcessingJob.id == job_id)
+            .values(
+                status=ProcessingJobStatus.FAILED,
+                completed_at=datetime.now(UTC),
+                error_message=f"[{ErrorCode.PROCESSING_CANCELLED}] cancelled",
+            )
+        )
+        await db_session.execute(
+            update(Video).where(Video.id == video_id).values(status=VideoStatus.FAILED)
+        )
+        await db_session.commit()
+        return BrowserMezzanineArtifact(
+            mezzanine_key=mezzanine_key,
+            storage_etag="c" * 32,
+            output_sha256="c" * 64,
+            output_size_bytes=123,
+            duration_seconds=10.0,
+            width=1280,
+            height=720,
+            fps=30.0,
+            codec="h264",
+            transcoder="test-cancel-race",
+        )
+
+    monkeypatch.setattr(
+        "nextballup_worker.runtime.transcode.create_browser_mezzanine",
+        _cancel_during_transcode,
+    )
+
+    result = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        celery_task_id="old-transcode-task",
+        request_id="old-transcode-task",
+        storage=fake_storage,
+    )
+
+    assert result.status == "skipped"
+    assert result.error_code == ErrorCode.PROCESSING_CANCELLED
+    job = await _load_job(db_session, job_id)
+    video = await _load_video(db_session, video_id)
+    assert job.status is ProcessingJobStatus.FAILED
+    assert video.status is VideoStatus.FAILED
+    assert video.storage_key_mezzanine is None
+    assert storage_key_for_mezzanine(team_id=str(team_id), video_id=str(video_id)) not in (
+        fake_storage.object_sizes
+    )
+    assert (
+        await _count_actions(
+            db_session,
+            team_id=team_id,
+            action=AuditAction.VIDEO_PROCESSING_COMPLETED,
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")

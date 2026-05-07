@@ -72,6 +72,8 @@ from nextballup_core.errors import (
     ValidationFailedError,
 )
 from nextballup_core.schemas.video import (
+    CancelProcessingRequest,
+    CancelProcessingResponse,
     CompleteUploadRequest,
     CompleteUploadResponse,
     CreateUploadRequest,
@@ -1773,6 +1775,127 @@ async def get_demo_preview_artifact(
             "Pragma": "no-cache",
             "Expires": "0",
         },
+    )
+
+
+# ---- POST /videos/{video_id}/processing/cancel ----------------------------
+
+
+@router.post("/{video_id:uuid}/processing/cancel", response_model=CancelProcessingResponse)
+async def cancel_processing(
+    video_id: uuid.UUID,
+    payload: CancelProcessingRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+) -> CancelProcessingResponse:
+    """Coach/admin recovery for a running transcode that is stuck in alpha.
+
+    The API cannot reliably terminate an already-running FFmpeg subprocess on
+    Render, so cancellation is a control-plane transition: the current claimed
+    job is marked FAILED and late worker writes are ignored by celery_task_id
+    ownership checks in the worker runtime.
+    """
+    require_verified_account(current_user, settings=settings)
+
+    try:
+        stage = ProcessingJobStage(payload.stage)
+    except ValueError as exc:
+        raise ValidationFailedError(
+            "Unknown processing stage",
+            code=ErrorCode.PROCESSING_STAGE_UNKNOWN,
+            details={"stage": payload.stage},
+        ) from exc
+
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+
+    video = await _load_video_for_update_after_binding_tenant(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    if stage is not ProcessingJobStage.TRANSCODE:
+        raise ConflictError(
+            "Only running transcode jobs can be cancelled from this recovery path",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"stage": stage.value},
+        )
+    if video.status not in {VideoStatus.PROCESSING, VideoStatus.QUEUED}:
+        raise ConflictError(
+            "Video is not currently processing",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"current_status": video.status.value},
+        )
+
+    job = await session.scalar(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.stage == stage,
+        )
+        .with_for_update()
+    )
+    if job is None:
+        raise NotFoundError(
+            "Processing job not found for this stage",
+            code=ErrorCode.PROCESSING_JOB_NOT_FOUND,
+        )
+    if job.status is not ProcessingJobStatus.RUNNING:
+        raise ConflictError(
+            "Only running processing jobs can be cancelled",
+            code=ErrorCode.PROCESSING_JOB_NOT_REQUEUABLE,
+            details={"current_status": job.status.value},
+        )
+
+    cancelled_at = datetime.now(tz=UTC)
+    previous_metadata = dict(job.result_metadata or {})
+    previous_metadata.update(
+        {
+            "cancelled_at": cancelled_at.isoformat(),
+            "cancelled_by_user_id": str(current_user.id),
+            "cancel_reason": "user_cancelled_processing",
+            "previous_progress_percent": job.progress_percent,
+            "previous_celery_task_present": job.celery_task_id is not None,
+        }
+    )
+    job.status = ProcessingJobStatus.FAILED
+    job.completed_at = cancelled_at
+    job.error_message = f"[{ErrorCode.PROCESSING_CANCELLED}] Processing cancelled by coach/admin"
+    job.result_metadata = previous_metadata
+    video.status = VideoStatus.FAILED
+
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_PROCESSING_CANCELLED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="processing_job",
+        resource_id=job.id,
+        team_id=video.team_id,
+        extra={
+            "video_id": str(video.id),
+            "stage": stage.value,
+            "previous_progress_percent": job.progress_percent,
+            "had_celery_task_id": job.celery_task_id is not None,
+        },
+    )
+    await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=video.team_id,
+    )
+
+    return CancelProcessingResponse(
+        job_id=job.id,
+        stage=stage.value,
+        status=job.status.value,
+        cancelled_at=cancelled_at,
     )
 
 

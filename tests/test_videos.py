@@ -2122,6 +2122,45 @@ async def seeded_failed_video_for_requeue(
     return team["id"], video_id, job_id
 
 
+async def seeded_running_video_for_cancel(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    *,
+    coach_email: str,
+) -> tuple[str, uuid.UUID, uuid.UUID]:
+    team, game = await _setup_coach_team_game(storage_client, coach_email=coach_email)
+    upload = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()
+    complete = (
+        await storage_client.post(
+            f"{API}/videos/{upload['id']}/complete",
+            json={"checksum_sha256": "f" * 64},
+        )
+    ).json()
+    job_id = uuid.UUID(complete["job_id"])
+    video_id = uuid.UUID(complete["id"])
+    heartbeat_at = datetime.now(UTC)
+    await set_worker_operator_role(db_session)
+    await db_session.execute(
+        update(Video).where(Video.id == video_id).values(status=VideoStatus.PROCESSING)
+    )
+    await db_session.execute(
+        update(ProcessingJob)
+        .where(ProcessingJob.id == job_id)
+        .values(
+            status=ProcessingJobStatus.RUNNING,
+            progress_percent=50,
+            celery_task_id="stuck-transcode-task",
+            started_at=heartbeat_at,
+            heartbeat_at=heartbeat_at,
+        )
+    )
+    await db_session.commit()
+    await clear_worker_context(db_session)
+    return team["id"], video_id, job_id
+
+
 @pytest_asyncio.fixture(loop_scope="session")
 async def seeded_failed_job(
     storage_client: AsyncClient, db_session: AsyncSession
@@ -2133,6 +2172,79 @@ async def seeded_failed_job(
         db_session,
         coach_email="requeue-owner@example.com",
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_cancel_running_transcode_marks_failed_for_team_coach(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    team_id, video_id, job_id = await seeded_running_video_for_cancel(
+        storage_client,
+        db_session,
+        coach_email="cancel-processing-owner@example.com",
+    )
+
+    response = await storage_client.post(
+        f"{API}/videos/{video_id}/processing/cancel",
+        json={"stage": "transcode"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["job_id"] == str(job_id)
+    assert body["stage"] == "transcode"
+    assert body["status"] == "failed"
+
+    await set_worker_operator_role(db_session)
+    job = await db_session.scalar(
+        select(ProcessingJob)
+        .where(ProcessingJob.id == job_id)
+        .execution_options(populate_existing=True)
+    )
+    video = await db_session.scalar(
+        select(Video).where(Video.id == video_id).execution_options(populate_existing=True)
+    )
+    audit = await db_session.scalar(
+        select(AuditLog)
+        .where(
+            AuditLog.team_id == uuid.UUID(team_id),
+            AuditLog.action == AuditAction.VIDEO_PROCESSING_CANCELLED,
+        )
+        .order_by(AuditLog.created_at.desc())
+    )
+    await clear_worker_context(db_session)
+    assert job is not None
+    assert job.status is ProcessingJobStatus.FAILED
+    assert job.completed_at is not None
+    assert job.error_message is not None
+    assert ErrorCode.PROCESSING_CANCELLED in job.error_message
+    assert (job.result_metadata or {})["cancel_reason"] == "user_cancelled_processing"
+    assert video is not None
+    assert video.status is VideoStatus.FAILED
+    assert audit is not None
+    assert audit.extra is not None
+    assert audit.extra["stage"] == "transcode"
+    assert audit.extra["had_celery_task_id"] is True
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_unauthorized_user_cannot_cancel_another_teams_running_transcode(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    _team_id, video_id, _job_id = await seeded_running_video_for_cancel(
+        storage_client,
+        db_session,
+        coach_email="cancel-processing-isolated@example.com",
+    )
+    await _register(storage_client, _coach_payload("cancel-processing-snoop@example.com"))
+
+    response = await storage_client.post(
+        f"{API}/videos/{video_id}/processing/cancel",
+        json={"stage": "transcode"},
+    )
+
+    assert response.status_code in {403, 404}
 
 
 @pytest.mark.asyncio(loop_scope="session")

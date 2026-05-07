@@ -88,6 +88,11 @@ export function VideoPlaybackView({
     <div className="space-y-4">
       <PlaybackPanel video={video} />
       <PendingUploadRecoveryPanel video={video} viewerRole={viewerRole} />
+      <ActiveProcessingRecoveryPanel
+        video={video}
+        status={statusQuery.data}
+        viewerRole={viewerRole}
+      />
       <FailedVideoRecoveryPanel video={video} viewerRole={viewerRole} />
       <DemoPreviewPanel video={video} viewerRole={viewerRole} />
       <MetadataPanel video={video} />
@@ -162,6 +167,39 @@ function PendingUploadRecoveryPanel({
           queryClient.invalidateQueries({ queryKey: ["video-status", video.id] });
         }}
       />
+    </section>
+  );
+}
+
+function ActiveProcessingRecoveryPanel({
+  video,
+  status,
+  viewerRole,
+}: {
+  video: VideoDetailResponse;
+  status: VideoStatusResponse | undefined;
+  viewerRole: UserRole | null;
+}) {
+  const canRecover = viewerRole === "coach" || viewerRole === "admin";
+  const transcode = status?.stages.transcode;
+  const transcodeRunning =
+    video.status === "processing" &&
+    (transcode?.status === "running" || video.processing.transcode === "running");
+  if (!canRecover || !transcodeRunning) {
+    return null;
+  }
+  return (
+    <section className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] p-4 text-sm">
+      <div className="space-y-1">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+          Processing recovery
+        </h2>
+        <p className="text-[color:var(--color-nbu-text-muted)]">
+          This transcode is still marked running. Cancel processing marks this
+          attempt failed so you can retry processing or delete the video.
+        </p>
+      </div>
+      <CancelProcessingButton videoId={video.id} stage="transcode" />
     </section>
   );
 }
@@ -489,6 +527,54 @@ function RequeueButton({
         className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
       >
         {mutation.isPending ? "Retrying…" : "Retry processing"}
+      </button>
+      {errorMessage && (
+        <span role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
+          {errorMessage}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function CancelProcessingButton({
+  videoId,
+  stage,
+}: {
+  videoId: string;
+  stage: string;
+}) {
+  const queryClient = useQueryClient();
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: () =>
+      apiJson(`/videos/${videoId}/processing/cancel`, {
+        method: "POST",
+        json: { stage },
+      }),
+    onSuccess: () => {
+      setErrorMessage(null);
+      queryClient.invalidateQueries({ queryKey: ["video", videoId] });
+      queryClient.invalidateQueries({ queryKey: ["video-status", videoId] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage("Unable to cancel processing.");
+      }
+    },
+  });
+  return (
+    <div className="flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={() => mutation.mutate()}
+        disabled={mutation.isPending}
+        data-testid={`cancel-processing-${stage}`}
+        className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+      >
+        {mutation.isPending ? "Cancelling..." : "Cancel processing"}
       </button>
       {errorMessage && (
         <span role="alert" className="text-xs text-[color:var(--color-nbu-error)]">

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -14,13 +15,14 @@ from nextballup_api.storage import (
     StoragePresigner,
     get_storage_presigner,
     normalize_etag,
+    storage_delete_object,
     storage_head_object,
 )
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_core.constants import AuditAction, ErrorCode
-from nextballup_core.enums import ProcessingJobStage, VideoStatus
+from nextballup_core.enums import ProcessingJobStage, ProcessingJobStatus, VideoStatus
 from nextballup_core.observability import (
     WORKER_STORAGE_BYTES_UPLOADED_TOTAL,
     WORKER_TRANSCODE_SECONDS,
@@ -77,6 +79,33 @@ async def _load_video(session: AsyncSession, video_id: uuid.UUID) -> Video | Non
         select(Video).where(Video.id == video_id).execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
+
+
+async def _claimed_job_still_active(
+    session: AsyncSession,
+    *,
+    job_id: uuid.UUID,
+    celery_task_id: str | None,
+    lock: bool = False,
+) -> bool:
+    stmt = select(ProcessingJob).where(
+        ProcessingJob.id == job_id,
+        ProcessingJob.status == ProcessingJobStatus.RUNNING,
+    )
+    if celery_task_id is not None:
+        stmt = stmt.where(ProcessingJob.celery_task_id == celery_task_id)
+    if lock:
+        stmt = stmt.with_for_update()
+    result = await session.execute(stmt.execution_options(populate_existing=True))
+    return result.scalar_one_or_none() is not None
+
+
+async def _delete_transient_output_best_effort(
+    presigner: StoragePresigner,
+    artifact: BrowserMezzanineArtifact,
+) -> None:
+    with suppress(Exception):
+        await storage_delete_object(presigner, key=artifact.mezzanine_key)
 
 
 async def _verify_storage(
@@ -156,9 +185,19 @@ async def _materialize_outputs(
     video: Video,
     artifact: BrowserMezzanineArtifact,
     settings: Settings,
-) -> dict[str, str | None]:
+    job_id: uuid.UUID,
+    celery_task_id: str | None,
+) -> dict[str, str | None] | None:
     """Persist the browser-safe playback artifact metadata onto the video row."""
     await set_worker_context(session, team_id=video.team_id)
+    if not await _claimed_job_still_active(
+        session,
+        job_id=job_id,
+        celery_task_id=celery_task_id,
+        lock=True,
+    ):
+        await session.commit()
+        return None
     plan_ctx = await resolve_team_plan(session, team_id=video.team_id)
     retention_days = (
         plan_ctx.raw_video_retention_days
@@ -168,9 +207,9 @@ async def _materialize_outputs(
     raw_retention_expires_at = video.raw_retention_expires_at or datetime.now(tz=UTC) + timedelta(
         days=retention_days
     )
-    await session.execute(
+    result = await session.execute(
         update(Video)
-        .where(Video.id == video.id)
+        .where(Video.id == video.id, Video.status == VideoStatus.PROCESSING)
         .values(
             storage_key_mezzanine=artifact.mezzanine_key,
             storage_etag=artifact.storage_etag,
@@ -182,7 +221,11 @@ async def _materialize_outputs(
             codec=artifact.codec,
             raw_retention_expires_at=raw_retention_expires_at,
         )
+        .returning(Video.id)
     )
+    if result.scalar_one_or_none() is None:
+        await session.commit()
+        return None
     await session.commit()
     if artifact.output_size_bytes is not None:
         WORKER_STORAGE_BYTES_UPLOADED_TOTAL.inc(artifact.output_size_bytes)
@@ -199,6 +242,7 @@ async def _await_with_heartbeat(
     session: AsyncSession,
     job_id: uuid.UUID,
     team_id: uuid.UUID,
+    celery_task_id: str | None,
     settings: Settings,
     progress_percent: int,
 ) -> Any:
@@ -214,6 +258,7 @@ async def _await_with_heartbeat(
                 await touch_heartbeat(
                     session,
                     job_id=job_id,
+                    celery_task_id=celery_task_id,
                     progress_percent=progress_percent,
                 )
         return await task
@@ -300,7 +345,12 @@ async def execute_transcode(
     # browser-safe playback mezzanine without exposing the raw upload.
     try:
         await set_worker_context(session, team_id=claimed.team_id)
-        await touch_heartbeat(session, job_id=claimed.id, progress_percent=10)
+        await touch_heartbeat(
+            session,
+            job_id=claimed.id,
+            celery_task_id=celery_task_id,
+            progress_percent=10,
+        )
         await set_worker_context(session, team_id=claimed.team_id)
         video = await _load_video(session, claimed.video_id)
         if video is None:
@@ -318,7 +368,12 @@ async def execute_transcode(
             )
         verification = await _verify_storage(video=video, presigner=resolved_storage)
         await set_worker_context(session, team_id=claimed.team_id)
-        await touch_heartbeat(session, job_id=claimed.id, progress_percent=50)
+        await touch_heartbeat(
+            session,
+            job_id=claimed.id,
+            celery_task_id=celery_task_id,
+            progress_percent=50,
+        )
         transcode_started = time.perf_counter()
         artifact = await _await_with_heartbeat(
             create_browser_mezzanine(
@@ -329,6 +384,7 @@ async def execute_transcode(
             session=session,
             job_id=claimed.id,
             team_id=claimed.team_id,
+            celery_task_id=celery_task_id,
             settings=resolved_settings,
             progress_percent=50,
         )
@@ -338,7 +394,18 @@ async def execute_transcode(
             video=video,
             artifact=artifact,
             settings=resolved_settings,
+            job_id=claimed.id,
+            celery_task_id=celery_task_id,
         )
+        if outputs is None:
+            await _delete_transient_output_best_effort(resolved_storage, artifact)
+            await clear_worker_context(session)
+            return TranscodeResult(
+                job_id=claimed.id,
+                status="skipped",
+                retryable=False,
+                error_code=ErrorCode.PROCESSING_CANCELLED,
+            )
         await write_worker_audit(
             session,
             action=AuditAction.VIDEO_OUTPUT_MATERIALIZED,
@@ -358,7 +425,12 @@ async def execute_transcode(
         )
         await session.commit()
         await set_worker_context(session, team_id=claimed.team_id)
-        await touch_heartbeat(session, job_id=claimed.id, progress_percent=80)
+        await touch_heartbeat(
+            session,
+            job_id=claimed.id,
+            celery_task_id=celery_task_id,
+            progress_percent=80,
+        )
 
     except (PermanentProcessingError, TransientProcessingError) as exc:
         retryable = isinstance(exc, TransientProcessingError)
@@ -368,6 +440,7 @@ async def execute_transcode(
             exc=exc,
             request_id=request_id,
             retryable=retryable,
+            celery_task_id=celery_task_id,
         )
     except Exception as exc:  # unexpected → treat as transient with retry
         return await _handle_task_failure(
@@ -376,13 +449,15 @@ async def execute_transcode(
             exc=exc,
             request_id=request_id,
             retryable=True,
+            celery_task_id=celery_task_id,
         )
 
     # 4. Complete.
     await set_worker_context(session, team_id=claimed.team_id)
-    await complete_job(
+    completed_job = await complete_job(
         session,
         job_id=claimed.id,
+        celery_task_id=celery_task_id,
         result_metadata={
             "verification": verification,
             "outputs": outputs,
@@ -392,6 +467,14 @@ async def execute_transcode(
             "output_size_bytes": artifact.output_size_bytes,
         },
     )
+    if completed_job is None:
+        await clear_worker_context(session)
+        return TranscodeResult(
+            job_id=claimed.id,
+            status="skipped",
+            retryable=False,
+            error_code=ErrorCode.PROCESSING_CANCELLED,
+        )
     # In Phase 4 the pipeline has a single stage — completing it implies the
     # video is fully processed. Downstream phases will only flip to PROCESSED
     # when the last stage completes.
@@ -437,8 +520,21 @@ async def _handle_task_failure(
     exc: BaseException,
     request_id: str | None,
     retryable: bool,
+    celery_task_id: str | None,
 ) -> TranscodeResult:
     await set_worker_context(session, team_id=job.team_id)
+    if not await _claimed_job_still_active(
+        session,
+        job_id=job.id,
+        celery_task_id=celery_task_id,
+    ):
+        await clear_worker_context(session)
+        return TranscodeResult(
+            job_id=job.id,
+            status="skipped",
+            retryable=False,
+            error_code=ErrorCode.PROCESSING_CANCELLED,
+        )
     error_code = getattr(exc, "code", None) or ErrorCode.INTERNAL_ERROR
     error_message = str(exc)[:2000]
     error_details = getattr(exc, "details", None)

@@ -221,11 +221,17 @@ class PlaybackVerifyResponse(BaseModel):
 
 
 class RequeueProcessingRequest(BaseModel):
-    """Admin-only request to reset a processing job back to PENDING so the
+    """Coach/admin request to reset a processing job back to PENDING so the
     beat dispatcher picks it back up. The `stage` argument is required so
     operators don't accidentally requeue every failed stage for a video —
     the recovery story for each stage is different."""
 
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str = Field(min_length=1, max_length=64)
+
+
+class CancelProcessingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     stage: str = Field(min_length=1, max_length=64)
@@ -236,6 +242,13 @@ class RequeueProcessingResponse(BaseModel):
     stage: str
     status: str
     requeued_at: datetime
+
+
+class CancelProcessingResponse(BaseModel):
+    job_id: uuid.UUID
+    stage: str
+    status: str
+    cancelled_at: datetime
 
 
 class GenerateDemoPreviewResponse(BaseModel):
