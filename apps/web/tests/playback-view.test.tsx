@@ -100,6 +100,81 @@ describe("VideoPlaybackView", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows active worker heartbeat when transcode remains at 50 percent", async () => {
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(baseVideo({ status: "processing" })),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processing",
+          playback_status: "transcoding",
+          stage: "transcode",
+          progress_percent: 50,
+          stages: {
+            transcode: {
+              status: "running",
+              progress_percent: 50,
+              heartbeat_at: new Date().toISOString(),
+            },
+          },
+        }),
+      ),
+    );
+
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({ status: "processing" })}
+            viewerRole="coach"
+          />,
+        ),
+      );
+    });
+
+    expect(await screen.findByText(/Worker heartbeat active/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Media transcode can stay at 50%/i),
+    ).toBeInTheDocument();
+  });
+
+  it("warns when a running transcode has no recent worker heartbeat", async () => {
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(baseVideo({ status: "processing" })),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processing",
+          playback_status: "transcoding",
+          stage: "transcode",
+          progress_percent: 50,
+          stages: {
+            transcode: {
+              status: "running",
+              progress_percent: 50,
+              heartbeat_at: new Date(Date.now() - 10 * 60 * 1_000).toISOString(),
+            },
+          },
+        }),
+      ),
+    );
+
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({ status: "processing" })}
+            viewerRole="coach"
+          />,
+        ),
+      );
+    });
+
+    expect(await screen.findByText(/No worker heartbeat for 10m/i)).toBeInTheDocument();
+  });
+
   it("lets coaches cancel a stuck pending upload from the detail page", async () => {
     const video = baseVideo({
       status: "pending_upload",

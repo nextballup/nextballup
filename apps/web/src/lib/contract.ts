@@ -61,6 +61,8 @@ export type PlaybackStatus =
 export type ProcessingStageStatus = {
   status: string;
   progress_percent?: number | null;
+  started_at?: string | null;
+  heartbeat_at?: string | null;
   completed_at?: string | null;
   error_message?: string | null;
 };

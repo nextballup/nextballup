@@ -110,6 +110,8 @@ class CompleteUploadResponse(BaseModel):
 class ProcessingStageStatus(BaseModel):
     status: str
     progress_percent: int | None = None
+    started_at: datetime | None = None
+    heartbeat_at: datetime | None = None
     completed_at: datetime | None = None
     error_message: str | None = None
 

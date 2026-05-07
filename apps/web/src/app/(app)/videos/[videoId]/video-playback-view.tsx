@@ -18,6 +18,7 @@ import {
 import { PLAYBACK_STATUS_LABELS } from "@/lib/video-status";
 
 const POLL_INTERVAL_MS = 3_000;
+const WORKER_HEARTBEAT_STALE_MS = 5 * 60 * 1_000;
 // Refresh the video detail (and the signed playback URL it carries) a bit
 // before token_expires_at — 30 s of slack gives the user time to start
 // playback on a slow connection without the URL expiring mid-stream.
@@ -380,6 +381,7 @@ function ProcessingPanel({
           const progress =
             "progress_percent" in detail ? detail.progress_percent : undefined;
           const errorMessage = detail.error_message;
+          const activity = processingStageActivity(detail);
           return (
             <li
               key={stage}
@@ -398,6 +400,17 @@ function ProcessingPanel({
                   className="rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-2 py-1 text-xs text-[color:var(--color-nbu-error)]"
                 >
                   {errorMessage}
+                </p>
+              ) : null}
+              {activity ? (
+                <p
+                  className={
+                    activity.isStale
+                      ? "text-xs text-[color:var(--color-nbu-error)]"
+                      : "text-xs text-[color:var(--color-nbu-text-muted)]"
+                  }
+                >
+                  {activity.text}
                 </p>
               ) : null}
             </li>
@@ -542,6 +555,57 @@ function fallbackStages(
       { status: statusValue },
     ]),
   );
+}
+
+function processingStageActivity(
+  detail: VideoStatusResponse["stages"][string],
+): { text: string; isStale: boolean } | null {
+  if (detail.status !== "running") return null;
+
+  const heartbeatAt = detail.heartbeat_at ? Date.parse(detail.heartbeat_at) : NaN;
+  if (!Number.isNaN(heartbeatAt)) {
+    const elapsedMs = Math.max(0, Date.now() - heartbeatAt);
+    if (elapsedMs > WORKER_HEARTBEAT_STALE_MS) {
+      return {
+        text: `No worker heartbeat for ${formatDuration(elapsedMs)}.`,
+        isStale: true,
+      };
+    }
+    const suffix =
+      detail.progress_percent === 50
+        ? " Media transcode can stay at 50% until playback output is uploaded."
+        : "";
+    return {
+      text: `Worker heartbeat active ${formatElapsed(elapsedMs)}.${suffix}`,
+      isStale: false,
+    };
+  }
+
+  const startedAt = detail.started_at ? Date.parse(detail.started_at) : NaN;
+  if (Number.isNaN(startedAt)) return null;
+  return {
+    text: `Worker started ${formatElapsed(Math.max(0, Date.now() - startedAt))}.`,
+    isStale: false,
+  };
+}
+
+function formatElapsed(elapsedMs: number): string {
+  const seconds = Math.floor(elapsedMs / 1_000);
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
+}
+
+function formatDuration(elapsedMs: number): string {
+  const seconds = Math.floor(elapsedMs / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h`;
 }
 
 function formatBytes(bytes: number): string {

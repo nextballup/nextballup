@@ -500,6 +500,8 @@ def _video_status(
         stages[job.stage.value] = ProcessingStageStatus(
             status=job.status.value,
             progress_percent=job.progress_percent,
+            started_at=job.started_at,
+            heartbeat_at=job.heartbeat_at,
             completed_at=job.completed_at,
             error_message=job.error_message,
         )

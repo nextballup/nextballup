@@ -1401,6 +1401,49 @@ async def test_video_status_reports_queued_after_complete(
     assert body["stages"]["transcode"]["status"] == "pending"
 
 
+@pytest.mark.asyncio(loop_scope="session")
+async def test_video_status_reports_running_worker_heartbeat(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, game = await _setup_coach_team_game(
+        storage_client, coach_email="status-heartbeat-coach@example.com"
+    )
+    video_id = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()["id"]
+    await storage_client.post(
+        f"{API}/videos/{video_id}/complete", json={"checksum_sha256": "c" * 64}
+    )
+    heartbeat_at = datetime.now(UTC)
+    await db_session.execute(
+        update(Video).where(Video.id == uuid.UUID(video_id)).values(status=VideoStatus.PROCESSING)
+    )
+    await db_session.execute(
+        update(ProcessingJob)
+        .where(
+            ProcessingJob.video_id == uuid.UUID(video_id),
+            ProcessingJob.stage == ProcessingJobStage.TRANSCODE,
+        )
+        .values(
+            status=ProcessingJobStatus.RUNNING,
+            progress_percent=50,
+            started_at=heartbeat_at,
+            heartbeat_at=heartbeat_at,
+        )
+    )
+    await db_session.commit()
+
+    status_response = await storage_client.get(f"{API}/videos/{video_id}/status")
+    assert status_response.status_code == 200
+    body = status_response.json()
+    assert body["status"] == "processing"
+    assert body["stage"] == "transcode"
+    assert body["stages"]["transcode"]["status"] == "running"
+    assert body["stages"]["transcode"]["progress_percent"] == 50
+    assert body["stages"]["transcode"]["started_at"] is not None
+    assert body["stages"]["transcode"]["heartbeat_at"] is not None
+
+
 def test_playback_status_mapping_for_lifecycle_states() -> None:
     assert (
         derive_playback_status(
