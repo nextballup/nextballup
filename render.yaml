@@ -115,7 +115,7 @@ services:
       - key: WORKER_PLAYBACK_CRF
         value: "26"
       - key: WORKER_PLAYBACK_PRESET
-        value: veryfast
+        value: superfast
 
   - type: worker
     name: nextballup-alpha-beat

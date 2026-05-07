@@ -123,7 +123,7 @@ the current Blueprint/env or the scratch disk is missing.
 Alpha playback transcode is optimized for pilot turnaround, not archival
 quality. The worker caps playback artifacts at 720p/30fps with
 `WORKER_PLAYBACK_MAX_WIDTH=1280`, `WORKER_PLAYBACK_MAX_FPS=30`,
-`WORKER_PLAYBACK_CRF=26`, and `WORKER_PLAYBACK_PRESET=veryfast`. The raw
+`WORKER_PLAYBACK_CRF=26`, and `WORKER_PLAYBACK_PRESET=superfast`. The raw
 upload remains in R2 for retention while available; this setting only affects
 the browser playback mezzanine.
 

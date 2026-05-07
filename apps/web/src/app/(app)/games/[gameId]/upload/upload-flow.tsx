@@ -13,7 +13,7 @@ import type {
 
 const SINGLE_PUT_LIMIT = 1_073_741_824; // Backend caps single PUT at 1 GB.
 const MAX_UPLOAD_SIZE_BYTES = 10 * 1024 ** 3; // Backend cap (see settings.max_upload_size_bytes).
-const MULTIPART_CONCURRENCY = 3;
+const MULTIPART_CONCURRENCY = 5;
 // Files above this threshold skip client-side SHA-256 to avoid browser OOM:
 // WebCrypto's `subtle.digest` has no incremental API, so hashing requires the
 // whole file resident in memory. The backend still verifies object size +
