@@ -1,9 +1,21 @@
 #!/bin/sh
 set -eu
 
-# Runs only the alpha detector preview queue. Export the Render/R2/Postgres
-# secrets in your shell before starting this process; this script deliberately
-# does not load or print them.
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd "$SCRIPT_DIR/.." && pwd)
+ENV_FILE="${NBU_LOCAL_ALPHA_PREVIEW_ENV:-$REPO_ROOT/.env.alpha-preview.local}"
+
+# Runs only the alpha detector preview queue. Keep Render/R2/Postgres secrets
+# in the gitignored env file; this script deliberately does not print them.
+if [ ! -f "$ENV_FILE" ]; then
+  echo "Missing $ENV_FILE. Copy .env.alpha-preview.local.example to .env.alpha-preview.local first." >&2
+  exit 1
+fi
+
+set -a
+. "$ENV_FILE"
+set +a
+
 export APP_ENV="${APP_ENV:-staging}"
 export CV_DEMO_PREVIEW_ENABLED="${CV_DEMO_PREVIEW_ENABLED:-false}"
 export CV_ALPHA_DETECTOR_PREVIEW_ENABLED="${CV_ALPHA_DETECTOR_PREVIEW_ENABLED:-true}"
@@ -14,7 +26,8 @@ export CELERY_DEMO_PREVIEW_QUEUE="${CELERY_DEMO_PREVIEW_QUEUE:-nextballup.demo_p
 export CELERY_WORKER_CONCURRENCY="${CELERY_WORKER_CONCURRENCY:-1}"
 export WORKER_MEDIA_TEMP_DIR="${WORKER_MEDIA_TEMP_DIR:-./local_artifacts/alpha-demo-scratch}"
 
-exec celery -A nextballup_worker.celery_app worker \
+cd "$REPO_ROOT"
+exec uv run celery -A nextballup_worker.celery_app worker \
   --loglevel="${CELERY_LOGLEVEL:-info}" \
   --concurrency="${CELERY_WORKER_CONCURRENCY}" \
   --queues="${CELERY_DEMO_PREVIEW_QUEUE}"

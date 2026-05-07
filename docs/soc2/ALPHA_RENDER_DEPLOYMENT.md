@@ -141,15 +141,18 @@ To enable it for private alpha only:
 3. Run a separate alpha preview worker with access to the already-trained
    detector config, checkpoint, and eval report, for example:
    `scripts/local_alpha_demo_preview_worker.sh`.
-4. Set `CV_ALPHA_DETECTOR_CONFIG_PATH`,
+4. Copy `.env.alpha-preview.local.example` to `.env.alpha-preview.local`,
+   fill the Render Postgres/Key Value and R2 values locally, then run
+   `scripts/local_alpha_demo_preview_preflight.sh`.
+5. Set `CV_ALPHA_DETECTOR_CONFIG_PATH`,
    `CV_ALPHA_DETECTOR_CHECKPOINT_PATH`, and
    `CV_ALPHA_DETECTOR_EVAL_REPORT_PATH`.
-5. The eval report must identify a basketball `detect` artifact and include
+6. The eval report must identify a basketball `detect` artifact and include
    `internal_alpha_poc_only` and `not_commercial_lineage` in
    `known_failure_modes`.
-6. Generated annotated preview MP4s are uploaded to object storage under the
+7. Generated annotated preview MP4s are uploaded to object storage under the
    video artifact prefix and are served through the authenticated API route.
-7. Do not insert an `ACTIVE` commercial `cv_model_artifacts` row unless the
+8. Do not insert an `ACTIVE` commercial `cv_model_artifacts` row unless the
    lineage is rights-cleared and `commercial_use_allowed=true`.
 
 ## Cloudflare Cutover
