@@ -1594,6 +1594,41 @@ async def test_video_detail_includes_demo_preview_when_available(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_video_detail_includes_shared_alpha_demo_preview_artifact(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+) -> None:
+    _, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-detail-shared@example.com",
+    )
+    preview_key = f"artifacts/shared-team/{video_id}/demo-preview.annotated.mp4"
+    fake_storage.object_sizes[preview_key] = 7
+    generated_at = datetime.now(tz=UTC)
+    video = await db_session.get(Video, video_id)
+    assert video is not None
+    video.demo_preview_status = "completed"
+    video.demo_preview_storage_key = preview_key
+    video.demo_preview_generated_at = generated_at
+    await db_session.commit()
+
+    response = await storage_client.get(f"{API}/videos/{video_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["demo_preview_enabled"] is True
+    assert body["demo_preview_status"] == "completed"
+    assert body["demo_preview_url"] == f"/api/v1/videos/{video_id}/demo-preview/artifact"
+    assert body["demo_preview_generated_at"] is not None
+
+    artifact = await storage_client.get(f"{API}/videos/{video_id}/demo-preview/artifact")
+    assert artifact.status_code == 307, artifact.text
+    assert artifact.headers["location"].startswith(f"https://fake-storage.test/{preview_key}")
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_coach_can_queue_demo_preview(
     storage_client: AsyncClient,
     db_session: AsyncSession,

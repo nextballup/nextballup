@@ -2028,6 +2028,8 @@ async def test_execute_demo_preview_completes_and_updates_video_detail(
     preview_path = demo_preview_env["preview_root"] / str(video_id) / "demo-preview.annotated.mp4"
     assert preview_path.is_file()
     assert preview_path.read_bytes() == b"annotated-preview"
+    preview_key = f"artifacts/{team_id}/{video_id}/demo-preview.annotated.mp4"
+    assert fake_storage.object_sizes[preview_key] == len(b"annotated-preview")
 
     detail = await storage_client.get(f"{API}/videos/{video_id}")
     assert detail.status_code == 200, detail.text
@@ -2038,9 +2040,9 @@ async def test_execute_demo_preview_completes_and_updates_video_detail(
     assert body["demo_preview_error_message"] is None
 
     artifact = await storage_client.get(f"{API}/videos/{video_id}/demo-preview/artifact")
-    assert artifact.status_code == 200, artifact.text
+    assert artifact.status_code == 307, artifact.text
     assert artifact.headers["cache-control"] == "private, no-store, max-age=0"
-    assert artifact.content == b"annotated-preview"
+    assert artifact.headers["location"].startswith(f"https://fake-storage.test/{preview_key}")
 
     assert (
         await _count_actions(

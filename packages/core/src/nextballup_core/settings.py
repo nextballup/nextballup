@@ -238,6 +238,7 @@ class Settings(BaseSettings):
     # finish immediately. Stage → queue routing lives in the worker module.
     celery_gpu_queue: str = "nextballup.gpu"
     celery_cpu_queue: str = "nextballup.cpu"
+    celery_demo_preview_queue: str = "nextballup.demo_preview"
     cv_pipeline_enabled: bool = False
     cv_require_model_artifacts: bool = True
     cv_model_artifact_required_stages: Annotated[list[str], NoDecode] = Field(

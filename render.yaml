@@ -60,6 +60,8 @@ services:
         value: nextballup-alpha-raw
       - key: S3_REGION
         value: auto
+      - key: CV_ALPHA_DETECTOR_PREVIEW_ENABLED
+        value: "true"
 
   - type: worker
     name: nextballup-alpha-worker
@@ -243,6 +245,8 @@ envVarGroups:
         value: "1"
       - key: CELERY_WORKER_MAX_TASKS_PER_CHILD
         value: "5"
+      - key: CELERY_DEMO_PREVIEW_QUEUE
+        value: nextballup.demo_preview
       - key: OBSERVABILITY_METRICS_ENABLED
         value: "false"
       - key: OBSERVABILITY_WORKER_METRICS_ENABLED

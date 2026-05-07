@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from nextballup_api.storage import storage_key_for_demo_preview, storage_upload_file
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +49,50 @@ async def _load_video(session: AsyncSession, video_id: uuid.UUID) -> Video | Non
     return result.scalar_one_or_none()
 
 
+def _set_preview_failed(video: Video, *, celery_task_id: str, error_message: str) -> None:
+    video.demo_preview_status = "failed"
+    video.demo_preview_task_id = celery_task_id
+    video.demo_preview_error_message = error_message[:1000]
+
+
+def _set_preview_completed(
+    video: Video,
+    *,
+    celery_task_id: str,
+    storage_key: str,
+    generated_at: datetime,
+) -> None:
+    video.demo_preview_status = "completed"
+    video.demo_preview_storage_key = storage_key
+    video.demo_preview_generated_at = generated_at
+    video.demo_preview_task_id = celery_task_id
+    video.demo_preview_error_message = None
+
+
+async def _upload_demo_preview_artifact(
+    *,
+    storage: StoragePresigner,
+    video: Video,
+    artifact_path: Path,
+) -> str:
+    storage_key = storage_key_for_demo_preview(
+        team_id=str(video.team_id),
+        video_id=str(video.id),
+    )
+    await storage_upload_file(
+        storage,
+        key=storage_key,
+        source=str(artifact_path),
+        content_type="video/mp4",
+        metadata={
+            "nbu-artifact-type": "alpha-detector-preview",
+            "nbu-video-id": str(video.id),
+            "nbu-team-id": str(video.team_id),
+        },
+    )
+    return storage_key
+
+
 async def finalize_demo_preview_failure(
     session: AsyncSession,
     *,
@@ -82,6 +129,7 @@ async def finalize_demo_preview_failure(
             task_id=celery_task_id,
             error_message=error_message,
         )
+        _set_preview_failed(video, celery_task_id=celery_task_id, error_message=error_message)
         await write_worker_audit(
             session,
             action=AuditAction.VIDEO_DEMO_PREVIEW_FAILED,
@@ -151,6 +199,20 @@ async def execute_demo_preview(
         )
 
     await set_worker_context(session, team_id=video.team_id)
+
+    async def _mark_preview_running() -> None:
+        mark_demo_preview_running(
+            settings=resolved,
+            video_id=video.id,
+            task_id=celery_task_id,
+        )
+        video.demo_preview_status = "running"
+        video.demo_preview_started_at = datetime.now(tz=UTC)
+        video.demo_preview_task_id = celery_task_id
+        video.demo_preview_error_message = None
+        await session.commit()
+        await set_worker_context(session, team_id=video.team_id)
+
     try:
         artifact = await render_demo_preview_artifact(
             video_id=video.id,
@@ -162,14 +224,12 @@ async def execute_demo_preview(
                 destination=destination,
             ),
             settings=resolved,
-            on_started=lambda: (
-                mark_demo_preview_running(
-                    settings=resolved,
-                    video_id=video.id,
-                    task_id=celery_task_id,
-                ),
-                None,
-            )[-1],
+            on_started=_mark_preview_running,
+        )
+        preview_storage_key = await _upload_demo_preview_artifact(
+            storage=resolved_storage,
+            video=video,
+            artifact_path=artifact.output_path,
         )
     except ConflictError as exc:
         if exc.code == ErrorCode.DEMO_PREVIEW_MACHINE_BUSY:
@@ -179,6 +239,8 @@ async def execute_demo_preview(
                 task_id=celery_task_id,
                 generated_at=None,
             )
+            video.demo_preview_status = "queued"
+            video.demo_preview_task_id = celery_task_id
             await session.commit()
             return DemoPreviewResult(
                 video_id=video.id,
@@ -203,6 +265,7 @@ async def execute_demo_preview(
             task_id=celery_task_id,
             error_message=exc.message,
         )
+        _set_preview_failed(video, celery_task_id=celery_task_id, error_message=exc.message)
         await write_worker_audit(
             session,
             action=AuditAction.VIDEO_DEMO_PREVIEW_FAILED,
@@ -227,6 +290,7 @@ async def execute_demo_preview(
             task_id=celery_task_id,
             error_message=exc.message,
         )
+        _set_preview_failed(video, celery_task_id=celery_task_id, error_message=exc.message)
         await write_worker_audit(
             session,
             action=AuditAction.VIDEO_DEMO_PREVIEW_FAILED,
@@ -252,6 +316,7 @@ async def execute_demo_preview(
             task_id=celery_task_id,
             error_message=message,
         )
+        _set_preview_failed(video, celery_task_id=celery_task_id, error_message=message)
         await write_worker_audit(
             session,
             action=AuditAction.VIDEO_DEMO_PREVIEW_FAILED,
@@ -274,6 +339,12 @@ async def execute_demo_preview(
             settings=resolved,
             video_id=video.id,
             task_id=celery_task_id,
+            generated_at=artifact.generated_at,
+        )
+        _set_preview_completed(
+            video,
+            celery_task_id=celery_task_id,
+            storage_key=preview_storage_key,
             generated_at=artifact.generated_at,
         )
         await write_worker_audit(

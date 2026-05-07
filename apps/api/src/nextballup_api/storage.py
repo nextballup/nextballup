@@ -458,6 +458,10 @@ def storage_key_for_thumbnail(*, team_id: str, video_id: str) -> str:
     return f"thumbnails/{team_id}/{video_id}/preview.jpg"
 
 
+def storage_key_for_demo_preview(*, team_id: str, video_id: str) -> str:
+    return f"artifacts/{team_id}/{video_id}/demo-preview.annotated.mp4"
+
+
 # --- CV-stage artifact layout ---------------------------------------------
 #
 # Each downstream CV stage deposits its output at a deterministic key under

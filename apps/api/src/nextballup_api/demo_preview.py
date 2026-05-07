@@ -4,11 +4,13 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import cast
 
 from nextballup_api.storage import StoragePresigner
 from nextballup_core.constants import ErrorCode
 from nextballup_core.demo_preview import (
     acquire_demo_preview_queue_lock,
+    demo_preview_url_path,
     mark_demo_preview_completed,
     mark_demo_preview_failed,
     mark_demo_preview_queued,
@@ -19,7 +21,7 @@ from nextballup_core.demo_preview import (
 )
 from nextballup_core.enums import VideoStatus
 from nextballup_core.errors import ConflictError, ServiceUnavailableError
-from nextballup_core.schemas.video import GenerateDemoPreviewResponse
+from nextballup_core.schemas.video import DemoPreviewStatusValue, GenerateDemoPreviewResponse
 from nextballup_core.settings import Settings
 from nextballup_db.models.video import Video
 
@@ -31,12 +33,20 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+_DEMO_PREVIEW_STATUSES = {"idle", "queued", "running", "completed", "failed"}
+
+
+def _demo_preview_status(value: str) -> DemoPreviewStatusValue:
+    if value not in _DEMO_PREVIEW_STATUSES:
+        return "idle"
+    return cast("DemoPreviewStatusValue", value)
 
 
 @dataclass(frozen=True)
 class QueuedDemoPreviewResult:
     response: GenerateDemoPreviewResponse
     enqueued: bool
+    task_id: str | None = None
 
 
 def _require_demo_preview_enabled(settings: Settings) -> None:
@@ -62,6 +72,17 @@ def _response_for_current_state(
     )
 
 
+def _response_for_video_preview_state(video: Video) -> GenerateDemoPreviewResponse:
+    status = getattr(video, "demo_preview_status", "idle")
+    preview_storage_key = getattr(video, "demo_preview_storage_key", None)
+    preview_url = demo_preview_url_path(video.id) if preview_storage_key else None
+    return GenerateDemoPreviewResponse(
+        status=_demo_preview_status(status),
+        preview_url=preview_url,
+        generated_at=getattr(video, "demo_preview_generated_at", None) if preview_url else None,
+    )
+
+
 def queue_demo_preview_request(
     *,
     video: Video,
@@ -69,7 +90,11 @@ def queue_demo_preview_request(
     storage: StoragePresigner,
 ) -> QueuedDemoPreviewResult:
     _require_demo_preview_enabled(settings)
-    validate_demo_preview_runtime(settings, startup=False)
+    validate_demo_preview_runtime(
+        settings,
+        startup=False,
+        require_inference_runtime=settings.cv_demo_preview_enabled,
+    )
     if video.status is not VideoStatus.PROCESSED:
         raise ConflictError(
             "Video must finish processing before a demo preview can be generated",
@@ -85,6 +110,12 @@ def queue_demo_preview_request(
         raise ServiceUnavailableError(
             "Object storage is not configured",
             code=ErrorCode.STORAGE_NOT_CONFIGURED,
+        )
+    if getattr(video, "demo_preview_status", "idle") in {"queued", "running"}:
+        return QueuedDemoPreviewResult(
+            response=_response_for_video_preview_state(video),
+            enqueued=False,
+            task_id=getattr(video, "demo_preview_task_id", None),
         )
 
     queue_lock = None
@@ -158,6 +189,7 @@ def queue_demo_preview_request(
                 generated_at=current_artifact.generated_at if current_artifact else None,
             ),
             enqueued=True,
+            task_id=task_id,
         )
     finally:
         release_demo_preview_lock(queue_lock)
@@ -169,6 +201,6 @@ def _enqueue_demo_preview_task(*, video_id: uuid.UUID, settings: Settings) -> st
     result = celery_app.send_task(
         "nextballup_worker.tasks.run_demo_preview",
         args=[str(video_id)],
-        queue=settings.celery_cpu_queue,
+        queue=settings.celery_demo_preview_queue,
     )
     return str(result.id)

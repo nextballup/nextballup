@@ -134,17 +134,22 @@ the commercial CV artifact path.
 
 To enable it for private alpha only:
 
-1. Place the already-trained detector config, checkpoint, and eval report on
-   the Render worker/API filesystem or another mounted path inside
-   `CV_DEMO_TRAINING_REPO_ROOT`.
-2. Set `CV_ALPHA_DETECTOR_PREVIEW_ENABLED=true`.
-3. Set `CV_ALPHA_DETECTOR_CONFIG_PATH`,
+1. Enable `CV_ALPHA_DETECTOR_PREVIEW_ENABLED=true` on the Render API so
+   coaches can queue the preview from the video page.
+2. Route preview jobs to `CELERY_DEMO_PREVIEW_QUEUE=nextballup.demo_preview`.
+   The Render transcode worker intentionally does not consume this queue.
+3. Run a separate alpha preview worker with access to the already-trained
+   detector config, checkpoint, and eval report, for example:
+   `scripts/local_alpha_demo_preview_worker.sh`.
+4. Set `CV_ALPHA_DETECTOR_CONFIG_PATH`,
    `CV_ALPHA_DETECTOR_CHECKPOINT_PATH`, and
    `CV_ALPHA_DETECTOR_EVAL_REPORT_PATH`.
-4. The eval report must identify a basketball `detect` artifact and include
+5. The eval report must identify a basketball `detect` artifact and include
    `internal_alpha_poc_only` and `not_commercial_lineage` in
    `known_failure_modes`.
-5. Do not insert an `ACTIVE` commercial `cv_model_artifacts` row unless the
+6. Generated annotated preview MP4s are uploaded to object storage under the
+   video artifact prefix and are served through the authenticated API route.
+7. Do not insert an `ACTIVE` commercial `cv_model_artifacts` row unless the
    lineage is rights-cleared and `commercial_use_allowed=true`.
 
 ## Cloudflare Cutover

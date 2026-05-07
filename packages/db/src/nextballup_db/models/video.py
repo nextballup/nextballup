@@ -105,6 +105,13 @@ class Video(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     raw_storage_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     raw_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     raw_delete_reason: Mapped[str | None] = mapped_column(String(64))
+    demo_preview_status: Mapped[str] = mapped_column(String(32), default="idle", nullable=False)
+    demo_preview_storage_key: Mapped[str | None] = mapped_column(String(1024))
+    demo_preview_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    demo_preview_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    demo_preview_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    demo_preview_task_id: Mapped[str | None] = mapped_column(String(128))
+    demo_preview_error_message: Mapped[str | None] = mapped_column(String(1000))
 
     game: Mapped[Game] = relationship(
         back_populates="videos",

@@ -211,7 +211,11 @@ def _validate_startup_secrets() -> None:
             "CV_ALPHA_DETECTOR_PREVIEW_ENABLED is only allowed in development/test/staging "
             "(fail-closed; alpha detector preview is not a production analytics path)"
         )
-    validate_demo_preview_runtime(settings, startup=True)
+    validate_demo_preview_runtime(
+        settings,
+        startup=True,
+        require_inference_runtime=settings.cv_demo_preview_enabled,
+    )
 
 
 @asynccontextmanager

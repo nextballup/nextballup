@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,7 +24,7 @@ from nextballup_core.settings import Settings
 
 DemoPreviewStatus = Literal["idle", "queued", "running", "completed", "failed"]
 DownloadArtifactFile = Callable[[str, str], Awaitable[None]]
-PreviewStartedHook = Callable[[], None]
+PreviewStartedHook = Callable[[], None | Awaitable[None]]
 _CONTROL_CHARS = re.compile(r"[\x00-\x1F\x7F-\x9F]+")
 
 
@@ -60,6 +61,25 @@ def _normalized_error_message(message: str) -> str:
 
 def _resolved_demo_root(settings: Settings) -> Path:
     return settings.resolve_repo_relative_path(settings.cv_demo_preview_root)
+
+
+def _resolved_demo_temp_parent(settings: Settings) -> str | None:
+    if settings.worker_media_temp_dir is None:
+        return None
+    temp_parent = settings.resolve_repo_relative_path(settings.worker_media_temp_dir)
+    try:
+        temp_parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ServiceUnavailableError(
+            "Alpha detector preview scratch directory is not writable",
+            code=ErrorCode.DEMO_PREVIEW_FAILED,
+        ) from exc
+    if not temp_parent.is_dir():
+        raise ServiceUnavailableError(
+            "Alpha detector preview scratch path is not a directory",
+            code=ErrorCode.DEMO_PREVIEW_FAILED,
+        )
+    return str(temp_parent)
 
 
 def _resolved_training_root(settings: Settings) -> Path:
@@ -272,7 +292,12 @@ def _repair_demo_preview_permissions(
         _chmod_best_effort(entry, 0o600)
 
 
-def validate_demo_preview_runtime(settings: Settings, *, startup: bool) -> None:
+def validate_demo_preview_runtime(
+    settings: Settings,
+    *,
+    startup: bool,
+    require_inference_runtime: bool = True,
+) -> None:
     if not settings.local_demo_preview_enabled():
         return
     if settings.app_env != "test" and not settings.celery_broker_url:
@@ -280,13 +305,14 @@ def validate_demo_preview_runtime(settings: Settings, *, startup: bool) -> None:
             "CV_DEMO_PREVIEW_ENABLED requires CELERY_BROKER_URL to be configured",
             startup=startup,
         )
-    if not settings.celery_cpu_queue.strip():
+    if not settings.celery_demo_preview_queue.strip():
         raise _runtime_error(
-            "CELERY_CPU_QUEUE must be configured before enabling local demo previews",
+            "CELERY_DEMO_PREVIEW_QUEUE must be configured before enabling local demo previews",
             startup=startup,
         )
-    _validate_demo_preview_inputs(settings, startup=startup)
-    if startup:
+    if require_inference_runtime:
+        _validate_demo_preview_inputs(settings, startup=startup)
+    if startup and require_inference_runtime:
         _repair_demo_preview_permissions(settings)
 
 
@@ -810,8 +836,13 @@ async def render_demo_preview_artifact(
             details={"video_id": str(video_id)},
         )
         if on_started is not None:
-            on_started()
-        with tempfile.TemporaryDirectory(prefix=f"nbu-demo-preview-{video_id}-") as temp_dir_raw:
+            started = on_started()
+            if isawaitable(started):
+                await started
+        with tempfile.TemporaryDirectory(
+            prefix=f"nbu-demo-preview-{video_id}-",
+            dir=_resolved_demo_temp_parent(settings),
+        ) as temp_dir_raw:
             temp_dir = Path(temp_dir_raw)
             input_path = temp_dir / "input.mp4"
             staged_output = temp_dir / "demo-preview.annotated.mp4"

@@ -569,7 +569,7 @@ def test_alpha_detector_preview_fails_closed_without_checkpoint(
     restore_env: None,
     tmp_path: Path,
 ) -> None:
-    from nextballup_api.main import _validate_startup_secrets
+    from nextballup_worker.tasks import _ensure_runtime_broker_configured
 
     _set_alpha_staging_env()
     os.environ["REGISTRATION_MODE"] = "invite_only"
@@ -579,14 +579,14 @@ def test_alpha_detector_preview_fails_closed_without_checkpoint(
     _write_alpha_detector_preview_files(tmp_path / "training", include_checkpoint=False)
     reload_settings()
     with pytest.raises(RuntimeError, match="checkpoint"):
-        _validate_startup_secrets()
+        _ensure_runtime_broker_configured()
 
 
 def test_alpha_detector_preview_requires_restricted_demo_lineage(
     restore_env: None,
     tmp_path: Path,
 ) -> None:
-    from nextballup_api.main import _validate_startup_secrets
+    from nextballup_worker.tasks import _ensure_runtime_broker_configured
 
     _set_alpha_staging_env()
     os.environ["REGISTRATION_MODE"] = "invite_only"
@@ -599,7 +599,7 @@ def test_alpha_detector_preview_requires_restricted_demo_lineage(
     )
     reload_settings()
     with pytest.raises(RuntimeError, match="internal_alpha_poc_only"):
-        _validate_startup_secrets()
+        _ensure_runtime_broker_configured()
 
 
 # ---- defaults are still backward-compatible ------------------------------

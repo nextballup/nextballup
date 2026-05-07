@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -132,11 +132,20 @@ class _PlaybackArtifact:
 
 
 @dataclass(frozen=True)
+class _DemoPreviewView:
+    status: str
+    url: str | None
+    generated_at: datetime | None
+    error_message: str | None
+
+
+@dataclass(frozen=True)
 class _VideoStorageCleanupResult:
     aborted_multipart: bool = False
     deleted_raw: bool = False
     deleted_mezzanine: bool = False
     deleted_hls: bool = False
+    deleted_demo_preview: bool = False
     failures: tuple[str, ...] = ()
 
 
@@ -155,6 +164,31 @@ def _playback_candidates(video: Video) -> tuple[tuple[str, str], ...]:
     if video.storage_key_mezzanine:
         candidates.append((video.storage_key_mezzanine, "mp4"))
     return tuple(candidates)
+
+
+def _demo_preview_view(*, video: Video, settings: Settings) -> _DemoPreviewView:
+    if video.demo_preview_status != "idle" or video.demo_preview_storage_key:
+        return _DemoPreviewView(
+            status=video.demo_preview_status,
+            url=(
+                f"/api/v1/videos/{video.id}/demo-preview/artifact"
+                if video.demo_preview_storage_key
+                else None
+            ),
+            generated_at=video.demo_preview_generated_at
+            if video.demo_preview_storage_key
+            else None,
+            error_message=video.demo_preview_error_message,
+        )
+
+    artifact = resolve_demo_preview(settings=settings, video_id=video.id)
+    state = resolve_demo_preview_state(settings=settings, video_id=video.id)
+    return _DemoPreviewView(
+        status=state.status,
+        url=artifact.url_path if artifact else None,
+        generated_at=artifact.generated_at if artifact else None,
+        error_message=state.error_message,
+    )
 
 
 def _object_metadata_value(metadata: dict[str, object], key: str) -> str | None:
@@ -638,6 +672,7 @@ def _video_has_storage_cleanup_work(video: Video) -> bool:
         or video.storage_key_raw
         or video.storage_key_mezzanine
         or video.storage_key_hls
+        or video.demo_preview_storage_key
     )
 
 
@@ -651,6 +686,7 @@ async def _delete_video_storage(
     deleted_raw = False
     deleted_mezzanine = False
     deleted_hls = False
+    deleted_demo_preview = False
 
     if video.upload_id is not None and video.storage_key_raw:
         try:
@@ -667,6 +703,7 @@ async def _delete_video_storage(
         ("raw", video.storage_key_raw),
         ("mezzanine", video.storage_key_mezzanine),
         ("hls", video.storage_key_hls),
+        ("demo_preview", video.demo_preview_storage_key),
     )
     attempted_keys: set[str] = set()
     for label, key in storage_objects:
@@ -684,12 +721,15 @@ async def _delete_video_storage(
             deleted_mezzanine = True
         elif label == "hls":
             deleted_hls = True
+        elif label == "demo_preview":
+            deleted_demo_preview = True
 
     return _VideoStorageCleanupResult(
         aborted_multipart=aborted_multipart,
         deleted_raw=deleted_raw,
         deleted_mezzanine=deleted_mezzanine,
         deleted_hls=deleted_hls,
+        deleted_demo_preview=deleted_demo_preview,
         failures=tuple(failures),
     )
 
@@ -722,6 +762,7 @@ async def _mark_video_cleanup_failed(
             "had_raw_object": video.storage_key_raw is not None,
             "had_mezzanine_object": video.storage_key_mezzanine is not None,
             "had_hls_object": video.storage_key_hls is not None,
+            "had_demo_preview_object": video.demo_preview_storage_key is not None,
             "had_multipart_upload": video.upload_id is not None,
         },
     )
@@ -1257,6 +1298,7 @@ async def delete_failed_video(
                 "deleted_raw": cleanup.deleted_raw,
                 "deleted_mezzanine": cleanup.deleted_mezzanine,
                 "deleted_hls": cleanup.deleted_hls,
+                "deleted_demo_preview": cleanup.deleted_demo_preview,
             },
         },
     )
@@ -1494,8 +1536,7 @@ async def get_video(
         storage=storage,
         settings=settings,
     )
-    demo_preview = resolve_demo_preview(settings=settings, video_id=video.id)
-    demo_preview_state = resolve_demo_preview_state(settings=settings, video_id=video.id)
+    demo_preview = _demo_preview_view(video=video, settings=settings)
     if playback is not None:
         await write_audit(
             session,
@@ -1518,10 +1559,10 @@ async def get_video(
         settings=settings,
         playback=playback,
         demo_preview_enabled=settings.local_demo_preview_enabled(),
-        demo_preview_status=demo_preview_state.status,
-        demo_preview_url=demo_preview.url_path if demo_preview else None,
-        demo_preview_generated_at=demo_preview.generated_at if demo_preview else None,
-        demo_preview_error_message=demo_preview_state.error_message,
+        demo_preview_status=demo_preview.status,
+        demo_preview_url=demo_preview.url,
+        demo_preview_generated_at=demo_preview.generated_at,
+        demo_preview_error_message=demo_preview.error_message,
     )
 
 
@@ -1707,6 +1748,13 @@ async def create_demo_preview(
             storage=_require_storage(storage),
             settings=settings,
         )
+        if result.enqueued:
+            now = datetime.now(tz=UTC)
+            video.demo_preview_status = result.response.status
+            video.demo_preview_requested_at = now
+            video.demo_preview_started_at = None
+            video.demo_preview_task_id = result.task_id
+            video.demo_preview_error_message = None
     except AppError as exc:
         await write_audit(
             session,
@@ -1753,7 +1801,8 @@ async def get_demo_preview_artifact(
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     settings: Settings = Depends(get_app_settings),
-) -> FileResponse:
+    storage: StoragePresigner | None = Depends(get_storage),
+) -> Response:
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
     session.sync_session.expunge_all()
@@ -1762,6 +1811,30 @@ async def get_demo_preview_artifact(
         raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
     await set_tenant_context(session, video.team_id)
     await require_team_member(session, user=current_user, team_id=video.team_id)
+
+    if video.demo_preview_storage_key:
+        presigner = _require_storage(storage)
+        metadata = await storage_head_object(presigner, key=video.demo_preview_storage_key)
+        if metadata is None or _uploaded_object_size(metadata) == 0:
+            raise NotFoundError("Demo preview not found", code=ErrorCode.NOT_FOUND)
+        url = await storage_presign_get(
+            presigner,
+            key=video.demo_preview_storage_key,
+            expires_in=min(
+                settings.playback_url_expires_seconds,
+                settings.playback_token_expire_seconds,
+            ),
+            response_content_type="video/mp4",
+        )
+        return RedirectResponse(
+            url=url,
+            status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+            headers={
+                "Cache-Control": "private, no-store, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
 
     artifact = resolve_demo_preview(settings=settings, video_id=video.id)
     if artifact is None:

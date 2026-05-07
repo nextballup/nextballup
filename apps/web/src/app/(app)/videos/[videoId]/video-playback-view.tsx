@@ -230,7 +230,7 @@ function DemoPreviewPanel({
       if (err instanceof ApiError) {
         setErrorMessage(err.message);
       } else {
-        setErrorMessage("Unable to generate the local demo preview.");
+        setErrorMessage("Unable to generate the alpha detector preview.");
       }
     },
   });
