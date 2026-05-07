@@ -73,10 +73,20 @@ def _build_ffmpeg_command(
     input_path: Path,
     output_path: Path,
     threads: int | None = None,
+    max_width: int = 1280,
+    max_fps: int = 30,
+    crf: int = 26,
+    preset: str = "veryfast",
 ) -> list[str]:
     thread_args: list[str] = []
     if threads is not None:
         thread_args = ["-threads", str(threads)]
+    filter_parts: list[str] = []
+    if max_width > 0:
+        filter_parts.append(f"scale='min({max_width},iw)':-2:force_original_aspect_ratio=decrease")
+    if max_fps > 0:
+        filter_parts.append(f"fps=fps='min({max_fps},source_fps)'")
+    filter_args = ["-vf", ",".join(filter_parts)] if filter_parts else []
     return [
         binary,
         "-nostdin",
@@ -101,10 +111,11 @@ def _build_ffmpeg_command(
         "-c:v",
         "libx264",
         *thread_args,
+        *filter_args,
         "-preset",
-        "veryfast",
+        preset,
         "-crf",
-        "23",
+        str(crf),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -475,6 +486,10 @@ async def create_browser_mezzanine(
                         input_path=input_path,
                         output_path=output_path,
                         threads=settings.worker_ffmpeg_threads,
+                        max_width=settings.worker_playback_max_width,
+                        max_fps=settings.worker_playback_max_fps,
+                        crf=settings.worker_playback_crf,
+                        preset=settings.worker_playback_preset,
                     ),
                     timeout_seconds=settings.worker_transcode_timeout_seconds,
                     unavailable_code=ErrorCode.PROCESSING_TRANSCODER_UNAVAILABLE,

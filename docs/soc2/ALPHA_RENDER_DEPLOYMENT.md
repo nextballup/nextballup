@@ -120,6 +120,13 @@ scratch space. The Blueprint attaches `alpha-worker-media-scratch` at
 If a worker event says `/tmp exceeded the limit of 2GB`, the worker is not on
 the current Blueprint/env or the scratch disk is missing.
 
+Alpha playback transcode is optimized for pilot turnaround, not archival
+quality. The worker caps playback artifacts at 720p/30fps with
+`WORKER_PLAYBACK_MAX_WIDTH=1280`, `WORKER_PLAYBACK_MAX_FPS=30`,
+`WORKER_PLAYBACK_CRF=26`, and `WORKER_PLAYBACK_PRESET=veryfast`. The raw
+upload remains in R2 for retention while available; this setting only affects
+the browser playback mezzanine.
+
 ## Alpha Detector Preview
 
 The alpha detector preview is disabled by default and must stay separate from

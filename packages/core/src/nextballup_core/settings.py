@@ -259,6 +259,10 @@ class Settings(BaseSettings):
     worker_transcode_timeout_seconds: int = 7_200
     worker_ffmpeg_threads: int = Field(default=2, ge=1, le=16)
     worker_media_temp_dir: Path | None = None
+    worker_playback_max_width: int = Field(default=1280, ge=0, le=7680)
+    worker_playback_max_fps: int = Field(default=30, ge=0, le=240)
+    worker_playback_crf: int = Field(default=26, ge=0, le=51)
+    worker_playback_preset: str = "veryfast"
     worker_media_subprocess_sandbox: bool = True
     worker_media_max_cpu_seconds: int = Field(default=7_200, ge=0)
     worker_media_max_output_bytes: int = Field(default=100 * 1024 * 1024 * 1024, ge=0)

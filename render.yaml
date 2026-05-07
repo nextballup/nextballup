@@ -108,6 +108,14 @@ services:
         value: auto
       - key: WORKER_MEDIA_TEMP_DIR
         value: /var/data/nextballup-transcode
+      - key: WORKER_PLAYBACK_MAX_WIDTH
+        value: "1280"
+      - key: WORKER_PLAYBACK_MAX_FPS
+        value: "30"
+      - key: WORKER_PLAYBACK_CRF
+        value: "26"
+      - key: WORKER_PLAYBACK_PRESET
+        value: veryfast
 
   - type: worker
     name: nextballup-alpha-beat

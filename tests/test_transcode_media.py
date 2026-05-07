@@ -97,10 +97,32 @@ def test_build_ffmpeg_command_strips_sensitive_metadata_and_targets_mp4() -> Non
     assert "-map_chapters" in command
     assert "-sn" in command
     assert "-dn" in command
+    assert "-vf" in command
+    vf = command[command.index("-vf") + 1]
+    assert "scale='min(1280,iw)':-2:force_original_aspect_ratio=decrease" in vf
+    assert "fps=fps='min(30,source_fps)'" in vf
     assert "-movflags" in command
     assert "+faststart" in command
     assert command[command.index("-threads") + 1] == "2"
+    assert command[command.index("-crf") + 1] == "26"
     assert command[-1] == "/tmp/output.mp4"
+
+
+def test_build_ffmpeg_command_can_disable_alpha_playback_caps() -> None:
+    command = _build_ffmpeg_command(
+        binary="ffmpeg",
+        input_path=Path("/tmp/input.mov"),
+        output_path=Path("/tmp/output.mp4"),
+        threads=2,
+        max_width=0,
+        max_fps=0,
+        crf=23,
+        preset="superfast",
+    )
+
+    assert "-vf" not in command
+    assert command[command.index("-crf") + 1] == "23"
+    assert command[command.index("-preset") + 1] == "superfast"
 
 
 def test_media_subprocess_env_drops_application_secrets(
