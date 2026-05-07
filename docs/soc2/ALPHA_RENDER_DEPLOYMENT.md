@@ -114,6 +114,26 @@ shape that the production checklist expects. Keep
 `WORKER_MEDIA_CONTAINER_SANDBOX_ENABLED=true` for production/beta transcode
 workers on infrastructure that supports that hardened container profile.
 
+## Alpha Detector Preview
+
+The alpha detector preview is disabled by default and must stay separate from
+the commercial CV artifact path.
+
+To enable it for private alpha only:
+
+1. Place the already-trained detector config, checkpoint, and eval report on
+   the Render worker/API filesystem or another mounted path inside
+   `CV_DEMO_TRAINING_REPO_ROOT`.
+2. Set `CV_ALPHA_DETECTOR_PREVIEW_ENABLED=true`.
+3. Set `CV_ALPHA_DETECTOR_CONFIG_PATH`,
+   `CV_ALPHA_DETECTOR_CHECKPOINT_PATH`, and
+   `CV_ALPHA_DETECTOR_EVAL_REPORT_PATH`.
+4. The eval report must identify a basketball `detect` artifact and include
+   `internal_alpha_poc_only` and `not_commercial_lineage` in
+   `known_failure_modes`.
+5. Do not insert an `ACTIVE` commercial `cv_model_artifacts` row unless the
+   lineage is rights-cleared and `commercial_use_allowed=true`.
+
 ## Cloudflare Cutover
 
 Keep the current `nextballup-alpha-holding` Worker until Render is green.

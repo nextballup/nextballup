@@ -1,9 +1,10 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { CancelUploadButton } from "@/components/cancel-upload-button";
-import { apiJson } from "@/lib/api-client";
+import { apiJson, apiVoid } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
 import {
   CV_PIPELINE_STAGES,
@@ -21,11 +22,6 @@ const POLL_INTERVAL_MS = 3_000;
 // before token_expires_at — 30 s of slack gives the user time to start
 // playback on a slow connection without the URL expiring mid-stream.
 const TOKEN_REFRESH_SLACK_MS = 30_000;
-
-// Stages where the admin requeue endpoint will accept input. Non-terminal
-// states (running/pending) are rejected by the backend with 409, so don't
-// even offer the button for those.
-const REQUEUEABLE_STAGE_STATES = new Set(["failed", "completed"]);
 
 export function VideoPlaybackView({
   initialVideo,
@@ -91,14 +87,49 @@ export function VideoPlaybackView({
     <div className="space-y-4">
       <PlaybackPanel video={video} />
       <PendingUploadRecoveryPanel video={video} viewerRole={viewerRole} />
+      <FailedVideoRecoveryPanel video={video} viewerRole={viewerRole} />
       <DemoPreviewPanel video={video} viewerRole={viewerRole} />
       <MetadataPanel video={video} />
       <ProcessingPanel
         status={statusQuery.data}
         video={video}
-        viewerRole={viewerRole}
       />
     </div>
+  );
+}
+
+function FailedVideoRecoveryPanel({
+  video,
+  viewerRole,
+}: {
+  video: VideoDetailResponse;
+  viewerRole: UserRole | null;
+}) {
+  const canRecover = viewerRole === "coach" || viewerRole === "admin";
+  const transcodeFailed =
+    video.status === "failed" && video.processing.transcode === "failed";
+  if (video.status !== "failed" || !canRecover) {
+    return null;
+  }
+  return (
+    <section className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] p-4 text-sm">
+      <div className="space-y-1">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+          Video recovery
+        </h2>
+        <p className="text-[color:var(--color-nbu-text-muted)]">
+          Retry processing checks the original upload and queues transcoding
+          again. Delete video removes the failed upload record and known
+          storage objects.
+        </p>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {transcodeFailed ? (
+          <RequeueButton videoId={video.id} stage="transcode" />
+        ) : null}
+        <DeleteVideoButton videoId={video.id} gameId={video.game_id} />
+      </div>
+    </section>
   );
 }
 
@@ -186,11 +217,10 @@ function DemoPreviewPanel({
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div className="space-y-1">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
-            Local model preview
+            Alpha detector preview
           </h2>
           <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
-            Dev-only overlay rendered by the sibling training repo checkpoint.
-            This is for internal sanity checks, not production inference.
+            Review only. Not production analytics.
           </p>
           {generatedAt ? (
             <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
@@ -209,10 +239,10 @@ function DemoPreviewPanel({
             {mutation.isPending
               ? "Queueing preview…"
               : previewBusy
-                ? "Generating preview…"
+                ? "Generating detector preview…"
               : previewUrl
-                ? "Regenerate local overlay"
-                : "Generate local overlay"}
+                ? "Regenerate detector preview"
+                : "Generate detector preview"}
           </button>
         ) : null}
       </div>
@@ -226,8 +256,8 @@ function DemoPreviewPanel({
         <VideoPlayer key={previewRenderUrl} url={previewRenderUrl} format="mp4" />
       ) : (
         <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-5 text-xs text-[color:var(--color-nbu-text-muted)]">
-          Generate a local overlay preview from the processed mezzanine to test
-          the current prototype detector inside the platform.
+          Generate a detector overlay from the processed mezzanine for internal
+          alpha review.
         </div>
       )}
       {resolvedErrorMessage ? (
@@ -327,11 +357,9 @@ function MetadataPanel({ video }: { video: VideoDetailResponse }) {
 function ProcessingPanel({
   status,
   video,
-  viewerRole,
 }: {
   status: VideoStatusResponse | undefined;
   video: VideoDetailResponse;
-  viewerRole: UserRole | null;
 }) {
   const stages = status?.stages ?? fallbackStages(video);
   const implemented = Object.entries(stages).filter(([stage]) =>
@@ -341,7 +369,6 @@ function ProcessingPanel({
     (stage) =>
       !IMPLEMENTED_PIPELINE_STAGES.has(stage) && CV_PIPELINE_STAGES.includes(stage),
   );
-  const isAdmin = viewerRole === "admin";
   return (
     <div className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm">
       <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
@@ -353,8 +380,6 @@ function ProcessingPanel({
           const progress =
             "progress_percent" in detail ? detail.progress_percent : undefined;
           const errorMessage = detail.error_message;
-          const canRequeue =
-            isAdmin && REQUEUEABLE_STAGE_STATES.has(statusValue);
           return (
             <li
               key={stage}
@@ -367,9 +392,6 @@ function ProcessingPanel({
                   {typeof progress === "number" ? ` ${progress}%` : ""}
                 </span>
               </div>
-              {canRequeue && (
-                <RequeueButton videoId={video.id} stage={stage} />
-              )}
               {errorMessage ? (
                 <p
                   role="alert"
@@ -453,7 +475,54 @@ function RequeueButton({
         data-testid={`requeue-${stage}`}
         className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
       >
-        {mutation.isPending ? "Requeuing…" : "Requeue stage (admin)"}
+        {mutation.isPending ? "Retrying…" : "Retry processing"}
+      </button>
+      {errorMessage && (
+        <span role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
+          {errorMessage}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function DeleteVideoButton({
+  videoId,
+  gameId,
+}: {
+  videoId: string;
+  gameId: string;
+}) {
+  const router = useRouter();
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: () =>
+      apiVoid(`/videos/${videoId}`, {
+        method: "DELETE",
+      }),
+    onSuccess: () => {
+      setErrorMessage(null);
+      router.push(`/games/${gameId}`);
+      router.refresh();
+    },
+    onError: (err) => {
+      if (err instanceof ApiError) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage("Unable to delete video.");
+      }
+    },
+  });
+  return (
+    <div className="flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={() => mutation.mutate()}
+        disabled={mutation.isPending}
+        data-testid="delete-video"
+        className="self-start rounded-md border border-[color:var(--color-nbu-error)] px-2 py-0.5 text-xs font-medium text-[color:var(--color-nbu-error)] transition hover:bg-[color:var(--color-nbu-surface)] disabled:opacity-50"
+      >
+        {mutation.isPending ? "Deleting…" : "Delete video"}
       </button>
       {errorMessage && (
         <span role="alert" className="text-xs text-[color:var(--color-nbu-error)]">

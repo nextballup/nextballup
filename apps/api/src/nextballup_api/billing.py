@@ -424,6 +424,27 @@ async def release_video_upload_quota_reservation(
     plan_ctx = await resolve_team_plan(session, team_id=team_id)
     if plan_ctx is None:
         return None
+    net_reserved = int(
+        await session.scalar(
+            text(
+                """
+                SELECT COALESCE(SUM(quantity), 0)
+                FROM usage_events
+                WHERE billing_account_id = :billing_account_id
+                  AND team_id = :team_id
+                  AND event_key = 'video.upload.initiated'
+                  AND event_metadata ->> 'video_id' = :video_id
+                """
+            ).bindparams(
+                billing_account_id=plan_ctx.account_id,
+                team_id=team_id,
+                video_id=str(video_id),
+            )
+        )
+        or 0
+    )
+    if net_reserved <= 0:
+        return None
     return await record_usage(
         session,
         billing_account_id=plan_ctx.account_id,

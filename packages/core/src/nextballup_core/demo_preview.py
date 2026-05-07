@@ -109,6 +109,65 @@ def _ensure_path_within_root(*, root: Path, path: Path, label: str, startup: boo
     return resolved
 
 
+def _preview_config_path(settings: Settings) -> Path:
+    if settings.alpha_detector_preview_enabled():
+        return settings.cv_alpha_detector_config_path
+    return settings.cv_demo_config_path
+
+
+def _preview_checkpoint_path(settings: Settings) -> Path:
+    if settings.alpha_detector_preview_enabled():
+        return settings.cv_alpha_detector_checkpoint_path
+    return settings.cv_demo_checkpoint_path
+
+
+def _validate_alpha_detector_preview_report(
+    settings: Settings,
+    *,
+    training_root: Path,
+    startup: bool,
+) -> None:
+    if not settings.alpha_detector_preview_enabled():
+        return
+    report_path = _ensure_path_within_root(
+        root=training_root,
+        path=settings.resolve_repo_relative_path(settings.cv_alpha_detector_eval_report_path),
+        label="alpha detector eval report",
+        startup=startup,
+    )
+    if not report_path.is_file():
+        raise _runtime_error(
+            "Alpha detector preview eval report is not available",
+            startup=startup,
+        )
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _runtime_error(
+            "Alpha detector preview eval report could not be read",
+            startup=startup,
+        ) from exc
+    known_failure_modes = report.get("known_failure_modes")
+    if not isinstance(known_failure_modes, list):
+        raise _runtime_error(
+            "Alpha detector preview eval report must declare known_failure_modes",
+            startup=startup,
+        )
+    failure_modes = {str(mode) for mode in known_failure_modes}
+    required_modes = {"internal_alpha_poc_only", "not_commercial_lineage"}
+    if not required_modes.issubset(failure_modes):
+        raise _runtime_error(
+            "Alpha detector preview artifact must be marked internal_alpha_poc_only "
+            "and not_commercial_lineage",
+            startup=startup,
+        )
+    if report.get("stage") != "detect" or report.get("sport") != "basketball":
+        raise _runtime_error(
+            "Alpha detector preview eval report must describe a basketball detect artifact",
+            startup=startup,
+        )
+
+
 def _validate_demo_preview_inputs(
     settings: Settings,
     *,
@@ -137,14 +196,19 @@ def _validate_demo_preview_inputs(
     )
     config_path = _ensure_path_within_root(
         root=training_root,
-        path=settings.resolve_repo_relative_path(settings.cv_demo_config_path),
+        path=settings.resolve_repo_relative_path(_preview_config_path(settings)),
         label="config",
         startup=startup,
     )
     checkpoint_path = _ensure_path_within_root(
         root=training_root,
-        path=settings.resolve_repo_relative_path(settings.cv_demo_checkpoint_path),
+        path=settings.resolve_repo_relative_path(_preview_checkpoint_path(settings)),
         label="checkpoint",
+        startup=startup,
+    )
+    _validate_alpha_detector_preview_report(
+        settings,
+        training_root=training_root,
         startup=startup,
     )
     required_files = {

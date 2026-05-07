@@ -12,9 +12,11 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -55,6 +57,12 @@ _ENV_KEYS = (
     "FRONTEND_APP_URL",
     "DATABASE_URL_RUNTIME",
     "CV_DEMO_PREVIEW_ENABLED",
+    "CV_DEMO_TRAINING_REPO_ROOT",
+    "CV_ALPHA_DETECTOR_PREVIEW_ENABLED",
+    "CV_ALPHA_DETECTOR_CONFIG_PATH",
+    "CV_ALPHA_DETECTOR_CHECKPOINT_PATH",
+    "CV_ALPHA_DETECTOR_EVAL_REPORT_PATH",
+    "CELERY_BROKER_URL",
     "S3_ENDPOINT_URL",
     "S3_ACCESS_KEY",
     "S3_SECRET_KEY",
@@ -492,6 +500,105 @@ def test_alpha_staging_refuses_demo_preview_bridge(restore_env: None) -> None:
     os.environ["CV_DEMO_PREVIEW_ENABLED"] = "true"
     reload_settings()
     with pytest.raises(RuntimeError, match="CV_DEMO_PREVIEW_ENABLED"):
+        _validate_startup_secrets()
+
+
+def _write_alpha_detector_preview_files(
+    root: Path,
+    *,
+    include_checkpoint: bool = True,
+    known_failure_modes: list[str] | None = None,
+) -> None:
+    script = root / "scripts" / "local_demo_infer.py"
+    config = root / "configs" / "experiments" / "basketball" / "detect" / "alpha.yaml"
+    checkpoint = root / "runs" / "alpha" / "checkpoint_best_total.pth"
+    report = root / "runs" / "alpha" / "eval_report.json"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    config.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("print('alpha detector preview')\n", encoding="utf-8")
+    config.write_text("experiment_id: alpha\n", encoding="utf-8")
+    if include_checkpoint:
+        checkpoint.write_bytes(b"checkpoint")
+    report.write_text(
+        json.dumps(
+            {
+                "stage": "detect",
+                "sport": "basketball",
+                "known_failure_modes": known_failure_modes
+                or ["internal_alpha_poc_only", "not_commercial_lineage"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.environ["CV_DEMO_TRAINING_REPO_ROOT"] = str(root)
+    os.environ["CV_ALPHA_DETECTOR_CONFIG_PATH"] = str(config)
+    os.environ["CV_ALPHA_DETECTOR_CHECKPOINT_PATH"] = str(checkpoint)
+    os.environ["CV_ALPHA_DETECTOR_EVAL_REPORT_PATH"] = str(report)
+
+
+def test_alpha_staging_accepts_gated_detector_preview_with_restricted_report(
+    restore_env: None,
+    tmp_path: Path,
+) -> None:
+    from nextballup_api.main import _validate_startup_secrets
+
+    _set_alpha_staging_env()
+    os.environ["REGISTRATION_MODE"] = "invite_only"
+    os.environ["REGISTRATION_INVITE_CODES"] = "ALPHA-CODE-AAAA"
+    os.environ["CELERY_BROKER_URL"] = "redis://127.0.0.1:6379/0"
+    os.environ["CV_ALPHA_DETECTOR_PREVIEW_ENABLED"] = "true"
+    _write_alpha_detector_preview_files(tmp_path / "training")
+    reload_settings()
+    _validate_startup_secrets()
+
+
+def test_production_refuses_alpha_detector_preview(restore_env: None) -> None:
+    from nextballup_api.main import _validate_startup_secrets
+
+    _set_production_env()
+    os.environ["REGISTRATION_MODE"] = "invite_only"
+    os.environ["REGISTRATION_INVITE_CODES"] = "PILOT-CODE-AAAA"
+    os.environ["CV_ALPHA_DETECTOR_PREVIEW_ENABLED"] = "true"
+    reload_settings()
+    with pytest.raises(RuntimeError, match="CV_ALPHA_DETECTOR_PREVIEW_ENABLED"):
+        _validate_startup_secrets()
+
+
+def test_alpha_detector_preview_fails_closed_without_checkpoint(
+    restore_env: None,
+    tmp_path: Path,
+) -> None:
+    from nextballup_api.main import _validate_startup_secrets
+
+    _set_alpha_staging_env()
+    os.environ["REGISTRATION_MODE"] = "invite_only"
+    os.environ["REGISTRATION_INVITE_CODES"] = "ALPHA-CODE-AAAA"
+    os.environ["CELERY_BROKER_URL"] = "redis://127.0.0.1:6379/0"
+    os.environ["CV_ALPHA_DETECTOR_PREVIEW_ENABLED"] = "true"
+    _write_alpha_detector_preview_files(tmp_path / "training", include_checkpoint=False)
+    reload_settings()
+    with pytest.raises(RuntimeError, match="checkpoint"):
+        _validate_startup_secrets()
+
+
+def test_alpha_detector_preview_requires_restricted_demo_lineage(
+    restore_env: None,
+    tmp_path: Path,
+) -> None:
+    from nextballup_api.main import _validate_startup_secrets
+
+    _set_alpha_staging_env()
+    os.environ["REGISTRATION_MODE"] = "invite_only"
+    os.environ["REGISTRATION_INVITE_CODES"] = "ALPHA-CODE-AAAA"
+    os.environ["CELERY_BROKER_URL"] = "redis://127.0.0.1:6379/0"
+    os.environ["CV_ALPHA_DETECTOR_PREVIEW_ENABLED"] = "true"
+    _write_alpha_detector_preview_files(
+        tmp_path / "training",
+        known_failure_modes=["commercial_lineage_claimed"],
+    )
+    reload_settings()
+    with pytest.raises(RuntimeError, match="internal_alpha_poc_only"):
         _validate_startup_secrets()
 
 

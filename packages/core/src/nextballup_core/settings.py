@@ -292,6 +292,22 @@ class Settings(BaseSettings):
         "../nextballup-vision-training/runs/bb_detect_rfdetr_demo_local_overfit_v1/"
         "demo-01/checkpoints/checkpoint_best_total.pth"
     )
+    cv_alpha_detector_preview_enabled: bool = False
+    cv_alpha_detector_config_path: Path = Path(
+        "../nextballup-vision-training/configs/experiments/basketball/detect/"
+        "rfdetr_ebard_alpha_demo_v1.yaml"
+    )
+    cv_alpha_detector_checkpoint_path: Path = Path(
+        "../nextballup-vision-training/local_artifacts/runs_alpha/runs/"
+        "bb_detect_rfdetr_ebard_alpha_demo_v1/"
+        "bb_detect_rfdetr_ebard_alpha_demo_v1-20260505T190931Z/"
+        "checkpoints/checkpoint_best_total.pth"
+    )
+    cv_alpha_detector_eval_report_path: Path = Path(
+        "../nextballup-vision-training/local_artifacts/runs_alpha/runs/"
+        "bb_detect_rfdetr_ebard_alpha_demo_v1/"
+        "bb_detect_rfdetr_ebard_alpha_demo_v1-20260505T190931Z/eval_report.json"
+    )
     cv_demo_sample_fps: float = Field(default=2.0, gt=0.0, le=30.0)
     cv_demo_max_sample_fps: float = Field(default=4.0, gt=0.0, le=10.0)
     cv_demo_timeout_seconds: int = Field(default=1800, ge=30, le=7200)
@@ -483,7 +499,19 @@ class Settings(BaseSettings):
 
     def local_demo_preview_enabled(self) -> bool:
         """Whether the internal demo-preview bridge may be used at runtime."""
-        return self.cv_demo_preview_enabled and self.app_env in ("development", "test")
+        dev_demo_enabled = self.cv_demo_preview_enabled and self.app_env in (
+            "development",
+            "test",
+        )
+        return dev_demo_enabled or self.alpha_detector_preview_enabled()
+
+    def alpha_detector_preview_enabled(self) -> bool:
+        """Whether the restricted alpha detector preview may be used."""
+        return self.cv_alpha_detector_preview_enabled and self.app_env in (
+            "development",
+            "test",
+            "staging",
+        )
 
     def repo_root(self) -> Path:
         """Resolve the repository root independent of the process CWD."""

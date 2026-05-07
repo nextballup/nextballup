@@ -102,6 +102,28 @@ async def test_only_active_commercial_artifacts_are_selectable(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_restricted_alpha_detector_cannot_be_promoted_to_commercial_artifact(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_artifact(
+        db_session,
+        stage=ProcessingJobStage.DETECTION,
+        tier=0,
+        version=f"basketball.detect.ebard_alpha_demo-{uuid.uuid4().hex[:6]}",
+        commercial=False,
+        status=ModelArtifactStatus.ACTIVE,
+    )
+
+    chosen = await _active_artifact_for_stage(
+        db_session,
+        ProcessingJobStage.DETECTION,
+        plan_tier=20,
+    )
+
+    assert chosen is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_newer_artifact_wins_for_same_tier(db_session: AsyncSession) -> None:
     older = await _seed_artifact(
         db_session,

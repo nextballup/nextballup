@@ -258,11 +258,11 @@ async def test_cross_tenant_game_patch_is_denied(storage_client: AsyncClient) ->
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_cross_tenant_requeue_is_denied_for_non_admin_coach(
+async def test_requeue_rejects_non_failed_video_for_team_coach(
     storage_client: AsyncClient,
 ) -> None:
-    """Even if a coach owns team A, they must not be able to POST a requeue
-    against team A's own job — the endpoint is admin-only, not coach-escalable."""
+    """Team coaches can retry failed alpha transcodes, but the endpoint must
+    still reject active/non-failed uploads instead of creating duplicate work."""
     _, _, video = await _seed_team_with_video(
         storage_client, coach_email="idor-requeue@example.com"
     )
@@ -271,7 +271,7 @@ async def test_cross_tenant_requeue_is_denied_for_non_admin_coach(
         f"{API}/videos/{video['id']}/processing/requeue",
         json={"stage": "transcode"},
     )
-    assert response.status_code == 403
+    assert response.status_code == 409
 
 
 # ---- Role-tier escalation -------------------------------------------------

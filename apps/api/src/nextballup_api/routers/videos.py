@@ -29,7 +29,6 @@ from nextballup_api.deps import get_app_settings, get_current_user, get_db
 from nextballup_api.permissions import (
     require_team_coach,
     require_team_member,
-    require_user_role,
     require_verified_account,
 )
 from nextballup_api.security.jwt import create_playback_token, decode_token
@@ -128,6 +127,15 @@ class _PlaybackArtifact:
     token: str
     fmt: str
     expires_at: datetime
+
+
+@dataclass(frozen=True)
+class _VideoStorageCleanupResult:
+    aborted_multipart: bool = False
+    deleted_raw: bool = False
+    deleted_mezzanine: bool = False
+    deleted_hls: bool = False
+    failures: tuple[str, ...] = ()
 
 
 def _playback_content_type(fmt: str) -> str | None:
@@ -620,6 +628,143 @@ async def _delete_raw_object_best_effort(
         return
 
 
+def _video_has_storage_cleanup_work(video: Video) -> bool:
+    return bool(
+        video.upload_id
+        or video.storage_key_raw
+        or video.storage_key_mezzanine
+        or video.storage_key_hls
+    )
+
+
+async def _delete_video_storage(
+    *,
+    presigner: StoragePresigner,
+    video: Video,
+) -> _VideoStorageCleanupResult:
+    failures: list[str] = []
+    aborted_multipart = False
+    deleted_raw = False
+    deleted_mezzanine = False
+    deleted_hls = False
+
+    if video.upload_id is not None and video.storage_key_raw:
+        try:
+            await storage_abort_multipart(
+                presigner,
+                key=video.storage_key_raw,
+                upload_id=video.upload_id,
+            )
+            aborted_multipart = True
+        except Exception:
+            failures.append("multipart_upload")
+
+    storage_objects = (
+        ("raw", video.storage_key_raw),
+        ("mezzanine", video.storage_key_mezzanine),
+        ("hls", video.storage_key_hls),
+    )
+    attempted_keys: set[str] = set()
+    for label, key in storage_objects:
+        if not key or key in attempted_keys:
+            continue
+        attempted_keys.add(key)
+        try:
+            await storage_delete_object(presigner, key=key)
+        except Exception:
+            failures.append(label)
+            continue
+        if label == "raw":
+            deleted_raw = True
+        elif label == "mezzanine":
+            deleted_mezzanine = True
+        elif label == "hls":
+            deleted_hls = True
+
+    return _VideoStorageCleanupResult(
+        aborted_multipart=aborted_multipart,
+        deleted_raw=deleted_raw,
+        deleted_mezzanine=deleted_mezzanine,
+        deleted_hls=deleted_hls,
+        failures=tuple(failures),
+    )
+
+
+async def _mark_video_cleanup_failed(
+    *,
+    session: AsyncSession,
+    request: Request,
+    current_user: User,
+    video: Video,
+    reason: str,
+    failures: tuple[str, ...],
+) -> None:
+    now = datetime.now(tz=UTC)
+    video.raw_delete_requested_at = video.raw_delete_requested_at or now
+    video.raw_delete_failed_at = now
+    video.raw_delete_reason = "user_cleanup"
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_DELETE_FAILED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="video",
+        resource_id=video.id,
+        team_id=video.team_id,
+        extra={
+            "reason": reason,
+            "failed_cleanup": list(failures),
+            "had_raw_object": video.storage_key_raw is not None,
+            "had_mezzanine_object": video.storage_key_mezzanine is not None,
+            "had_hls_object": video.storage_key_hls is not None,
+            "had_multipart_upload": video.upload_id is not None,
+        },
+    )
+
+
+async def _assert_raw_object_requeueable(
+    *,
+    video: Video,
+    presigner: StoragePresigner,
+) -> None:
+    if (
+        not video.storage_key_raw
+        or video.raw_deleted_at is not None
+        or video.raw_storage_deleted_at is not None
+    ):
+        raise ConflictError(
+            "Original upload is no longer available; delete the video and upload again",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"reason": "raw_object_unavailable"},
+        )
+    metadata = await storage_head_object(presigner, key=video.storage_key_raw)
+    if metadata is None:
+        raise ConflictError(
+            "Original upload is missing from storage; delete the video and upload again",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"reason": "raw_object_missing"},
+        )
+    actual_size = _uploaded_object_size(metadata)
+    if (
+        actual_size is not None
+        and video.file_size_bytes is not None
+        and actual_size != video.file_size_bytes
+    ):
+        raise ConflictError(
+            "Original upload no longer matches the recorded file size",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"reason": "raw_object_size_mismatch"},
+        )
+    actual_checksum = _uploaded_object_checksum_sha256(metadata)
+    if video.checksum_sha256 and actual_checksum and actual_checksum != video.checksum_sha256:
+        raise ConflictError(
+            "Original upload no longer matches the recorded checksum",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"reason": "raw_object_checksum_mismatch"},
+        )
+
+
 async def _verify_uploaded_object(
     *,
     session: AsyncSession,
@@ -1017,6 +1162,102 @@ async def cancel_upload(
         role=current_user.role,
         team_id=video.team_id,
     )
+    return None
+
+
+@router.delete("/{video_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_failed_video(
+    video_id: uuid.UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+    storage: StoragePresigner | None = Depends(get_storage),
+) -> None:
+    """Coach/admin cleanup for failed videos and abandoned upload rows.
+
+    This is intentionally narrow for alpha recovery: processed videos are not
+    removable through this path, and cleanup only succeeds once known storage
+    handles have been removed or aborted. Storage failures leave the row in a
+    failed auditable state so operators can retry or reconcile R2 manually.
+    """
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video_for_update_after_binding_tenant(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    if video.status not in {VideoStatus.FAILED, VideoStatus.PENDING_UPLOAD}:
+        raise ConflictError(
+            "Only failed videos or pending uploads can be deleted from this recovery path",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"current_status": video.status.value},
+        )
+
+    cleanup = _VideoStorageCleanupResult()
+    if _video_has_storage_cleanup_work(video):
+        if storage is None:
+            await _mark_video_cleanup_failed(
+                session=session,
+                request=request,
+                current_user=current_user,
+                video=video,
+                reason="storage_not_configured",
+                failures=("storage",),
+            )
+            await session.commit()
+            raise ServiceUnavailableError(
+                "Object storage is not configured; video cleanup cannot be completed",
+                code=ErrorCode.STORAGE_NOT_CONFIGURED,
+            )
+        cleanup = await _delete_video_storage(presigner=storage, video=video)
+        if cleanup.failures:
+            await _mark_video_cleanup_failed(
+                session=session,
+                request=request,
+                current_user=current_user,
+                video=video,
+                reason="storage_cleanup_failed",
+                failures=cleanup.failures,
+            )
+            await session.commit()
+            raise StorageFailureError(
+                "Video cleanup failed while deleting storage objects",
+                details={"failed_cleanup": list(cleanup.failures)},
+            )
+
+    released_usage = await release_video_upload_quota_reservation(
+        session,
+        team_id=video.team_id,
+        video_id=video.id,
+        reason="user_deleted_failed_video",
+    )
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_DELETED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="video",
+        resource_id=video.id,
+        team_id=video.team_id,
+        extra={
+            "reason": "user_deleted_failed_video",
+            "previous_status": video.status.value,
+            "quota_released": released_usage is not None,
+            "storage_cleanup": {
+                "aborted_multipart": cleanup.aborted_multipart,
+                "deleted_raw": cleanup.deleted_raw,
+                "deleted_mezzanine": cleanup.deleted_mezzanine,
+                "deleted_hls": cleanup.deleted_hls,
+            },
+        },
+    )
+    await session.delete(video)
+    await session.commit()
     return None
 
 
@@ -1543,21 +1784,17 @@ async def requeue_processing(
     request: Request,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+    storage: StoragePresigner | None = Depends(get_storage),
 ) -> RequeueProcessingResponse:
-    """Admin-only: return a terminal processing job (FAILED/COMPLETED) to
-    PENDING so the beat dispatcher re-runs it.
+    """Coach/admin recovery: retry a failed transcode when the raw upload is
+    still available.
 
-    Scope:
-    * Restricted to `UserRole.ADMIN` — requeue bypasses the tenant coach
-      controls that normally govern video state, so platform admins are the
-      only principals trusted to kick stuck jobs.
-    * Only jobs in a terminal status can be requeued. Trying to requeue a
-      PENDING/RUNNING job is rejected (409) so operators don't race a live
-      worker.
-    * The video row's status is not rewritten here — the worker will drive
-      it forward on the next claim.
+    This deliberately does not weaken RLS or audit. The caller must be a coach
+    for the video's team (or platform admin), the job must be a failed
+    transcode, and storage is checked before the row is returned to PENDING.
     """
-    require_user_role(current_user, UserRole.ADMIN)
+    require_verified_account(current_user, settings=settings)
 
     try:
         stage = ProcessingJobStage(payload.stage)
@@ -1572,11 +1809,22 @@ async def requeue_processing(
     await clear_tenant_context(session)
     session.sync_session.expunge_all()
 
-    video = await _load_video(session, video_id)
+    video = await _load_video_for_update_after_binding_tenant(session, video_id)
     if video is None:
         raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
-
-    await set_tenant_context(session, video.team_id)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+    if stage is not ProcessingJobStage.TRANSCODE:
+        raise ConflictError(
+            "Only failed transcode jobs can be retried from this recovery path",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"stage": stage.value},
+        )
+    if video.status is not VideoStatus.FAILED:
+        raise ConflictError(
+            "Video is not in a failed state",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"current_status": video.status.value},
+        )
 
     job = await session.scalar(
         select(ProcessingJob)
@@ -1591,13 +1839,17 @@ async def requeue_processing(
             "Processing job not found for this stage",
             code=ErrorCode.PROCESSING_JOB_NOT_FOUND,
         )
-    if job.status not in {ProcessingJobStatus.FAILED, ProcessingJobStatus.COMPLETED}:
+    if job.status is not ProcessingJobStatus.FAILED:
         raise ConflictError(
-            "Processing job is still active — cannot requeue",
+            "Only failed processing jobs can be retried",
             code=ErrorCode.PROCESSING_JOB_NOT_REQUEUABLE,
             details={"current_status": job.status.value},
         )
 
+    presigner = _require_storage(storage)
+    await _assert_raw_object_requeueable(video=video, presigner=presigner)
+
+    video.status = VideoStatus.QUEUED
     job.status = ProcessingJobStatus.PENDING
     job.progress_percent = 0
     job.error_message = None

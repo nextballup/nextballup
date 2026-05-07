@@ -62,6 +62,7 @@ class FakeStorage:
         self.fail_presign = False
         self.fail_complete = False
         self.fail_head_for_keys: set[str] = set()
+        self.fail_delete_for_keys: set[str] = set()
 
     def is_configured(self) -> bool:
         return True
@@ -120,6 +121,8 @@ class FakeStorage:
         self.pending_multiparts.pop(upload_id, None)
 
     def delete_object(self, *, key: str) -> None:
+        if key in self.fail_delete_for_keys:
+            raise StorageFailureError("Simulated delete failure", details={"key": key})
         self.object_sizes.pop(key, None)
 
     def head_object(self, *, key: str) -> dict[str, Any] | None:
@@ -1017,6 +1020,185 @@ async def test_cancel_multipart_upload_aborts_storage_and_marks_failed(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_delete_pending_multipart_upload_aborts_storage_and_releases_quota(
+    storage_client: AsyncClient,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="delete-pending-multipart@example.com"
+    )
+    initiate = (
+        await storage_client.post(
+            f"{API}/videos/upload",
+            json=_upload_body(game["id"], file_size_bytes=1_500_000_000),
+        )
+    ).json()
+    video_id = uuid.UUID(initiate["id"])
+
+    response = await storage_client.delete(f"{API}/videos/{video_id}")
+
+    assert response.status_code == 204, response.text
+    assert fake_storage.aborted_multiparts[-1]["upload_id"] == initiate["upload_id"]
+    assert await db_session.scalar(select(Video).where(Video.id == video_id)) is None
+    usage_sum = await db_session.scalar(
+        select(func.coalesce(func.sum(UsageEvent.quantity), 0)).where(
+            UsageEvent.team_id == uuid.UUID(team["id"]),
+            UsageEvent.event_key == "video.upload.initiated",
+        )
+    )
+    assert usage_sum == 0
+    audit = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.resource_id == video_id,
+            AuditLog.action == AuditAction.VIDEO_DELETED,
+        )
+    )
+    assert audit is not None
+    assert audit.extra is not None
+    assert audit.extra["quota_released"] is True
+    assert audit.extra["storage_cleanup"]["aborted_multipart"] is True
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_delete_failed_transcode_video_deletes_raw_and_releases_quota(
+    storage_client: AsyncClient,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="delete-failed-transcode@example.com"
+    )
+    upload = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()
+    complete = (
+        await storage_client.post(
+            f"{API}/videos/{upload['id']}/complete",
+            json={"checksum_sha256": "e" * 64},
+        )
+    ).json()
+    video_id = uuid.UUID(complete["id"])
+    job_id = uuid.UUID(complete["job_id"])
+    await _force_job_status(
+        db_session,
+        job_id=job_id,
+        new_status=ProcessingJobStatus.FAILED,
+        error_message="[PROCESSING_STORAGE_FAILURE] simulated",
+    )
+    await _force_video_status(db_session, video_id=video_id, new_status=VideoStatus.FAILED)
+    video_before = await db_session.scalar(select(Video).where(Video.id == video_id))
+    assert video_before is not None
+    raw_key = video_before.storage_key_raw
+    assert raw_key is not None and raw_key in fake_storage.object_sizes
+    audit_count_before = await db_session.scalar(select(func.count()).select_from(AuditLog))
+
+    response = await storage_client.delete(f"{API}/videos/{video_id}")
+
+    assert response.status_code == 204, response.text
+    assert await db_session.scalar(select(Video).where(Video.id == video_id)) is None
+    assert raw_key not in fake_storage.object_sizes
+    usage_sum = await db_session.scalar(
+        select(func.coalesce(func.sum(UsageEvent.quantity), 0)).where(
+            UsageEvent.team_id == uuid.UUID(team["id"]),
+            UsageEvent.event_key == "video.upload.initiated",
+        )
+    )
+    assert usage_sum == 0
+    audit_count_after = await db_session.scalar(select(func.count()).select_from(AuditLog))
+    assert audit_count_before is not None and audit_count_after is not None
+    assert audit_count_after > audit_count_before
+    deleted_audit = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.resource_id == video_id,
+            AuditLog.action == AuditAction.VIDEO_DELETED,
+        )
+    )
+    assert deleted_audit is not None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_delete_failed_video_records_auditable_failure_when_storage_delete_fails(
+    storage_client: AsyncClient,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+) -> None:
+    _, game = await _setup_coach_team_game(
+        storage_client, coach_email="delete-storage-fails@example.com"
+    )
+    upload = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()
+    complete = (
+        await storage_client.post(
+            f"{API}/videos/{upload['id']}/complete",
+            json={"checksum_sha256": "e" * 64},
+        )
+    ).json()
+    video_id = uuid.UUID(complete["id"])
+    job_id = uuid.UUID(complete["job_id"])
+    await _force_job_status(
+        db_session,
+        job_id=job_id,
+        new_status=ProcessingJobStatus.FAILED,
+        error_message="[PROCESSING_STORAGE_FAILURE] simulated",
+    )
+    await _force_video_status(db_session, video_id=video_id, new_status=VideoStatus.FAILED)
+    video_before = await db_session.scalar(select(Video).where(Video.id == video_id))
+    assert video_before is not None and video_before.storage_key_raw is not None
+    fake_storage.fail_delete_for_keys.add(video_before.storage_key_raw)
+    try:
+        response = await storage_client.delete(f"{API}/videos/{video_id}")
+    finally:
+        fake_storage.fail_delete_for_keys.discard(video_before.storage_key_raw)
+
+    assert response.status_code == 502, response.text
+    persisted = await db_session.scalar(select(Video).where(Video.id == video_id))
+    assert persisted is not None
+    assert persisted.raw_delete_failed_at is not None
+    failed_audit = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.resource_id == video_id,
+            AuditLog.action == AuditAction.VIDEO_DELETE_FAILED,
+        )
+    )
+    assert failed_audit is not None
+    assert failed_audit.extra is not None
+    assert failed_audit.extra["failed_cleanup"] == ["raw"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_unauthorized_user_cannot_delete_another_teams_failed_video(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    _, game = await _setup_coach_team_game(storage_client, coach_email="delete-owner@example.com")
+    upload = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()
+    complete = (
+        await storage_client.post(
+            f"{API}/videos/{upload['id']}/complete",
+            json={"checksum_sha256": "e" * 64},
+        )
+    ).json()
+    video_id = uuid.UUID(complete["id"])
+    await _force_job_status(
+        db_session,
+        job_id=uuid.UUID(complete["job_id"]),
+        new_status=ProcessingJobStatus.FAILED,
+        error_message="[PROCESSING_STORAGE_FAILURE] simulated",
+    )
+    await _force_video_status(db_session, video_id=video_id, new_status=VideoStatus.FAILED)
+
+    await _register(storage_client, _coach_payload("delete-snoop@example.com"))
+    response = await storage_client.delete(f"{API}/videos/{video_id}")
+
+    assert response.status_code in {403, 404}
+    assert await db_session.scalar(select(Video).where(Video.id == video_id)) is not None
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_complete_multipart_with_parts_succeeds(
     storage_client: AsyncClient, fake_storage: FakeStorage
 ) -> None:
@@ -1853,15 +2035,25 @@ async def _force_job_status(
     await clear_worker_context(db_session)
 
 
-@pytest_asyncio.fixture(loop_scope="session")
-async def seeded_failed_job(
-    storage_client: AsyncClient, db_session: AsyncSession
+async def _force_video_status(
+    db_session: AsyncSession,
+    *,
+    video_id: uuid.UUID,
+    new_status: VideoStatus,
+) -> None:
+    await set_worker_operator_role(db_session)
+    await db_session.execute(update(Video).where(Video.id == video_id).values(status=new_status))
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+
+async def seeded_failed_video_for_requeue(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    *,
+    coach_email: str,
 ) -> tuple[str, uuid.UUID, uuid.UUID]:
-    """Returns (team_id, video_id, transcode_job_id) for a video whose
-    transcode has been force-failed."""
-    team, game = await _setup_coach_team_game(
-        storage_client, coach_email="requeue-owner@example.com"
-    )
+    team, game = await _setup_coach_team_game(storage_client, coach_email=coach_email)
     upload = (
         await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
     ).json()
@@ -1872,13 +2064,32 @@ async def seeded_failed_job(
         )
     ).json()
     job_id = uuid.UUID(complete["job_id"])
+    video_id = uuid.UUID(complete["id"])
     await _force_job_status(
         db_session,
         job_id=job_id,
         new_status=ProcessingJobStatus.FAILED,
         error_message="[PROCESSING_STORAGE_FAILURE] simulated",
     )
-    return team["id"], uuid.UUID(complete["id"]), job_id
+    await _force_video_status(
+        db_session,
+        video_id=video_id,
+        new_status=VideoStatus.FAILED,
+    )
+    return team["id"], video_id, job_id
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def seeded_failed_job(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> tuple[str, uuid.UUID, uuid.UUID]:
+    """Returns (team_id, video_id, transcode_job_id) for a video whose
+    transcode has been force-failed."""
+    return await seeded_failed_video_for_requeue(
+        storage_client,
+        db_session,
+        coach_email="requeue-owner@example.com",
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -1917,6 +2128,11 @@ async def test_requeue_resets_failed_job_to_pending_for_admin(
     assert job.progress_percent == 0
     assert job.started_at is None
     assert job.completed_at is None
+    video = await db_session.scalar(
+        select(Video).where(Video.id == video_id).execution_options(populate_existing=True)
+    )
+    assert video is not None
+    assert video.status is VideoStatus.QUEUED
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -1948,19 +2164,72 @@ async def test_requeue_writes_audit_entry(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_requeue_rejects_non_admin_caller(
+async def test_requeue_allows_team_coach_for_failed_transcode(
     storage_client: AsyncClient,
-    seeded_failed_job: tuple[str, uuid.UUID, uuid.UUID],
+    db_session: AsyncSession,
 ) -> None:
-    """A coach with write access to their own team must still not be able to
-    requeue — that's an admin-only operator action."""
-    _team_id, video_id, _ = seeded_failed_job
-    # Coach cookies are still on the client from seeding.
+    _team_id, video_id, job_id = await seeded_failed_video_for_requeue(
+        storage_client,
+        db_session,
+        coach_email="requeue-coach-owner@example.com",
+    )
     response = await storage_client.post(
         f"{API}/videos/{video_id}/processing/requeue",
         json={"stage": "transcode"},
     )
-    assert response.status_code == 403
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["job_id"] == str(job_id)
+    video = await db_session.scalar(
+        select(Video).where(Video.id == video_id).execution_options(populate_existing=True)
+    )
+    assert video is not None
+    assert video.status is VideoStatus.QUEUED
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_unauthorized_user_cannot_requeue_another_teams_video(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    _team_id, video_id, _job_id = await seeded_failed_video_for_requeue(
+        storage_client,
+        db_session,
+        coach_email="requeue-owner-isolated@example.com",
+    )
+    await _register(storage_client, _coach_payload("requeue-snoop@example.com"))
+
+    response = await storage_client.post(
+        f"{API}/videos/{video_id}/processing/requeue",
+        json={"stage": "transcode"},
+    )
+
+    assert response.status_code in {403, 404}
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_requeue_rejects_failed_transcode_when_raw_object_missing(
+    storage_client: AsyncClient,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+) -> None:
+    _team_id, video_id, _job_id = await seeded_failed_video_for_requeue(
+        storage_client,
+        db_session,
+        coach_email="requeue-missing-raw@example.com",
+    )
+    video = await db_session.scalar(select(Video).where(Video.id == video_id))
+    assert video is not None and video.storage_key_raw is not None
+    fake_storage.object_sizes.pop(video.storage_key_raw, None)
+
+    response = await storage_client.post(
+        f"{API}/videos/{video_id}/processing/requeue",
+        json={"stage": "transcode"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == ErrorCode.INVALID_VIDEO_STATE
+    assert response.json()["error"]["details"]["reason"] == "raw_object_missing"
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -2001,12 +2270,14 @@ async def test_requeue_rejects_active_job(
         )
     ).json()
     job_id = uuid.UUID(complete["job_id"])
+    video_id = uuid.UUID(complete["id"])
+    await _force_video_status(db_session, video_id=video_id, new_status=VideoStatus.FAILED)
 
     # PENDING is the default post-complete status, no mutation needed.
     headers = await _seed_admin_headers(db_session, email="requeue-active-admin@example.com")
     storage_client.cookies.clear()
     response = await storage_client.post(
-        f"{API}/videos/{complete['id']}/processing/requeue",
+        f"{API}/videos/{video_id}/processing/requeue",
         json={"stage": "transcode"},
         headers=headers,
     )
@@ -2016,7 +2287,7 @@ async def test_requeue_rejects_active_job(
     # Now push to RUNNING and confirm it still rejects.
     await _force_job_status(db_session, job_id=job_id, new_status=ProcessingJobStatus.RUNNING)
     response = await storage_client.post(
-        f"{API}/videos/{complete['id']}/processing/requeue",
+        f"{API}/videos/{video_id}/processing/requeue",
         json={"stage": "transcode"},
         headers=headers,
     )
@@ -2030,8 +2301,7 @@ async def test_requeue_missing_stage_returns_404(
     db_session: AsyncSession,
     seeded_failed_job: tuple[str, uuid.UUID, uuid.UUID],
 ) -> None:
-    """Asking to requeue a stage for which no ProcessingJob row exists
-    (e.g. `detection` before it has ever run) returns 404, not 409."""
+    """Only transcode retries are supported by the alpha recovery path."""
     _team_id, video_id, _ = seeded_failed_job
     headers = await _seed_admin_headers(db_session, email="requeue-missing-admin@example.com")
 
@@ -2041,8 +2311,8 @@ async def test_requeue_missing_stage_returns_404(
         json={"stage": "detection"},
         headers=headers,
     )
-    assert response.status_code == 404
-    assert response.json()["error"]["code"] == ErrorCode.PROCESSING_JOB_NOT_FOUND
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == ErrorCode.INVALID_VIDEO_STATE
 
 
 @pytest.mark.asyncio(loop_scope="session")

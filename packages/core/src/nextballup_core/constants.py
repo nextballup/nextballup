@@ -46,6 +46,8 @@ class AuditAction:
 
     GAME_UPDATED = "games.update"
     VIDEO_PROCESSING_REQUEUED = "videos.processing.requeued"
+    VIDEO_DELETED = "videos.delete"
+    VIDEO_DELETE_FAILED = "videos.delete.failed"
 
     USER_EMAIL_VERIFICATION_REQUESTED = "auth.email_verification.requested"
     USER_EMAIL_VERIFICATION_SENT = "auth.email_verification.sent"

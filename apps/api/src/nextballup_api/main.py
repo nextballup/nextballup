@@ -202,6 +202,15 @@ def _validate_startup_secrets() -> None:
             "CV_DEMO_PREVIEW_ENABLED is only allowed in development/test "
             "(fail-closed; do not shell out to the sibling training repo in staging/production)"
         )
+    if settings.cv_alpha_detector_preview_enabled and settings.app_env not in (
+        "development",
+        "test",
+        "staging",
+    ):
+        raise RuntimeError(
+            "CV_ALPHA_DETECTOR_PREVIEW_ENABLED is only allowed in development/test/staging "
+            "(fail-closed; alpha detector preview is not a production analytics path)"
+        )
     validate_demo_preview_runtime(settings, startup=True)
 
 

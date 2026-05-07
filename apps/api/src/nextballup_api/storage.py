@@ -227,10 +227,12 @@ class S3StoragePresigner:
     def abort_multipart(self, *, key: str, upload_id: str) -> None:
         try:
             self._client.abort_multipart_upload(Bucket=self._bucket, Key=key, UploadId=upload_id)
-        except (BotoCoreError, ClientError):
-            # Aborts are best-effort cleanup — log and swallow so the caller's
-            # error response isn't masked by a downstream cleanup failure.
+        except (BotoCoreError, ClientError) as exc:
             logger.warning("Failed to abort multipart upload %s", upload_id, exc_info=True)
+            raise StorageFailureError(
+                "Failed to abort multipart upload",
+                details={"key": key, "upload_id": upload_id},
+            ) from exc
 
     def head_object(self, *, key: str) -> dict[str, Any] | None:
         try:

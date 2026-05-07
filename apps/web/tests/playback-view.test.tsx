@@ -10,9 +10,10 @@ import type {
 import { server } from "./setup";
 
 const refresh = vi.fn();
+const push = vi.fn();
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ refresh }),
+  useRouter: () => ({ push, refresh }),
 }));
 
 function wrap(ui: React.ReactElement) {
@@ -363,7 +364,7 @@ describe("VideoPlaybackView", () => {
     );
   });
 
-  it("hides the admin requeue control from non-admin viewers", async () => {
+  it("hides failed-video recovery controls from player viewers", async () => {
     server.use(
       http.get("/api/v1/videos/v1", () =>
         HttpResponse.json(baseVideo({ status: "failed" })),
@@ -382,18 +383,19 @@ describe("VideoPlaybackView", () => {
         wrap(
           <VideoPlaybackView
             initialVideo={baseVideo({ status: "failed" })}
-            viewerRole="coach"
+            viewerRole="player"
           />,
         ),
       );
     });
     expect(screen.queryByTestId("requeue-transcode")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("delete-video")).not.toBeInTheDocument();
   });
 
-  it("shows the admin requeue control for failed stages when viewer is admin", async () => {
+  it("shows retry and delete recovery controls for failed transcode when viewer is coach", async () => {
     server.use(
       http.get("/api/v1/videos/v1", () =>
-        HttpResponse.json(baseVideo({ status: "failed" })),
+        HttpResponse.json(baseVideo({ status: "failed", processing: { transcode: "failed" } })),
       ),
       http.get("/api/v1/videos/v1/status", () =>
         HttpResponse.json({
@@ -408,15 +410,51 @@ describe("VideoPlaybackView", () => {
       render(
         wrap(
           <VideoPlaybackView
-            initialVideo={baseVideo({ status: "failed" })}
-            viewerRole="admin"
+            initialVideo={baseVideo({ status: "failed", processing: { transcode: "failed" } })}
+            viewerRole="coach"
           />,
         ),
       );
     });
     const button = await screen.findByTestId("requeue-transcode");
     expect(button).toBeInTheDocument();
-    expect(button.textContent).toMatch(/requeue/i);
+    expect(button.textContent).toMatch(/retry processing/i);
+    expect(screen.getByTestId("delete-video")).toBeInTheDocument();
+  });
+
+  it("deletes a failed video from the recovery panel", async () => {
+    const video = baseVideo({
+      status: "failed",
+      processing: { transcode: "failed" },
+    });
+    let deleted = false;
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "failed",
+          stage: "transcode",
+          progress_percent: 0,
+          stages: { transcode: { status: "failed" } },
+        }),
+      ),
+      http.delete("/api/v1/videos/v1", () => {
+        deleted = true;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    fireEvent.click(await screen.findByTestId("delete-video"));
+
+    await waitFor(() => {
+      expect(deleted).toBe(true);
+    });
+    expect(push).toHaveBeenCalledWith("/games/g1");
+    expect(refresh).toHaveBeenCalled();
   });
 
   it("shows the local demo preview controls when the backend enables them", async () => {
@@ -439,7 +477,37 @@ describe("VideoPlaybackView", () => {
       render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
     });
     expect(screen.getByTestId("demo-preview-panel")).toBeInTheDocument();
+    expect(screen.getByText("Alpha detector preview")).toBeInTheDocument();
+    expect(screen.getByText("Review only. Not production analytics.")).toBeInTheDocument();
     expect(screen.getByTestId("generate-demo-preview")).toBeInTheDocument();
+  });
+
+  it("keeps alpha detector preview copy scoped to review rather than accuracy claims", async () => {
+    const video = baseVideo({
+      demo_preview_enabled: true,
+      status: "processed",
+    });
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          stage: null,
+          progress_percent: 100,
+          stages: { transcode: { status: "completed" } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+    const panel = screen.getByTestId("demo-preview-panel");
+    expect(panel.textContent).toMatch(/Alpha detector preview/);
+    expect(panel.textContent).toMatch(/Review only/);
+    expect(panel.textContent).toMatch(/Not production analytics/);
+    expect(panel.textContent).not.toMatch(/tracking accuracy/i);
+    expect(panel.textContent).not.toMatch(/event accuracy/i);
+    expect(panel.textContent).not.toMatch(/metrics accuracy/i);
   });
 
   it("generates a local demo preview and renders the returned mp4", async () => {
