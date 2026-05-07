@@ -70,7 +70,6 @@ services:
     dockerfilePath: ./Dockerfile.backend
     dockerContext: .
     dockerCommand: /bin/sh scripts/render_start_worker.sh
-    maxShutdownDelaySeconds: 300
     disk:
       name: alpha-worker-media-scratch
       mountPath: /var/data
