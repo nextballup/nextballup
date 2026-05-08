@@ -343,6 +343,16 @@ def test_demo_preview_subprocess_env_excludes_platform_secrets(
     assert "CSRF_SECRET" not in env
 
 
+def test_demo_preview_subprocess_env_allows_uv_binary_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UV_BIN", "/Users/tester/.local/bin/uv")
+
+    env = _build_demo_preview_env()
+
+    assert env["UV_BIN"] == "/Users/tester/.local/bin/uv"
+
+
 def test_sensitive_upload_consent_defaults_on_outside_tests() -> None:
     development = get_settings().model_copy(update={"app_env": "development"})
     production = get_settings().model_copy(update={"app_env": "production"})

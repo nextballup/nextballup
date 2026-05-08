@@ -42,6 +42,7 @@ if [ -z "${UV_BIN:-}" ]; then
     exit 1
   fi
 fi
+export UV_BIN
 
 cd "$REPO_ROOT"
 exec "$UV_BIN" run celery -A nextballup_worker.celery_app worker \

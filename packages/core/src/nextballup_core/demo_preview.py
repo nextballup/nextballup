@@ -686,6 +686,7 @@ def _build_demo_preview_env() -> dict[str, str]:
         "TORCH_HOME",
         "TRANSFORMERS_CACHE",
         "UV_CACHE_DIR",
+        "UV_BIN",
         "XDG_CACHE_HOME",
     }
     env = {key: value for key, value in os.environ.items() if key in allowed_keys and value}
@@ -732,6 +733,25 @@ def _demo_preview_preexec_fn(settings: Settings) -> Callable[[], None] | None:
     return _apply_limits
 
 
+def _resolve_uv_command() -> str:
+    configured = os.environ.get("UV_BIN")
+    if configured and Path(configured).expanduser().is_file():
+        return str(Path(configured).expanduser())
+    discovered = shutil.which("uv")
+    if discovered:
+        return discovered
+    home = Path.home()
+    candidates = (
+        home / ".local/bin/uv",
+        Path("/opt/homebrew/bin/uv"),
+        Path("/usr/local/bin/uv"),
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return "uv"
+
+
 def _run_demo_preview_inference(
     *,
     settings: Settings,
@@ -743,7 +763,7 @@ def _run_demo_preview_inference(
         startup=False,
     )
     command = [
-        "uv",
+        _resolve_uv_command(),
         "run",
         "--no-sync",
         "python",
