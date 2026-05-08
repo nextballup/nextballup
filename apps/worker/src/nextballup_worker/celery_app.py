@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from ssl import CERT_REQUIRED
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from celery import Celery
 from celery.schedules import crontab
@@ -19,37 +21,71 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BROKER = "memory://"  # in-process transport for tests/import-only.
 
 
+def _redis_tls_url(url: str | None) -> str | None:
+    if not url:
+        return url
+    parsed = urlsplit(url)
+    if parsed.scheme != "rediss":
+        return url
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.setdefault("ssl_cert_reqs", "CERT_REQUIRED")
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(query),
+            parsed.fragment,
+        )
+    )
+
+
+def _redis_tls_options(url: str | None) -> dict[str, object] | None:
+    if not url or urlsplit(url).scheme != "rediss":
+        return None
+    return {"ssl_cert_reqs": CERT_REQUIRED}
+
+
 def _resolve_broker(settings: Settings) -> str:
-    return settings.celery_broker_url or _DEFAULT_BROKER
+    return _redis_tls_url(settings.celery_broker_url) or _DEFAULT_BROKER
 
 
 def _resolve_backend(settings: Settings) -> str | None:
-    return settings.celery_result_backend or settings.celery_broker_url
+    return _redis_tls_url(settings.celery_result_backend or settings.celery_broker_url)
 
 
 def create_celery_app(settings: Settings | None = None) -> Celery:
     install_log_redaction_filter()
     resolved = settings or get_settings()
+    broker_url = _resolve_broker(resolved)
+    backend_url = _resolve_backend(resolved)
     app = Celery(
         "nextballup_worker",
-        broker=_resolve_broker(resolved),
-        backend=_resolve_backend(resolved),
+        broker=broker_url,
+        backend=backend_url,
         include=["nextballup_worker.tasks"],
     )
-    app.conf.update(
-        task_default_queue=resolved.celery_task_default_queue,
-        task_acks_late=True,
-        task_reject_on_worker_lost=True,
-        task_track_started=True,
-        task_time_limit=60 * 60 * 3,  # 3 hours hard cap
-        task_soft_time_limit=60 * 60 * 2,
-        worker_prefetch_multiplier=1,
-        broker_connection_retry_on_startup=True,
-        result_expires=60 * 60 * 24,
-        timezone="UTC",
-        enable_utc=True,
-        beat_schedule=_beat_schedule(resolved),
-    )
+    app_config: dict[str, object] = {
+        "task_default_queue": resolved.celery_task_default_queue,
+        "task_acks_late": True,
+        "task_reject_on_worker_lost": True,
+        "task_track_started": True,
+        "task_time_limit": 60 * 60 * 3,  # 3 hours hard cap
+        "task_soft_time_limit": 60 * 60 * 2,
+        "worker_prefetch_multiplier": 1,
+        "broker_connection_retry_on_startup": True,
+        "result_expires": 60 * 60 * 24,
+        "timezone": "UTC",
+        "enable_utc": True,
+        "beat_schedule": _beat_schedule(resolved),
+    }
+    broker_ssl = _redis_tls_options(broker_url)
+    if broker_ssl:
+        app_config["broker_use_ssl"] = broker_ssl
+    backend_ssl = _redis_tls_options(backend_url)
+    if backend_ssl:
+        app_config["redis_backend_use_ssl"] = backend_ssl
+    app.conf.update(app_config)
     return app
 
 

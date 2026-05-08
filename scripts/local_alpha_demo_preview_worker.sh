@@ -26,8 +26,25 @@ export CELERY_DEMO_PREVIEW_QUEUE="${CELERY_DEMO_PREVIEW_QUEUE:-nextballup.demo_p
 export CELERY_WORKER_CONCURRENCY="${CELERY_WORKER_CONCURRENCY:-1}"
 export WORKER_MEDIA_TEMP_DIR="${WORKER_MEDIA_TEMP_DIR:-./local_artifacts/alpha-demo-scratch}"
 
+if [ -z "${UV_BIN:-}" ]; then
+  if command -v uv >/dev/null 2>&1; then
+    UV_BIN=$(command -v uv)
+  elif [ -n "${HOME:-}" ] && [ -x "$HOME/.local/bin/uv" ]; then
+    UV_BIN="$HOME/.local/bin/uv"
+  elif [ -x "/Users/$(id -un)/.local/bin/uv" ]; then
+    UV_BIN="/Users/$(id -un)/.local/bin/uv"
+  elif [ -x /opt/homebrew/bin/uv ]; then
+    UV_BIN=/opt/homebrew/bin/uv
+  elif [ -x /usr/local/bin/uv ]; then
+    UV_BIN=/usr/local/bin/uv
+  else
+    echo "Missing uv. Set UV_BIN to the absolute uv executable path." >&2
+    exit 1
+  fi
+fi
+
 cd "$REPO_ROOT"
-exec uv run celery -A nextballup_worker.celery_app worker \
+exec "$UV_BIN" run celery -A nextballup_worker.celery_app worker \
   --loglevel="${CELERY_LOGLEVEL:-info}" \
   --concurrency="${CELERY_WORKER_CONCURRENCY}" \
   --queues="${CELERY_DEMO_PREVIEW_QUEUE}"
