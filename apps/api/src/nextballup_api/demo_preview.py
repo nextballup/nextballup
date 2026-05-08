@@ -83,6 +83,48 @@ def _response_for_video_preview_state(video: Video) -> GenerateDemoPreviewRespon
     )
 
 
+def _queue_storage_backed_alpha_preview_request(
+    *,
+    video: Video,
+    settings: Settings,
+) -> QueuedDemoPreviewResult:
+    if getattr(video, "demo_preview_status", "idle") in {"queued", "running"}:
+        return QueuedDemoPreviewResult(
+            response=_response_for_video_preview_state(video),
+            enqueued=False,
+            task_id=getattr(video, "demo_preview_task_id", None),
+        )
+
+    try:
+        task_id = _enqueue_demo_preview_task(video_id=video.id, settings=settings)
+    except Exception as exc:
+        logger.exception(
+            "Failed to enqueue alpha detector preview task", extra={"video_id": str(video.id)}
+        )
+        raise ServiceUnavailableError(
+            "Local demo preview worker is unavailable",
+            code=ErrorCode.DEMO_PREVIEW_FAILED,
+        ) from exc
+
+    return QueuedDemoPreviewResult(
+        response=GenerateDemoPreviewResponse(
+            status="queued",
+            preview_url=(
+                demo_preview_url_path(video.id)
+                if getattr(video, "demo_preview_storage_key", None)
+                else None
+            ),
+            generated_at=(
+                getattr(video, "demo_preview_generated_at", None)
+                if getattr(video, "demo_preview_storage_key", None)
+                else None
+            ),
+        ),
+        enqueued=True,
+        task_id=task_id,
+    )
+
+
 def queue_demo_preview_request(
     *,
     video: Video,
@@ -111,6 +153,9 @@ def queue_demo_preview_request(
             "Object storage is not configured",
             code=ErrorCode.STORAGE_NOT_CONFIGURED,
         )
+    if settings.alpha_detector_preview_enabled() and not settings.cv_demo_preview_enabled:
+        return _queue_storage_backed_alpha_preview_request(video=video, settings=settings)
+
     if getattr(video, "demo_preview_status", "idle") in {"queued", "running"}:
         return QueuedDemoPreviewResult(
             response=_response_for_video_preview_state(video),

@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
 from nextballup_core.constants import AuditAction, ErrorCode
+from nextballup_core.demo_preview import mark_demo_preview_queued
 from nextballup_core.enums import (
     ProcessingJobStage,
     ProcessingJobStatus,
@@ -406,6 +407,25 @@ def demo_preview_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterato
             "config_path": config_path,
             "checkpoint_path": checkpoint_path,
         }
+    finally:
+        reload_settings()
+
+
+@pytest.fixture()
+def alpha_preview_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[dict[str, Path]]:
+    preview_root = tmp_path / "alpha_demo_previews"
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CV_DEMO_PREVIEW_ENABLED", "false")
+    monkeypatch.setenv("CV_ALPHA_DETECTOR_PREVIEW_ENABLED", "true")
+    monkeypatch.setenv("CV_DEMO_PREVIEW_ROOT", str(preview_root))
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://127.0.0.1:6379/1")
+    monkeypatch.setenv("RATE_LIMIT_FAIL_CLOSED", "false")
+
+    from nextballup_core.settings import reload_settings
+
+    reload_settings()
+    try:
+        yield {"preview_root": preview_root}
     finally:
         reload_settings()
 
@@ -1671,6 +1691,55 @@ async def test_coach_can_queue_demo_preview(
         )
     )
     assert action_count is not None and action_count >= 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_alpha_preview_enqueue_ignores_stale_api_local_state(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    alpha_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="alpha-preview-stale-api-state@example.com",
+    )
+    video = await db_session.get(Video, video_id)
+    assert video is not None
+    video.demo_preview_status = "failed"
+    video.demo_preview_task_id = "previous-failed-task"
+    video.demo_preview_error_message = "Local demo preview inference failed"
+    await db_session.commit()
+
+    mark_demo_preview_queued(
+        settings=get_settings(),
+        video_id=video_id,
+        task_id="stale-api-local-task",
+        generated_at=None,
+    )
+    assert alpha_preview_env["preview_root"].is_dir()
+
+    enqueue_calls: list[uuid.UUID] = []
+
+    def _fake_enqueue(*, video_id: uuid.UUID, settings: Any) -> str:
+        enqueue_calls.append(video_id)
+        return f"task-{video_id}"
+
+    monkeypatch.setattr("nextballup_api.demo_preview._enqueue_demo_preview_task", _fake_enqueue)
+
+    response = await storage_client.post(f"{API}/videos/{video_id}/demo-preview")
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "queued"
+    assert enqueue_calls == [video_id]
+
+    detail = await storage_client.get(f"{API}/videos/{video_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["demo_preview_status"] == "queued"
+    assert body["demo_preview_error_message"] is None
 
 
 @pytest.mark.asyncio(loop_scope="session")
