@@ -280,7 +280,7 @@ function DemoPreviewPanel({
           </p>
           {generatedAt ? (
             <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
-              Last generated: {new Date(generatedAt).toLocaleString()}
+              Last generated: {formatUtcDateTime(generatedAt)}
             </p>
           ) : null}
         </div>
@@ -735,6 +735,18 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)}GB`;
+}
+
+function formatUtcDateTime(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  const year = parsed.getUTCFullYear();
+  const month = String(parsed.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getUTCDate()).padStart(2, "0");
+  const hours = String(parsed.getUTCHours()).padStart(2, "0");
+  const minutes = String(parsed.getUTCMinutes()).padStart(2, "0");
+  const seconds = String(parsed.getUTCSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds} UTC`;
 }
 
 function withVersionParam(url: string, generatedAt: string | null): string {

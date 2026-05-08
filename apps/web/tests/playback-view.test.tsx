@@ -741,6 +741,32 @@ describe("VideoPlaybackView", () => {
     expect(postCount).toBe(1);
   });
 
+  it("renders alpha preview generated time without locale-specific hydration text", async () => {
+    const video = baseVideo({
+      demo_preview_enabled: true,
+      demo_preview_status: "completed",
+      status: "processed",
+      demo_preview_url: "/api/v1/videos/v1/demo-preview/artifact",
+      demo_preview_generated_at: "2026-04-19T12:00:00Z",
+    });
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          stage: null,
+          progress_percent: 100,
+          stages: { transcode: { status: "completed" } },
+        }),
+      ),
+    );
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    expect(screen.getByText("Last generated: 2026-04-19 12:00:00 UTC")).toBeInTheDocument();
+  });
+
   it("does not show the requeue button for a running stage, even to an admin", async () => {
     server.use(
       http.get("/api/v1/videos/v1", () =>
