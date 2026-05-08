@@ -1674,6 +1674,47 @@ async def test_coach_can_queue_demo_preview(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_coach_can_cancel_queued_demo_preview(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+) -> None:
+    team, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-cancel@example.com",
+    )
+    video = await db_session.get(Video, video_id)
+    assert video is not None
+    video.demo_preview_status = "queued"
+    video.demo_preview_task_id = "demo-preview-task"
+    video.demo_preview_requested_at = datetime.now(tz=UTC)
+    await db_session.commit()
+
+    response = await storage_client.delete(f"{API}/videos/{video_id}/demo-preview")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "failed"
+
+    detail = await storage_client.get(f"{API}/videos/{video_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["demo_preview_status"] == "failed"
+    assert "cancelled" in body["demo_preview_error_message"].lower()
+
+    action_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_DEMO_PREVIEW_CANCELLED,
+            AuditLog.team_id == uuid.UUID(team["id"]),
+        )
+    )
+    assert action_count is not None and action_count >= 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_demo_preview_generation_is_idempotent_while_queued(
     storage_client: AsyncClient,
     db_session: AsyncSession,
@@ -1897,6 +1938,36 @@ async def test_player_cannot_generate_demo_preview(
     assert join.status_code == 200
 
     response = await storage_client.post(f"{API}/videos/{video_id}/demo-preview")
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_player_cannot_cancel_demo_preview(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    demo_preview_env: dict[str, Path],
+) -> None:
+    team, video_id = await _seed_processed_video(
+        storage_client,
+        db_session,
+        fake_storage,
+        coach_email="demo-cancel-player-owner@example.com",
+    )
+    video = await db_session.get(Video, video_id)
+    assert video is not None
+    video.demo_preview_status = "queued"
+    video.demo_preview_task_id = "demo-preview-task-player"
+    await db_session.commit()
+
+    await _register(storage_client, _player_payload("demo-cancel-player@example.com"))
+    join = await storage_client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 25},
+    )
+    assert join.status_code == 200
+
+    response = await storage_client.delete(f"{API}/videos/{video_id}/demo-preview")
     assert response.status_code == 403
 
 

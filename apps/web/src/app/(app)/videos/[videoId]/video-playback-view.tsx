@@ -234,6 +234,23 @@ function DemoPreviewPanel({
       }
     },
   });
+  const cancelMutation = useMutation<GenerateDemoPreviewResponse>({
+    mutationFn: async () =>
+      apiJson<GenerateDemoPreviewResponse>(`/videos/${video.id}/demo-preview`, {
+        method: "DELETE",
+      }),
+    onSuccess: () => {
+      setErrorMessage(null);
+      queryClient.invalidateQueries({ queryKey: ["video", video.id] });
+    },
+    onError: (err) => {
+      if (err instanceof ApiError) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage("Unable to cancel the alpha detector preview.");
+      }
+    },
+  });
   const previewUrl = video.demo_preview_url;
   const generatedAt = video.demo_preview_generated_at;
   const previewRenderUrl = previewUrl ? withVersionParam(previewUrl, generatedAt) : null;
@@ -268,28 +285,47 @@ function DemoPreviewPanel({
           ) : null}
         </div>
         {video.demo_preview_enabled && canRequest ? (
-          <button
-            type="button"
-            onClick={() => mutation.mutate()}
-            disabled={mutation.isPending || previewBusy || video.status !== "processed"}
-            data-testid="generate-demo-preview"
-            className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-3 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
-          >
-            {mutation.isPending
-              ? "Queueing preview…"
-              : previewBusy
-                ? "Generating detector preview…"
-              : previewUrl
-                ? "Regenerate detector preview"
-                : "Generate detector preview"}
-          </button>
+          <div className="flex flex-wrap gap-2 sm:justify-end">
+            <button
+              type="button"
+              onClick={() => mutation.mutate()}
+              disabled={mutation.isPending || previewBusy || video.status !== "processed"}
+              data-testid="generate-demo-preview"
+              className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-3 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+            >
+              {mutation.isPending
+                ? "Queueing preview…"
+                : previewBusy
+                  ? "Generating detector preview…"
+                  : previewUrl
+                    ? "Regenerate detector preview"
+                    : "Generate detector preview"}
+            </button>
+            {previewBusy ? (
+              <button
+                type="button"
+                onClick={() => cancelMutation.mutate()}
+                disabled={cancelMutation.isPending}
+                data-testid="cancel-demo-preview"
+                className="self-start rounded-md border border-[color:var(--color-nbu-error)] px-3 py-1 text-xs font-medium text-[color:var(--color-nbu-error)] transition hover:bg-[color:var(--color-nbu-surface)] disabled:opacity-50"
+              >
+                {cancelMutation.isPending ? "Cancelling…" : "Cancel preview"}
+              </button>
+            ) : null}
+          </div>
         ) : null}
       </div>
       {previewBusy ? (
-        <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
-          The preview job is queued in the worker and will appear automatically
-          when rendering finishes.
-        </p>
+        <div className="space-y-1 text-xs text-[color:var(--color-nbu-text-muted)]">
+          <p>
+            The preview job is queued in the worker and will appear automatically
+            when rendering finishes.
+          </p>
+          <p>
+            If the local worker logs show a setup error, cancel this preview,
+            fix the worker env, then generate again.
+          </p>
+        </div>
       ) : null}
       {previewRenderUrl ? (
         <VideoPlayer key={previewRenderUrl} url={previewRenderUrl} format="mp4" />

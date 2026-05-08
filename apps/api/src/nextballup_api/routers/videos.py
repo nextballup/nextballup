@@ -1795,6 +1795,70 @@ async def create_demo_preview(
 # ---- GET /videos/{video_id}/demo-preview/artifact -------------------------
 
 
+@router.delete(
+    "/{video_id:uuid}/demo-preview",
+    response_model=GenerateDemoPreviewResponse,
+)
+async def cancel_demo_preview(
+    video_id: uuid.UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+) -> GenerateDemoPreviewResponse:
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    if video.demo_preview_status not in {"queued", "running"}:
+        raise ConflictError(
+            "Only queued or running alpha detector previews can be cancelled",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"current_status": video.demo_preview_status},
+        )
+
+    cancelled_at = datetime.now(tz=UTC)
+    previous_status = video.demo_preview_status
+    previous_task_id = video.demo_preview_task_id
+    video.demo_preview_status = "failed"
+    video.demo_preview_error_message = (
+        "Alpha detector preview was cancelled. Fix the local worker setup, then generate again."
+    )
+    video.demo_preview_task_id = None
+    video.demo_preview_started_at = None
+    video.demo_preview_requested_at = cancelled_at
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_DEMO_PREVIEW_CANCELLED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="video",
+        resource_id=video.id,
+        team_id=video.team_id,
+        extra={
+            "previous_status": previous_status,
+            "previous_task_id": previous_task_id,
+        },
+    )
+    await session.commit()
+    return GenerateDemoPreviewResponse(
+        status="failed",
+        preview_url=(
+            f"/api/v1/videos/{video.id}/demo-preview/artifact"
+            if video.demo_preview_storage_key
+            else None
+        ),
+        generated_at=video.demo_preview_generated_at if video.demo_preview_storage_key else None,
+    )
+
+
 @router.get("/{video_id:uuid}/demo-preview/artifact")
 async def get_demo_preview_artifact(
     video_id: uuid.UUID,

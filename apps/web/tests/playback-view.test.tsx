@@ -616,6 +616,53 @@ describe("VideoPlaybackView", () => {
     expect(screen.getByTestId("generate-demo-preview")).toBeInTheDocument();
   });
 
+  it("lets a coach cancel a stuck local demo preview", async () => {
+    const queued = baseVideo({
+      demo_preview_enabled: true,
+      demo_preview_status: "queued",
+      status: "processed",
+    });
+    const failed = baseVideo({
+      demo_preview_enabled: true,
+      demo_preview_status: "failed",
+      demo_preview_error_message:
+        "Alpha detector preview was cancelled. Fix the local worker setup, then generate again.",
+      status: "processed",
+    });
+    let current = queued;
+    let cancelCount = 0;
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(current)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          stage: null,
+          progress_percent: 100,
+          stages: { transcode: { status: "completed" } },
+        }),
+      ),
+      http.delete("/api/v1/videos/v1/demo-preview", async () => {
+        cancelCount += 1;
+        current = failed;
+        return HttpResponse.json<GenerateDemoPreviewResponse>({
+          status: "failed",
+          preview_url: null,
+          generated_at: null,
+        });
+      }),
+    );
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={queued} viewerRole="coach" />));
+    });
+
+    fireEvent.click(await screen.findByTestId("cancel-demo-preview"));
+
+    await waitFor(() => {
+      expect(cancelCount).toBe(1);
+      expect(screen.getByText(/was cancelled/i)).toBeInTheDocument();
+    });
+  });
+
   it("keeps alpha detector preview copy scoped to review rather than accuracy claims", async () => {
     const video = baseVideo({
       demo_preview_enabled: true,

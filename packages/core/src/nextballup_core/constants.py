@@ -44,6 +44,7 @@ class AuditAction:
     VIDEO_DEMO_PREVIEW_REJECTED = "videos.demo_preview.rejected"
     VIDEO_DEMO_PREVIEW_GENERATED = "videos.demo_preview.generated"
     VIDEO_DEMO_PREVIEW_FAILED = "videos.demo_preview.failed"
+    VIDEO_DEMO_PREVIEW_CANCELLED = "videos.demo_preview.cancelled"
 
     GAME_UPDATED = "games.update"
     VIDEO_PROCESSING_REQUEUED = "videos.processing.requeued"
