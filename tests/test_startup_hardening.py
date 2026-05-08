@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -336,7 +337,8 @@ def test_demo_preview_subprocess_env_excludes_platform_secrets(
 
     env = _build_demo_preview_env()
 
-    assert env["PATH"] == "/usr/bin"
+    path_entries = env["PATH"].split(os.pathsep)
+    assert path_entries[0] == "/usr/bin"
     assert env["HOME"] == "/Users/tester"
     assert "JWT_PRIVATE_KEY" not in env
     assert "DATABASE_URL" not in env
@@ -345,12 +347,19 @@ def test_demo_preview_subprocess_env_excludes_platform_secrets(
 
 def test_demo_preview_subprocess_env_allows_uv_binary_override(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("UV_BIN", "/Users/tester/.local/bin/uv")
+    tool_dir = tmp_path / "tools"
+    tool_dir.mkdir()
+    uv_bin = tool_dir / "uv"
+    uv_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("UV_BIN", str(uv_bin))
 
     env = _build_demo_preview_env()
 
-    assert env["UV_BIN"] == "/Users/tester/.local/bin/uv"
+    assert env["UV_BIN"] == str(uv_bin)
+    assert str(tool_dir) in env["PATH"].split(os.pathsep)
 
 
 def test_sensitive_upload_consent_defaults_on_outside_tests() -> None:

@@ -665,6 +665,36 @@ def _require_demo_preview_enabled(settings: Settings) -> None:
     )
 
 
+def _demo_preview_extra_path_entries() -> list[str]:
+    entries: list[str] = []
+    home = os.environ.get("HOME")
+    if home:
+        entries.append(str(Path(home).expanduser() / ".local" / "bin"))
+    configured_uv = os.environ.get("UV_BIN")
+    if configured_uv:
+        configured_uv_path = Path(configured_uv).expanduser()
+        if configured_uv_path.is_absolute():
+            entries.append(str(configured_uv_path.parent))
+    for binary in ("uv", "ffmpeg"):
+        discovered = shutil.which(binary)
+        if discovered:
+            entries.append(str(Path(discovered).parent))
+    entries.extend(("/opt/homebrew/bin", "/usr/local/bin"))
+    return entries
+
+
+def _build_demo_preview_path(path: str) -> str:
+    entries = [entry for entry in path.split(os.pathsep) if entry]
+    seen = set(entries)
+    for entry in _demo_preview_extra_path_entries():
+        if entry and entry not in seen:
+            entries.append(entry)
+            seen.add(entry)
+    if not entries:
+        return os.defpath
+    return os.pathsep.join(entries)
+
+
 def _build_demo_preview_env() -> dict[str, str]:
     allowed_keys = {
         "CUDA_VISIBLE_DEVICES",
@@ -690,7 +720,7 @@ def _build_demo_preview_env() -> dict[str, str]:
         "XDG_CACHE_HOME",
     }
     env = {key: value for key, value in os.environ.items() if key in allowed_keys and value}
-    env.setdefault("PATH", os.defpath)
+    env["PATH"] = _build_demo_preview_path(env.get("PATH", os.defpath))
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 

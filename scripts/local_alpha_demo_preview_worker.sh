@@ -16,6 +16,13 @@ set -a
 . "$ENV_FILE"
 set +a
 
+PATH="${PATH:-/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+if [ -n "${HOME:-}" ]; then
+  PATH="$HOME/.local/bin:$PATH"
+fi
+PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH
+
 export APP_ENV="${APP_ENV:-staging}"
 export CV_DEMO_PREVIEW_ENABLED="${CV_DEMO_PREVIEW_ENABLED:-false}"
 export CV_ALPHA_DETECTOR_PREVIEW_ENABLED="${CV_ALPHA_DETECTOR_PREVIEW_ENABLED:-true}"

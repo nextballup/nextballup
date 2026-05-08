@@ -14,6 +14,13 @@ set -a
 . "$ENV_FILE"
 set +a
 
+PATH="${PATH:-/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+if [ -n "${HOME:-}" ]; then
+  PATH="$HOME/.local/bin:$PATH"
+fi
+PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH
+
 cd "$REPO_ROOT"
 
 missing=""
@@ -30,6 +37,11 @@ fi
 
 if [ -n "$missing" ]; then
   echo "Missing required env values:$missing" >&2
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Missing ffmpeg. Install ffmpeg or add it to PATH before running alpha detector preview." >&2
   exit 1
 fi
 
