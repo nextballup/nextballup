@@ -1618,7 +1618,10 @@ async def test_video_detail_includes_shared_alpha_demo_preview_artifact(
     storage_client: AsyncClient,
     db_session: AsyncSession,
     fake_storage: FakeStorage,
+    alpha_preview_env: dict[str, Path],
 ) -> None:
+    assert alpha_preview_env["preview_root"].name == "alpha_demo_previews"
+    assert get_settings().local_demo_preview_enabled() is True
     _, video_id = await _seed_processed_video(
         storage_client,
         db_session,
