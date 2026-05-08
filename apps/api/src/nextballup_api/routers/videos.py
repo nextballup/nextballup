@@ -1884,10 +1884,7 @@ async def get_demo_preview_artifact(
         url = await storage_presign_get(
             presigner,
             key=video.demo_preview_storage_key,
-            expires_in=min(
-                settings.playback_url_expires_seconds,
-                settings.playback_token_expire_seconds,
-            ),
+            expires_in=settings.demo_preview_url_expires_seconds,
             response_content_type="video/mp4",
         )
         return RedirectResponse(

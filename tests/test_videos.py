@@ -1649,6 +1649,7 @@ async def test_video_detail_includes_shared_alpha_demo_preview_artifact(
     artifact = await storage_client.get(f"{API}/videos/{video_id}/demo-preview/artifact")
     assert artifact.status_code == 307, artifact.text
     assert artifact.headers["location"].startswith(f"https://fake-storage.test/{preview_key}")
+    assert "exp=7200" in artifact.headers["location"]
 
 
 @pytest.mark.asyncio(loop_scope="session")

@@ -2043,6 +2043,7 @@ async def test_execute_demo_preview_completes_and_updates_video_detail(
     assert artifact.status_code == 307, artifact.text
     assert artifact.headers["cache-control"] == "private, no-store, max-age=0"
     assert artifact.headers["location"].startswith(f"https://fake-storage.test/{preview_key}")
+    assert "exp=7200" in artifact.headers["location"]
 
     assert (
         await _count_actions(

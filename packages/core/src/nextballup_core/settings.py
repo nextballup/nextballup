@@ -110,6 +110,7 @@ class Settings(BaseSettings):
     # is the *session-aware* boundary.
     playback_token_expire_seconds: int = 120
     playback_url_expires_seconds: int = 600
+    demo_preview_url_expires_seconds: int = Field(default=7200, ge=60, le=86400)
     playback_token_audience: str = "video:playback"
     auth_rate_limit_attempts: int = 5
     auth_rate_limit_window_seconds: int = 60
