@@ -380,6 +380,14 @@ def test_demo_preview_effective_sample_fps_is_capped() -> None:
     assert settings.effective_cv_demo_sample_fps() == 4.0
 
 
+def test_demo_preview_effective_sample_fps_allows_alpha_twelve_fps() -> None:
+    settings = get_settings().model_copy(
+        update={"cv_demo_sample_fps": 12.0, "cv_demo_max_sample_fps": 12.0}
+    )
+
+    assert settings.effective_cv_demo_sample_fps() == 12.0
+
+
 def test_settings_rejects_invalid_trusted_proxy_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRUSTED_PROXY_IPS", "127.0.0.1,not-an-ip")
 

@@ -315,7 +315,7 @@ class Settings(BaseSettings):
         "bb_detect_rfdetr_ebard_alpha_demo_v1-20260505T190931Z/eval_report.json"
     )
     cv_demo_sample_fps: float = Field(default=2.0, gt=0.0, le=30.0)
-    cv_demo_max_sample_fps: float = Field(default=4.0, gt=0.0, le=10.0)
+    cv_demo_max_sample_fps: float = Field(default=4.0, gt=0.0, le=24.0)
     cv_demo_timeout_seconds: int = Field(default=1800, ge=30, le=7200)
     cv_demo_retention_seconds: int = Field(default=259200, ge=3600, le=2_592_000)
     cv_demo_subprocess_sandbox: bool = True
