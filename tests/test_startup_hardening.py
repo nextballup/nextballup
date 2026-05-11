@@ -72,6 +72,16 @@ def test_startup_validation_accepts_hardened_production_config(
     _validate_startup_secrets()
 
 
+def test_startup_validation_rejects_debug_mode_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_hardened_production_env(monkeypatch)
+    monkeypatch.setenv("APP_DEBUG", "true")
+    reload_settings()
+    with pytest.raises(RuntimeError, match="APP_DEBUG"):
+        _validate_startup_secrets()
+
+
 def test_startup_validation_requires_explicit_csrf_secret_in_production(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

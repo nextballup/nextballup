@@ -1,9 +1,9 @@
-"""nextballup_clips — placeholder package surface for video clip generation.
-
-Phase 1 contains no behavior; the package exists so the uv workspace resolves.
-Implementation lands when video upload and clip generation come online.
-"""
+"""NextBallUp clip proposal and generation helpers."""
 
 from __future__ import annotations
 
+from nextballup_clips.proposals import ClipEvent, ClipProposal, build_clip_proposals
+
 __version__ = "0.1.0"
+
+__all__ = ["ClipEvent", "ClipProposal", "build_clip_proposals"]

@@ -5,8 +5,9 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,13 +54,16 @@ from nextballup_api.tenant import (
     set_tenant_context,
 )
 from nextballup_api.video_playback_status import derive_playback_status
+from nextballup_clips import ClipEvent, build_clip_proposals
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.enums import (
     InstitutionType,
     ProcessingJobStage,
     ProcessingJobStatus,
+    ReviewStatus,
     TeamLevel,
     UserRole,
+    VideoEventType,
     VideoStatus,
 )
 from nextballup_core.errors import (
@@ -85,6 +89,8 @@ from nextballup_core.schemas.video import (
     ProcessingStageStatus,
     RequeueProcessingRequest,
     RequeueProcessingResponse,
+    VideoClipProposalsResponse,
+    VideoClipProposalSummary,
     VideoDetailResponse,
     VideoEventsResponse,
     VideoEventSummary,
@@ -1639,6 +1645,71 @@ async def list_video_events(
         shot_clock_seconds=game.shot_clock_seconds if game is not None else None,
         events=events,
         total=len(events),
+    )
+
+
+# ---- GET /videos/{video_id}/clip-proposals -------------------------------
+
+
+@router.get("/{video_id:uuid}/clip-proposals", response_model=VideoClipProposalsResponse)
+async def list_video_clip_proposals(
+    video_id: uuid.UUID,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> VideoClipProposalsResponse:
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    candidate_limit = min(limit * 4, 400)
+    rows = await session.execute(
+        select(VideoEvent)
+        .where(VideoEvent.video_id == video.id)
+        .where(VideoEvent.review_status.in_((ReviewStatus.NEEDS_REVIEW, ReviewStatus.MACHINE_ONLY)))
+        .order_by(VideoEvent.event_time_ms, VideoEvent.output_frame)
+        .limit(candidate_limit)
+    )
+    proposals = build_clip_proposals(
+        [
+            ClipEvent(
+                id=row.id,
+                event_type=row.event_type.value,
+                event_time_ms=row.event_time_ms,
+                confidence=row.confidence,
+                review_status=row.review_status.value,
+                created_at=row.created_at,
+                metadata=row.event_metadata,
+            )
+            for row in rows.scalars()
+        ],
+        duration_seconds=video.duration_seconds,
+        limit=limit,
+    )
+    response_items = [
+        VideoClipProposalSummary(
+            id=proposal.id,
+            source_event_id=proposal.source_event_id,
+            event_type=VideoEventType(proposal.event_type),
+            label=proposal.label,
+            reason=proposal.reason,
+            start_time_ms=proposal.start_time_ms,
+            end_time_ms=proposal.end_time_ms,
+            review_status=ReviewStatus(proposal.review_status),
+            created_at=proposal.created_at,
+        )
+        for proposal in proposals
+        if proposal.created_at is not None
+    ]
+    return VideoClipProposalsResponse(
+        video_id=video.id,
+        proposals=response_items,
+        total=len(response_items),
     )
 
 

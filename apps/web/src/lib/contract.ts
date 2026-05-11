@@ -320,6 +320,24 @@ export type VideoEventsResponse = {
   total: number;
 };
 
+export type VideoClipProposalSummary = {
+  id: string;
+  source_event_id: string;
+  event_type: VideoEventType;
+  label: string;
+  reason: string;
+  start_time_ms: number;
+  end_time_ms: number;
+  review_status: ReviewStatus;
+  created_at: string;
+};
+
+export type VideoClipProposalsResponse = {
+  video_id: string;
+  proposals: VideoClipProposalSummary[];
+  total: number;
+};
+
 export type GenerateDemoPreviewResponse = {
   status: DemoPreviewStatus;
   preview_url: string | null;

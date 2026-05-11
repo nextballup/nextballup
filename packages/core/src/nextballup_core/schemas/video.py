@@ -205,6 +205,24 @@ class VideoEventsResponse(BaseModel):
     total: int
 
 
+class VideoClipProposalSummary(BaseModel):
+    id: str
+    source_event_id: uuid.UUID
+    event_type: VideoEventType
+    label: str
+    reason: str
+    start_time_ms: int
+    end_time_ms: int
+    review_status: ReviewStatus
+    created_at: datetime
+
+
+class VideoClipProposalsResponse(BaseModel):
+    video_id: uuid.UUID
+    proposals: list[VideoClipProposalSummary]
+    total: int
+
+
 class PlaybackVerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

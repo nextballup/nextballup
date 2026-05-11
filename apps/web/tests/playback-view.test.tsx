@@ -435,6 +435,147 @@ describe("VideoPlaybackView", () => {
     expect(screen.getByText("transcode")).toBeInTheDocument();
   });
 
+  it("shows clip proposals once event extraction has completed", async () => {
+    const sourceEventId = "00000000-0000-0000-0000-000000000001";
+    const video = baseVideo({
+      status: "processed",
+      processing: { transcode: "completed", events: "completed" },
+    });
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/clip-proposals", () =>
+        HttpResponse.json({
+          video_id: "v1",
+          total: 1,
+          proposals: [
+            {
+              id: `event:${sourceEventId}`,
+              source_event_id: sourceEventId,
+              event_type: "shot_made",
+              label: "Made shot",
+              reason: "Alpha made shot candidate at 00:12. Coach review required.",
+              start_time_ms: 8_000,
+              end_time_ms: 19_000,
+              review_status: "needs_review",
+              created_at: "2026-05-11T00:00:00Z",
+            },
+          ],
+        }),
+      ),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    expect(await screen.findByText("Made shot")).toBeInTheDocument();
+    expect(screen.getByText(/Not analytics; export is not implemented/)).toBeInTheDocument();
+    expect(screen.getByText(/0:08 - 0:19/)).toBeInTheDocument();
+    expect(screen.getByText("Needs review")).toBeInTheDocument();
+    expect(screen.getByText("1 for review")).toBeInTheDocument();
+    expect(screen.queryByText("84%")).not.toBeInTheDocument();
+  });
+
+  it("hides clip proposals from players", async () => {
+    const proposalRequest = vi.fn();
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(
+          baseVideo({
+            status: "processed",
+            processing: { transcode: "completed", events: "completed" },
+          }),
+        ),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/clip-proposals", () => {
+        proposalRequest();
+        return HttpResponse.json({ video_id: "v1", total: 0, proposals: [] });
+      }),
+    );
+
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({
+              status: "processed",
+              processing: { transcode: "completed", events: "completed" },
+            })}
+            viewerRole="player"
+          />,
+        ),
+      );
+    });
+
+    expect(screen.queryByTestId("clip-proposal-panel")).not.toBeInTheDocument();
+    expect(proposalRequest).not.toHaveBeenCalled();
+  });
+
+  it("hides clip proposals before event extraction completes", async () => {
+    server.use(
+      http.get("/api/v1/videos/v1", () =>
+        HttpResponse.json(
+          baseVideo({
+            status: "processed",
+            processing: { transcode: "completed", events: "pending" },
+          }),
+        ),
+      ),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "pending" },
+          },
+        }),
+      ),
+    );
+
+    await act(async () => {
+      render(
+        wrap(
+          <VideoPlaybackView
+            initialVideo={baseVideo({
+              status: "processed",
+              processing: { transcode: "completed", events: "pending" },
+            })}
+            viewerRole="coach"
+          />,
+        ),
+      );
+    });
+
+    expect(screen.queryByTestId("clip-proposal-panel")).not.toBeInTheDocument();
+  });
+
   it("surfaces an HLS manifest URL as the video source", async () => {
     const video = baseVideo({
       status: "processed",

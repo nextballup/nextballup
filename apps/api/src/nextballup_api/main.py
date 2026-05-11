@@ -125,6 +125,8 @@ def _validate_startup_secrets() -> None:
         )
     if settings.app_env in ("staging", "production"):
         failures: list[str] = []
+        if settings.app_debug:
+            failures.append("APP_DEBUG must be false in staging/production")
         if not settings.cookie_secure:
             failures.append("COOKIE_SECURE must be true in staging/production")
         if settings.cookie_samesite != "strict":

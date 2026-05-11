@@ -35,14 +35,17 @@ from nextballup_core.demo_preview import mark_demo_preview_queued
 from nextballup_core.enums import (
     ProcessingJobStage,
     ProcessingJobStatus,
+    ReviewStatus,
     UploadMethod,
     UserRole,
+    VideoEventType,
     VideoStatus,
 )
 from nextballup_core.errors import TooManyRequestsError
 from nextballup_core.settings import get_settings
 from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.billing import UsageEvent
+from nextballup_db.models.cv import VideoEvent
 from nextballup_db.models.user import User
 from nextballup_db.models.video import ProcessingJob, Video
 
@@ -1559,6 +1562,148 @@ async def test_video_events_endpoint_reflects_game_shot_clock_policy(
     assert body["shot_clock_seconds"] == 30
     assert body["events"] == []
     assert body["total"] == 0
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_clip_proposals_endpoint_returns_empty_queue_without_events(
+    storage_client: AsyncClient,
+) -> None:
+    _, game = await _setup_coach_team_game(
+        storage_client, coach_email="clip-empty-coach@example.com"
+    )
+    video_id = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()["id"]
+
+    response = await storage_client.get(f"{API}/videos/{video_id}/clip-proposals")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["video_id"] == video_id
+    assert body["proposals"] == []
+    assert body["total"] == 0
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_clip_proposals_endpoint_returns_ranked_event_windows(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="clip-events-coach@example.com"
+    )
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+
+    await set_worker_operator_role(db_session)
+    await db_session.execute(
+        update(Video).where(Video.id == video_id).values(duration_seconds=30.0)
+    )
+    shot = VideoEvent(
+        video_id=video_id,
+        team_id=uuid.UUID(team["id"]),
+        event_type=VideoEventType.SHOT_MADE,
+        event_time_ms=12_000,
+        output_frame=360,
+        shot_clock_enabled=False,
+        confidence=0.72,
+        review_status=ReviewStatus.NEEDS_REVIEW,
+        event_metadata={"clip_pre_ms": 4_000, "internal_track_id": "track-secret"},
+    )
+    passing = VideoEvent(
+        video_id=video_id,
+        team_id=uuid.UUID(team["id"]),
+        event_type=VideoEventType.PASS,
+        event_time_ms=2_000,
+        output_frame=60,
+        shot_clock_enabled=False,
+        confidence=0.99,
+        review_status=ReviewStatus.NEEDS_REVIEW,
+    )
+    approved = VideoEvent(
+        video_id=video_id,
+        team_id=uuid.UUID(team["id"]),
+        event_type=VideoEventType.SHOT_MADE,
+        event_time_ms=16_000,
+        output_frame=480,
+        shot_clock_enabled=False,
+        confidence=0.99,
+        review_status=ReviewStatus.APPROVED,
+    )
+    rejected = VideoEvent(
+        video_id=video_id,
+        team_id=uuid.UUID(team["id"]),
+        event_type=VideoEventType.SHOT_ATTEMPT,
+        event_time_ms=20_000,
+        output_frame=600,
+        shot_clock_enabled=False,
+        confidence=0.99,
+        review_status=ReviewStatus.REJECTED,
+    )
+    db_session.add_all([shot, passing, approved, rejected])
+    await db_session.commit()
+    shot_id = shot.id
+    await clear_worker_context(db_session)
+
+    response = await storage_client.get(f"{API}/videos/{video_id}/clip-proposals")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 2
+    assert [proposal["label"] for proposal in body["proposals"]] == ["Made shot", "Pass"]
+    first = body["proposals"][0]
+    assert first["source_event_id"] == str(shot_id)
+    assert first["event_type"] == "shot_made"
+    assert first["start_time_ms"] == 8_000
+    assert first["end_time_ms"] == 19_000
+    assert first["review_status"] == "needs_review"
+    assert first["reason"] == "Alpha made shot candidate at 00:12. Coach review required."
+    assert "rank_score" not in first
+    assert "confidence" not in first
+    assert "internal_track_id" not in response.text
+
+    limited = await storage_client.get(f"{API}/videos/{video_id}/clip-proposals?limit=1")
+    assert limited.status_code == 200, limited.text
+    assert limited.json()["total"] == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_clip_proposals_endpoint_rejects_non_members(
+    storage_client: AsyncClient,
+) -> None:
+    _, game = await _setup_coach_team_game(
+        storage_client, coach_email="clip-owner-coach@example.com"
+    )
+    video_id = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()["id"]
+
+    await _register(storage_client, _coach_payload("clip-snoop-coach@example.com"))
+    response = await storage_client.get(f"{API}/videos/{video_id}/clip-proposals")
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_clip_proposals_endpoint_rejects_player_members(
+    storage_client: AsyncClient,
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="clip-player-owner@example.com"
+    )
+    video_id = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()["id"]
+
+    await _register(storage_client, _player_payload("clip-player@example.com"))
+    join = await storage_client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 44},
+    )
+    assert join.status_code == 200, join.text
+
+    response = await storage_client.get(f"{API}/videos/{video_id}/clip-proposals")
+
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio(loop_scope="session")

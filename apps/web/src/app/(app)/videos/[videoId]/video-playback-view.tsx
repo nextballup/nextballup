@@ -12,6 +12,7 @@ import {
   IMPLEMENTED_PIPELINE_STAGES,
   VIDEO_TERMINAL_STATUSES,
   type UserRole,
+  type VideoClipProposalsResponse,
   type VideoDetailResponse,
   type VideoStatusResponse,
 } from "@/lib/contract";
@@ -95,6 +96,11 @@ export function VideoPlaybackView({
       />
       <FailedVideoRecoveryPanel video={video} viewerRole={viewerRole} />
       <DemoPreviewPanel video={video} viewerRole={viewerRole} />
+      <ClipProposalPanel
+        video={video}
+        status={statusQuery.data}
+        viewerRole={viewerRole}
+      />
       <MetadataPanel video={video} />
       <ProcessingPanel
         status={statusQuery.data}
@@ -340,6 +346,107 @@ function DemoPreviewPanel({
           {resolvedErrorMessage}
         </p>
       ) : null}
+    </section>
+  );
+}
+
+function ClipProposalPanel({
+  video,
+  status,
+  viewerRole,
+}: {
+  video: VideoDetailResponse;
+  status: VideoStatusResponse | undefined;
+  viewerRole: UserRole | null;
+}) {
+  const canReview = viewerRole === "coach" || viewerRole === "admin";
+  const eventStageStatus = status?.stages.events?.status ?? video.processing.events;
+  const canLoadProposals =
+    video.status === "processed" && eventStageStatus === "completed";
+  const proposalsQuery = useQuery<VideoClipProposalsResponse>({
+    queryKey: ["video-clip-proposals", video.id],
+    enabled: canReview && canLoadProposals,
+    staleTime: 15_000,
+    refetchInterval: (query) =>
+      canReview && canLoadProposals && (query.state.data?.proposals.length ?? 0) === 0
+        ? POLL_INTERVAL_MS
+        : false,
+    queryFn: async () =>
+      apiJson<VideoClipProposalsResponse>(`/videos/${video.id}/clip-proposals`),
+  });
+  const proposals = proposalsQuery.data?.proposals ?? [];
+  const visibleProposals = proposals.slice(0, 5);
+
+  if (!canReview || !canLoadProposals) {
+    return null;
+  }
+
+  return (
+    <section
+      data-testid="clip-proposal-panel"
+      className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm"
+    >
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            Clip proposals
+          </h2>
+          <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
+            Alpha detector candidates for coach review. Not analytics; export is
+            not implemented.
+          </p>
+        </div>
+        <span className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+          {proposalsQuery.isLoading ? "loading" : `${proposals.length} for review`}
+        </span>
+      </div>
+      {proposalsQuery.isLoading ? (
+        <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
+          Loading clip proposals...
+        </div>
+      ) : proposalsQuery.isError ? (
+        <p role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
+          Clip proposals are unavailable.
+        </p>
+      ) : proposals.length === 0 ? (
+        <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
+          No alpha candidates surfaced for this video.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {proposals.length > visibleProposals.length ? (
+            <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
+              Showing top {visibleProposals.length} of {proposals.length}.
+            </p>
+          ) : null}
+          <ul className="divide-y divide-[color:var(--color-nbu-border)] rounded-md border border-[color:var(--color-nbu-border)]">
+            {visibleProposals.map((proposal) => (
+              <li
+                key={proposal.id}
+                className="grid gap-2 px-3 py-2 sm:grid-cols-[1fr_auto]"
+              >
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="font-medium">{proposal.label}</span>
+                    <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+                      {formatClipTime(proposal.start_time_ms)} -{" "}
+                      {formatClipTime(proposal.end_time_ms)}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-[color:var(--color-nbu-text-muted)]">
+                    {proposal.reason}
+                  </p>
+                </div>
+                <div className="flex items-start gap-2 sm:justify-end">
+                  <span className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+                    {formatReviewStatus(proposal.review_status)}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </section>
   );
 }
@@ -728,6 +835,28 @@ function formatDuration(elapsedMs: number): string {
   if (minutes < 60) return `${minutes}m`;
   const hours = Math.floor(minutes / 60);
   return `${hours}h`;
+}
+
+function formatClipTime(valueMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(valueMs / 1_000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatReviewStatus(value: string): string {
+  switch (value) {
+    case "needs_review":
+      return "Needs review";
+    case "machine_only":
+      return "Detector only";
+    case "approved":
+      return "Approved";
+    case "rejected":
+      return "Rejected";
+    default:
+      return value.replace(/_/g, " ");
+  }
 }
 
 function formatBytes(bytes: number): string {
