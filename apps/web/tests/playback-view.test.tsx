@@ -630,6 +630,106 @@ describe("VideoPlaybackView", () => {
     expect(within(refreshedList).getByText("Pass")).toBeInTheDocument();
   });
 
+  it("keeps pagination reachable when the loaded candidates do not match the filter", async () => {
+    const video = baseVideo({
+      status: "processed",
+      duration_seconds: 600,
+      processing: { transcode: "completed", events: "completed" },
+    });
+    const firstPageEvents = [
+      buildEvent({
+        id: "00000000-0000-0000-0000-000000000301",
+        event_type: "shot_attempt",
+        event_time_ms: 8_000,
+      }),
+      buildEvent({
+        id: "00000000-0000-0000-0000-000000000302",
+        event_type: "rebound",
+        event_time_ms: 16_000,
+      }),
+    ];
+    const secondPageEvents = [
+      buildEvent({
+        id: "00000000-0000-0000-0000-000000000303",
+        event_type: "pass",
+        event_time_ms: 60_000,
+      }),
+    ];
+
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/events", ({ request }) => {
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        const summary = {
+          total: 3,
+          needs_review: 3,
+          approved: 0,
+          rejected: 0,
+          machine_only: 0,
+          alpha_model_source: 3,
+          manual_source: 0,
+        };
+        if (cursor) {
+          return HttpResponse.json({
+            video_id: "v1",
+            shot_clock_enabled: false,
+            shot_clock_seconds: null,
+            total: 3,
+            next_cursor: null,
+            summary,
+            events: secondPageEvents,
+          });
+        }
+        return HttpResponse.json({
+          video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
+          total: 3,
+          next_cursor: "page-2",
+          summary,
+          events: firstPageEvents,
+        });
+      }),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(2);
+    });
+
+    fireEvent.change(screen.getByTestId("candidate-search"), {
+      target: { value: "pass" },
+    });
+
+    expect(
+      await screen.findByText("No loaded candidates match the current filter."),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("candidate-load-more")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("candidate-load-more"));
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(1);
+    });
+    const list = screen.getByTestId("candidate-review-list");
+    expect(within(list).getByText("Pass")).toBeInTheDocument();
+  });
+
   it("filters candidates by event type and review status, and keeps reviewed candidates visible", async () => {
     const video = baseVideo({
       status: "processed",
@@ -809,7 +909,9 @@ describe("VideoPlaybackView", () => {
       render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
     });
 
-    expect(await screen.findByLabelText("Filter candidates")).toBeInTheDocument();
+    expect(
+      await screen.findByLabelText("Filter loaded candidates"),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/AI search/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/semantic/i)).not.toBeInTheDocument();
 

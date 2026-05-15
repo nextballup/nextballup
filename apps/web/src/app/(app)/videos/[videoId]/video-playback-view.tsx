@@ -669,13 +669,13 @@ function CandidateReviewPanel({
         </div>
         <div className="flex flex-col gap-2 pt-1 sm:flex-row sm:items-end sm:justify-between">
           <label className="flex flex-1 flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)] sm:max-w-sm">
-            Filter candidates
+            Filter loaded candidates
             <input
               type="search"
               value={searchText}
               onChange={(event) => setSearchText(event.target.value)}
               data-testid="candidate-search"
-              placeholder="Type, timestamp, or status"
+              placeholder="Loaded type, timestamp, or status"
               className="rounded-md border border-[color:var(--color-nbu-border)] bg-transparent px-2 py-1 text-sm text-[color:var(--color-nbu-text)]"
             />
           </label>
@@ -732,8 +732,19 @@ function CandidateReviewPanel({
           No alpha candidates surfaced for this video.
         </div>
       ) : visibleEvents.length === 0 ? (
-        <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
-          No candidates match the current filter.
+        <div className="space-y-2 rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
+          <p>No loaded candidates match the current filter.</p>
+          {eventsQuery.hasNextPage ? (
+            <button
+              type="button"
+              data-testid="candidate-load-more"
+              disabled={eventsQuery.isFetchingNextPage}
+              onClick={() => eventsQuery.fetchNextPage()}
+              className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-3 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+            >
+              {eventsQuery.isFetchingNextPage ? "Loading more..." : "Load more"}
+            </button>
+          ) : null}
         </div>
       ) : (
         <div className="space-y-2">
