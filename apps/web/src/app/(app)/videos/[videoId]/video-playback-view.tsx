@@ -182,9 +182,31 @@ export function VideoPlaybackView({
     return () => window.clearTimeout(handle);
   }, [video.token_expires_at, video.playback_url, videoQuery]);
 
+  const showCandidateReview = shouldShowCandidateReview(
+    video,
+    statusQuery.data,
+    viewerRole,
+  );
+
   return (
     <div className="space-y-4">
-      <PlaybackPanel video={video} videoRef={playbackVideoRef} />
+      {showCandidateReview ? (
+        <div
+          data-testid="playback-review-row"
+          className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] lg:items-start"
+        >
+          <PlaybackPanel video={video} videoRef={playbackVideoRef} />
+          <CandidateReviewPanel
+            video={video}
+            status={statusQuery.data}
+            viewerRole={viewerRole}
+            onJumpToTime={jumpToPlaybackTime}
+            getCurrentPlaybackTimeMs={getCurrentPlaybackTimeMs}
+          />
+        </div>
+      ) : (
+        <PlaybackPanel video={video} videoRef={playbackVideoRef} />
+      )}
       <PendingUploadRecoveryPanel video={video} viewerRole={viewerRole} />
       <ActiveProcessingRecoveryPanel
         video={video}
@@ -193,13 +215,6 @@ export function VideoPlaybackView({
       />
       <FailedVideoRecoveryPanel video={video} viewerRole={viewerRole} />
       <DemoPreviewPanel video={video} viewerRole={viewerRole} />
-      <CandidateReviewPanel
-        video={video}
-        status={statusQuery.data}
-        viewerRole={viewerRole}
-        onJumpToTime={jumpToPlaybackTime}
-        getCurrentPlaybackTimeMs={getCurrentPlaybackTimeMs}
-      />
       <MetadataPanel video={video} />
       <ProcessingPanel
         status={statusQuery.data}
@@ -207,6 +222,16 @@ export function VideoPlaybackView({
       />
     </div>
   );
+}
+
+function shouldShowCandidateReview(
+  video: VideoDetailResponse,
+  status: VideoStatusResponse | undefined,
+  viewerRole: UserRole | null,
+): boolean {
+  if (viewerRole !== "coach" && viewerRole !== "admin") return false;
+  const eventStageStatus = status?.stages.events?.status ?? video.processing.events;
+  return video.status === "processed" && eventStageStatus === "completed";
 }
 
 function FailedVideoRecoveryPanel({
@@ -474,10 +499,7 @@ function CandidateReviewPanel({
     useState<VideoEventType>("shot_attempt");
   const [mutationError, setMutationError] = useState<string | null>(null);
 
-  const canReview = viewerRole === "coach" || viewerRole === "admin";
-  const eventStageStatus = status?.stages.events?.status ?? video.processing.events;
-  const canLoadEvents =
-    video.status === "processed" && eventStageStatus === "completed";
+  const isVisible = shouldShowCandidateReview(video, status, viewerRole);
 
   const queryKey = [
     "video-events",
@@ -489,14 +511,12 @@ function CandidateReviewPanel({
 
   const eventsQuery = useInfiniteQuery<VideoEventsResponse>({
     queryKey,
-    enabled: canReview && canLoadEvents,
+    enabled: isVisible,
     initialPageParam: undefined,
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     staleTime: 10_000,
     refetchInterval: (query) =>
-      canReview &&
-      canLoadEvents &&
-      (query.state.data?.pages[0]?.summary.total ?? 0) === 0
+      isVisible && (query.state.data?.pages[0]?.summary.total ?? 0) === 0
         ? POLL_INTERVAL_MS
         : false,
     queryFn: async ({ pageParam }) =>
@@ -565,7 +585,7 @@ function CandidateReviewPanel({
     },
   });
 
-  if (!canReview || !canLoadEvents) {
+  if (!isVisible) {
     return null;
   }
 
@@ -731,91 +751,82 @@ function CandidateReviewPanel({
         <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
           No alpha candidates surfaced for this video.
         </div>
-      ) : visibleEvents.length === 0 ? (
-        <div className="space-y-2 rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
-          <p>No loaded candidates match the current filter.</p>
-          {eventsQuery.hasNextPage ? (
-            <button
-              type="button"
-              data-testid="candidate-load-more"
-              disabled={eventsQuery.isFetchingNextPage}
-              onClick={() => eventsQuery.fetchNextPage()}
-              className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-3 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
-            >
-              {eventsQuery.isFetchingNextPage ? "Loading more..." : "Load more"}
-            </button>
-          ) : null}
-        </div>
       ) : (
         <div className="space-y-2">
-          <ul
-            data-testid="candidate-review-list"
-            className="max-h-[36rem] divide-y divide-[color:var(--color-nbu-border)] overflow-y-auto rounded-md border border-[color:var(--color-nbu-border)]"
-          >
-            {visibleEvents.map((event) => (
-              <li
-                key={event.id}
-                data-testid="candidate-row"
-                className="grid gap-3 px-3 py-2 sm:grid-cols-[1fr_auto]"
-              >
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="font-medium">
-                      {EVENT_TYPE_LABELS[event.event_type]}
-                    </span>
-                    <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
-                      {formatClipTime(event.event_time_ms)}
-                    </span>
-                    <span className={REVIEW_STATUS_BADGE_CLASS[event.review_status]}>
-                      {formatReviewStatus(event.review_status)}
-                    </span>
-                    <span className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
-                      {SOURCE_LABELS[event.source]}
-                    </span>
+          {visibleEvents.length === 0 ? (
+            <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
+              No loaded candidates match the current filter.
+            </div>
+          ) : (
+            <ul
+              data-testid="candidate-review-list"
+              className="max-h-[36rem] divide-y divide-[color:var(--color-nbu-border)] overflow-y-auto rounded-md border border-[color:var(--color-nbu-border)]"
+            >
+              {visibleEvents.map((event) => (
+                <li
+                  key={event.id}
+                  data-testid="candidate-row"
+                  className="grid gap-3 px-3 py-2 sm:grid-cols-[1fr_auto]"
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span className="font-medium">
+                        {EVENT_TYPE_LABELS[event.event_type]}
+                      </span>
+                      <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+                        {formatClipTime(event.event_time_ms)}
+                      </span>
+                      <span className={REVIEW_STATUS_BADGE_CLASS[event.review_status]}>
+                        {formatReviewStatus(event.review_status)}
+                      </span>
+                      <span className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+                        {SOURCE_LABELS[event.source]}
+                      </span>
+                    </div>
                   </div>
-                </div>
-                <div className="flex flex-wrap items-start gap-2 sm:justify-end">
-                  <button
-                    type="button"
-                    onClick={() => onJumpToTime(event.event_time_ms)}
-                    className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
-                  >
-                    Jump
-                  </button>
-                  <button
-                    type="button"
-                    disabled={
-                      reviewMutation.isPending || event.review_status === "approved"
-                    }
-                    onClick={() =>
-                      reviewMutation.mutate({
-                        event,
-                        review_status: "approved",
-                      })
-                    }
-                    className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
-                  >
-                    Approve
-                  </button>
-                  <button
-                    type="button"
-                    disabled={
-                      reviewMutation.isPending || event.review_status === "rejected"
-                    }
-                    onClick={() =>
-                      reviewMutation.mutate({
-                        event,
-                        review_status: "rejected",
-                      })
-                    }
-                    className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
-                  >
-                    Reject
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
+                  <div className="flex flex-wrap items-start gap-2 sm:justify-end">
+                    <button
+                      type="button"
+                      onClick={() => onJumpToTime(event.event_time_ms)}
+                      className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
+                    >
+                      Jump
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        reviewMutation.isPending || event.review_status === "approved"
+                      }
+                      onClick={() =>
+                        reviewMutation.mutate({
+                          event,
+                          review_status: "approved",
+                        })
+                      }
+                      className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+                    >
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        reviewMutation.isPending || event.review_status === "rejected"
+                      }
+                      onClick={() =>
+                        reviewMutation.mutate({
+                          event,
+                          review_status: "rejected",
+                        })
+                      }
+                      className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
           {eventsQuery.hasNextPage ? (
             <button
               type="button"
