@@ -687,8 +687,8 @@ function CandidateReviewPanel({
             </button>
           ))}
         </div>
-        <div className="flex flex-col gap-2 pt-1 sm:flex-row sm:items-end sm:justify-between">
-          <label className="flex flex-1 flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)] sm:max-w-sm">
+        <div className="flex flex-col gap-2 pt-1">
+          <label className="flex flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)]">
             Filter loaded candidates
             <input
               type="search"
@@ -700,7 +700,7 @@ function CandidateReviewPanel({
             />
           </label>
           <div className="flex flex-wrap items-end gap-2">
-            <label className="flex flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)]">
+            <label className="flex min-w-0 flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)]">
               Manual tag
               <select
                 value={manualEventType}
