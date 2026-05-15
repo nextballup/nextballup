@@ -192,6 +192,47 @@ services:
           name: nextballup-alpha-api
           property: hostport
 
+  # Public marketing surface for nextballup.com / www.nextballup.com. Same
+  # Next.js codebase as the gated alpha web service, but configured so it
+  # cannot serve the product:
+  #   * NEXT_PUBLIC_REGISTRATION_MODE=disabled hides any same-origin
+  #     register CTA the layer above the marketing page might add later.
+  #   * NEXT_PUBLIC_PRODUCT_BASE_URL points "Sign in" at the gated beta host
+  #     so product auth cookies never get scoped to nextballup.com.
+  #   * API_UPSTREAM_HOSTPORT rewrites /api/v1/* to the alpha API so the
+  #     marketing pilot-interest form has somewhere to POST. Swap to a
+  #     dedicated public API later if/when one exists.
+  #   * autoDeployTrigger: off keeps deploys manual, matching project
+  #     discipline for production-facing surfaces.
+  # Custom domain + DNS for nextballup.com is attached in the Render
+  # dashboard, not declared here.
+  - type: web
+    name: nextballup-public-web
+    runtime: node
+    plan: starter
+    region: ohio
+    rootDir: apps/web
+    autoDeployTrigger: off
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    startCommand: pnpm exec next start -p $PORT
+    healthCheckPath: /
+    domains:
+      - nextballup.com
+      - www.nextballup.com
+    renderSubdomainPolicy: disabled
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NEXT_PUBLIC_REGISTRATION_MODE
+        value: disabled
+      - key: NEXT_PUBLIC_PRODUCT_BASE_URL
+        value: https://beta.nextballup.com
+      - key: API_UPSTREAM_HOSTPORT
+        fromService:
+          type: pserv
+          name: nextballup-alpha-api
+          property: hostport
+
 databases:
   - name: nextballup-alpha-db
     databaseName: nextballup_alpha
