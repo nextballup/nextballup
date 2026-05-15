@@ -23,49 +23,57 @@ afterEach(() => {
 });
 
 describe("registration channel UI", () => {
-  it("fails closed on the public landing page when mode is unset", () => {
-    delete process.env.NEXT_PUBLIC_REGISTRATION_MODE;
+  // The public marketing site (nextballup.com) does not render same-origin
+  // /register or /login links regardless of NEXT_PUBLIC_REGISTRATION_MODE.
+  // The only marketing CTA is /pilot, and Sign in points at the gated
+  // product host. These tests pin that invariant so a future copy change
+  // can't accidentally re-introduce a /register CTA on a marketing build.
+  it.each([
+    ["unset", undefined],
+    ["open", "open"],
+    ["invite_only", "invite_only"],
+    ["allowlist", "allowlist"],
+    ["disabled", "disabled"],
+    ["unknown", "invite-ony"],
+  ] as const)(
+    "never exposes same-origin /register or /login links on the marketing landing (mode=%s)",
+    (_label, mode) => {
+      if (mode === undefined) {
+        delete process.env.NEXT_PUBLIC_REGISTRATION_MODE;
+      } else {
+        process.env.NEXT_PUBLIC_REGISTRATION_MODE = mode;
+      }
 
-    render(<LandingPage />);
+      render(<LandingPage />);
 
-    expect(screen.queryByRole("link", { name: /^create account$/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: /have an invite/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/public access is not yet open/i)).toBeInTheDocument();
-  });
+      expect(
+        screen.queryByRole("link", { name: /^create account$/i }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("link", { name: /have an invite/i }),
+      ).not.toBeInTheDocument();
+      const sameOriginAuth = screen
+        .queryAllByRole("link")
+        .filter((link) => {
+          const href = link.getAttribute("href") ?? "";
+          return href === "/register" || href === "/login";
+        });
+      expect(sameOriginAuth).toHaveLength(0);
+    },
+  );
 
-  it("shows the invite CTA on invite-only channels", () => {
-    process.env.NEXT_PUBLIC_REGISTRATION_MODE = "invite_only";
-
-    render(<LandingPage />);
-
-    expect(screen.getByRole("link", { name: /have an invite/i })).toHaveAttribute(
-      "href",
-      "/register",
-    );
-    expect(screen.queryByRole("link", { name: /^create account$/i })).not.toBeInTheDocument();
-  });
-
-  it("does not ask for an invite on allowlist channels", () => {
+  it("routes every Request pilot access CTA on the marketing landing to /pilot", () => {
     process.env.NEXT_PUBLIC_REGISTRATION_MODE = "allowlist";
 
     render(<LandingPage />);
 
-    expect(screen.getByRole("link", { name: /pilot access/i })).toHaveAttribute(
-      "href",
-      "/register",
-    );
-    expect(screen.queryByRole("link", { name: /have an invite/i })).not.toBeInTheDocument();
-  });
-
-  it("fails closed and warns when the public registration mode is unknown", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    process.env.NEXT_PUBLIC_REGISTRATION_MODE = "invite-ony";
-
-    render(<LandingPage />);
-
-    expect(screen.queryByRole("link", { name: /have an invite/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/public access is not yet open/i)).toBeInTheDocument();
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/unknown/i));
+    const pilotLinks = screen
+      .getAllByRole("link", { name: /request pilot access/i })
+      .map((link) => link.getAttribute("href"));
+    expect(pilotLinks.length).toBeGreaterThan(0);
+    for (const href of pilotLinks) {
+      expect(href).toBe("/pilot");
+    }
   });
 
   it("keeps the register form disabled until status loads", () => {

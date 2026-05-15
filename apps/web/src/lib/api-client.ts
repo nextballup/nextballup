@@ -11,6 +11,9 @@ const CSRF_OPTIONAL_PATHS = new Set([
   "/auth/password/forgot",
   "/auth/password/reset",
   "/auth/email/verify/confirm",
+  // Marketing pilot-interest is unauthenticated; the public marketing site
+  // does not share auth/CSRF cookies with the gated product host.
+  "/pilot-interest",
 ]);
 
 function readCsrfCookie(): string | null {

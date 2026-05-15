@@ -14,14 +14,32 @@
   --color-nbu-error: #ef4444;
 }
 
+/* Default to system preference when no explicit theme is set on <html>. */
 @media (prefers-color-scheme: dark) {
-  @theme {
+  :root:not([data-theme="light"]) {
     --color-nbu-bg: #000000;
     --color-nbu-surface: #0a0a0a;
     --color-nbu-border: #262626;
     --color-nbu-text: #fafafa;
     --color-nbu-text-muted: #a3a3a3;
   }
+}
+
+/* Explicit overrides win over the system preference. */
+[data-theme="dark"] {
+  --color-nbu-bg: #000000;
+  --color-nbu-surface: #0a0a0a;
+  --color-nbu-border: #262626;
+  --color-nbu-text: #fafafa;
+  --color-nbu-text-muted: #a3a3a3;
+}
+
+[data-theme="light"] {
+  --color-nbu-bg: #ffffff;
+  --color-nbu-surface: #fafafa;
+  --color-nbu-border: #e5e5e5;
+  --color-nbu-text: #0a0a0a;
+  --color-nbu-text-muted: #737373;
 }
 
 html,

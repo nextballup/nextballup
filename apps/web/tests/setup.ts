@@ -51,6 +51,25 @@ afterAll(() => {
   server.close();
 });
 
+// jsdom doesn't implement matchMedia; the theme toggle uses it to read the
+// system color-scheme preference on first mount. Stub a static "light" match
+// so tests are deterministic regardless of host appearance settings.
+if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      dispatchEvent: () => false,
+    }),
+  });
+}
+
 // jsdom doesn't implement MediaSource; the HLS branch imports hls.js which
 // expects window, but our tests only exercise the mp4 (native <video>) path.
 // A narrow shim keeps the import graph happy without pulling in browser APIs.
