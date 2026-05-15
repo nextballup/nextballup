@@ -33,6 +33,8 @@ class DemoPreviewArtifact:
     output_path: Path
     url_path: str
     generated_at: datetime
+    candidate_tags_path: Path | None = None
+    candidate_tags_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,10 @@ def _resolved_demo_state_path(settings: Settings, video_id: uuid.UUID) -> Path:
     return _resolved_demo_dir(settings, video_id) / "demo-preview.state.json"
 
 
+def _resolved_candidate_tags_path(settings: Settings, video_id: uuid.UUID) -> Path:
+    return _resolved_demo_dir(settings, video_id) / "alpha-candidate-tags.json"
+
+
 def _resolved_demo_run_lock_path(settings: Settings, video_id: uuid.UUID) -> Path:
     return _resolved_demo_dir(settings, video_id) / ".demo-preview.run.lock"
 
@@ -139,6 +145,46 @@ def _preview_checkpoint_path(settings: Settings) -> Path:
     if settings.alpha_detector_preview_enabled():
         return settings.cv_alpha_detector_checkpoint_path
     return settings.cv_demo_checkpoint_path
+
+
+def _validate_alpha_candidate_tags_inputs(
+    settings: Settings,
+    *,
+    training_root: Path,
+    startup: bool,
+) -> None:
+    if not settings.alpha_candidate_tags_enabled():
+        return
+    script_path = _ensure_path_within_root(
+        root=training_root,
+        path=settings.resolve_repo_relative_path(settings.cv_alpha_candidate_script_path),
+        label="alpha candidate script",
+        startup=startup,
+    )
+    trainer_sidecar_path = _ensure_path_within_root(
+        root=training_root,
+        path=settings.resolve_repo_relative_path(settings.cv_alpha_candidate_trainer_sidecar_path),
+        label="alpha candidate trainer sidecar",
+        startup=startup,
+    )
+    adapter_path = _ensure_path_within_root(
+        root=training_root,
+        path=settings.resolve_repo_relative_path(settings.cv_alpha_candidate_adapter_path),
+        label="alpha candidate adapter",
+        startup=startup,
+    )
+    if not script_path.is_file():
+        raise _runtime_error("Alpha candidate tagging script is not available", startup=startup)
+    if not trainer_sidecar_path.is_file():
+        raise _runtime_error(
+            "Alpha candidate tagging trainer sidecar is not available",
+            startup=startup,
+        )
+    if not adapter_path.is_dir():
+        raise _runtime_error(
+            "Alpha candidate tagging adapter directory is not available",
+            startup=startup,
+        )
 
 
 def _validate_alpha_detector_preview_report(
@@ -227,6 +273,11 @@ def _validate_demo_preview_inputs(
         startup=startup,
     )
     _validate_alpha_detector_preview_report(
+        settings,
+        training_root=training_root,
+        startup=startup,
+    )
+    _validate_alpha_candidate_tags_inputs(
         settings,
         training_root=training_root,
         startup=startup,
@@ -471,10 +522,12 @@ def resolve_demo_preview(*, settings: Settings, video_id: uuid.UUID) -> DemoPrev
     if not output_path.is_file():
         return None
     generated_at = datetime.fromtimestamp(output_path.stat().st_mtime, tz=UTC)
+    candidate_tags_path = _resolved_candidate_tags_path(settings, video_id)
     return DemoPreviewArtifact(
         output_path=output_path,
         url_path=demo_preview_url_path(video_id),
         generated_at=generated_at,
+        candidate_tags_path=candidate_tags_path if candidate_tags_path.is_file() else None,
     )
 
 
@@ -844,6 +897,78 @@ def _run_demo_preview_inference(
         )
 
 
+def _run_alpha_candidate_tags_inference(
+    *,
+    settings: Settings,
+    input_path: Path,
+    output_path: Path,
+) -> str | None:
+    if not settings.alpha_candidate_tags_enabled():
+        return None
+    training_root = _resolved_training_root(settings)
+    script_path = _ensure_path_within_root(
+        root=training_root,
+        path=settings.resolve_repo_relative_path(settings.cv_alpha_candidate_script_path),
+        label="alpha candidate script",
+        startup=False,
+    )
+    trainer_sidecar_path = _ensure_path_within_root(
+        root=training_root,
+        path=settings.resolve_repo_relative_path(settings.cv_alpha_candidate_trainer_sidecar_path),
+        label="alpha candidate trainer sidecar",
+        startup=False,
+    )
+    adapter_path = _ensure_path_within_root(
+        root=training_root,
+        path=settings.resolve_repo_relative_path(settings.cv_alpha_candidate_adapter_path),
+        label="alpha candidate adapter",
+        startup=False,
+    )
+    command = [
+        _resolve_uv_command(),
+        "run",
+        "--no-sync",
+        "python",
+        str(script_path.relative_to(training_root)),
+        "--input",
+        str(input_path),
+        "--output",
+        str(output_path),
+        "--trainer-sidecar",
+        str(trainer_sidecar_path),
+        "--adapter-dir",
+        str(adapter_path),
+        "--window-seconds",
+        str(settings.cv_alpha_candidate_window_seconds),
+        "--stride-seconds",
+        str(settings.cv_alpha_candidate_stride_seconds),
+        "--max-windows",
+        str(settings.cv_alpha_candidate_max_windows),
+    ]
+    subprocess_kwargs: dict[str, Any] = {
+        "cwd": training_root,
+        "env": _build_demo_preview_env(),
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "timeout": settings.cv_alpha_candidate_timeout_seconds,
+    }
+    preexec_fn = _demo_preview_preexec_fn(settings)
+    if preexec_fn is not None:
+        subprocess_kwargs["preexec_fn"] = preexec_fn
+    try:
+        completed = subprocess.run(command, **subprocess_kwargs)
+    except FileNotFoundError:
+        return "uv is not available; cannot run alpha candidate tagging"
+    except subprocess.TimeoutExpired:
+        return "Alpha candidate tagging timed out"
+    if completed.returncode != 0:
+        return "Alpha candidate tagging failed"
+    if not output_path.is_file() or output_path.stat().st_size <= 0:
+        return "Alpha candidate tagging did not produce an output artifact"
+    return None
+
+
 async def render_demo_preview_artifact(
     *,
     video_id: uuid.UUID,
@@ -896,6 +1021,7 @@ async def render_demo_preview_artifact(
             temp_dir = Path(temp_dir_raw)
             input_path = temp_dir / "input.mp4"
             staged_output = temp_dir / "demo-preview.annotated.mp4"
+            staged_candidates = temp_dir / "alpha-candidate-tags.json"
             await download_file(storage_key_mezzanine, str(input_path))
             await to_thread.run_sync(
                 lambda: _run_demo_preview_inference(
@@ -909,7 +1035,23 @@ async def render_demo_preview_artifact(
                     "Local demo preview did not produce an output artifact",
                     code=ErrorCode.DEMO_PREVIEW_FAILED,
                 )
+            candidate_error = await to_thread.run_sync(
+                lambda: _run_alpha_candidate_tags_inference(
+                    settings=settings,
+                    input_path=input_path,
+                    output_path=staged_candidates,
+                )
+            )
             staged_output.replace(final_output)
+            final_candidates = _resolved_candidate_tags_path(settings, video_id)
+            if candidate_error is not None and settings.alpha_candidate_tags_enabled():
+                try:
+                    final_candidates.unlink(missing_ok=True)
+                except OSError:
+                    candidate_error = "Alpha candidate tagging could not clear stale output"
+            if candidate_error is None and staged_candidates.is_file():
+                staged_candidates.replace(final_candidates)
+                final_candidates.chmod(0o600)
             _chmod_best_effort(final_output.parent, 0o700)
             final_output.chmod(0o600)
     finally:
@@ -921,4 +1063,6 @@ async def render_demo_preview_artifact(
             "Local demo preview artifact could not be resolved after generation",
             code=ErrorCode.DEMO_PREVIEW_FAILED,
         )
+    if "candidate_error" in locals() and candidate_error is not None:
+        return replace(artifact, candidate_tags_error=candidate_error)
     return artifact

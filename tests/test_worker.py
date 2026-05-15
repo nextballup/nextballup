@@ -7,6 +7,7 @@ RLS-gated INSERTs go through the audited code paths.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import time
@@ -71,6 +72,7 @@ from sqlalchemy.pool import NullPool
 
 from nextballup_core.constants import AuditAction, ErrorCode
 from nextballup_core.demo_preview import (
+    DemoPreviewArtifact,
     cleanup_expired_demo_previews,
     mark_demo_preview_running,
     resolve_demo_preview,
@@ -83,15 +85,18 @@ from nextballup_core.enums import (
     InstitutionType,
     ProcessingJobStage,
     ProcessingJobStatus,
+    ReviewStatus,
     Sport,
     TeamLevel,
     UploadMethod,
+    VideoEventType,
     VideoStatus,
 )
 from nextballup_core.errors import ConflictError, ServiceUnavailableError
 from nextballup_core.settings import Settings, get_settings, reload_settings
 from nextballup_db.models.audit import AuditLog
 from nextballup_db.models.billing import UsageEvent
+from nextballup_db.models.cv import VideoEvent
 from nextballup_db.models.email_verification import EmailVerificationToken
 from nextballup_db.models.game import Game
 from nextballup_db.models.password_reset import PasswordResetToken
@@ -2053,6 +2058,245 @@ async def test_execute_demo_preview_completes_and_updates_video_detail(
         )
         >= 1
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_demo_preview_imports_alpha_candidate_tags(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="worker-demo-preview-candidates@example.com"
+    )
+    transcode = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        celery_task_id="celery-transcode-demo-preview-candidates",
+        storage=fake_storage,
+    )
+    assert transcode.status == "completed"
+
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CV_ALPHA_DETECTOR_PREVIEW_ENABLED", "true")
+    monkeypatch.setenv("CV_ALPHA_CANDIDATE_TAGS_ENABLED", "true")
+    reload_settings()
+    settings = get_settings()
+
+    preview_dir = demo_preview_env["preview_root"] / str(video_id)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview_path = preview_dir / "demo-preview.annotated.mp4"
+    preview_path.write_bytes(b"annotated-preview-with-candidates")
+    candidate_path = preview_dir / "alpha-candidate-tags.json"
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "alpha_video_candidate_tags_v1",
+                "source": "restricted_bard_lora_alpha_video_windows",
+                "lineage": {
+                    "demo_only": True,
+                    "review_required": True,
+                    "commercial_use_allowed": False,
+                    "restricted_source": True,
+                },
+                "review_required": True,
+                "demo_only": True,
+                "commercial_use_allowed": False,
+                "not_production_analytics": True,
+                "candidates": [
+                    {
+                        "candidate_id": "alpha-video-candidate-000001",
+                        "event_type": "shot_attempt",
+                        "start_time_ms": 4000,
+                        "end_time_ms": 12000,
+                        "predicted_actions": ["3PT Shot"],
+                        "review_required": True,
+                        "commercial_use_allowed": False,
+                    }
+                ],
+                "blocker": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def _fake_render(**kwargs: Any) -> DemoPreviewArtifact:
+        return DemoPreviewArtifact(
+            output_path=preview_path,
+            url_path=f"/api/v1/videos/{video_id}/demo-preview/artifact",
+            generated_at=datetime.now(tz=UTC),
+            candidate_tags_path=candidate_path,
+        )
+
+    monkeypatch.setattr(
+        "nextballup_worker.runtime.demo_preview.render_demo_preview_artifact",
+        _fake_render,
+    )
+
+    result = await execute_demo_preview(
+        db_session,
+        video_id=video_id,
+        celery_task_id="celery-demo-preview-candidates",
+        settings=settings,
+        storage=fake_storage,
+    )
+    assert result.status == "completed"
+
+    await set_worker_operator_role(db_session)
+    events = (
+        (await db_session.execute(select(VideoEvent).where(VideoEvent.video_id == video_id)))
+        .scalars()
+        .all()
+    )
+    event_job = await db_session.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video_id,
+            ProcessingJob.stage == ProcessingJobStage.EVENTS,
+        )
+    )
+    await clear_worker_context(db_session)
+
+    assert event_job is not None
+    assert event_job.status is ProcessingJobStatus.COMPLETED
+    assert event_job.progress_percent == 100
+    assert (event_job.result_metadata or {})["not_production_analytics"] is True
+    assert len(events) == 1
+    event = events[0]
+    assert event.team_id == team_id
+    assert event.event_type is VideoEventType.SHOT_ATTEMPT
+    assert event.review_status is ReviewStatus.NEEDS_REVIEW
+    assert event.confidence is None
+    assert event.event_metadata == {
+        "source": "restricted_bard_lora_alpha_video_windows",
+        "candidate_id": "alpha-video-candidate-000001",
+        "not_production_analytics": True,
+        "review_copy": "Review required. Alpha candidate only. Not production analytics.",
+        "predicted_actions": ["3PT Shot"],
+        "clip_pre_ms": 4000,
+        "clip_post_ms": 4000,
+    }
+
+    proposals = await storage_client.get(f"{API}/videos/{video_id}/clip-proposals")
+    assert proposals.status_code == 200, proposals.text
+    body = proposals.json()
+    assert body["proposals"][0]["label"] == "Shot attempt"
+    assert body["proposals"][0]["review_status"] == "needs_review"
+    assert "confidence" not in json.dumps(body).lower()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_execute_demo_preview_rejects_sensitive_alpha_candidate_report(
+    storage_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_storage: FakeWorkerStorage,
+    demo_preview_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team_id, video_id, job_id = await _seed_queued_video(
+        storage_client, coach_email="worker-demo-preview-candidates-sensitive@example.com"
+    )
+    transcode = await execute_transcode(
+        db_session,
+        job_id=job_id,
+        celery_task_id="celery-transcode-demo-preview-sensitive-candidates",
+        storage=fake_storage,
+    )
+    assert transcode.status == "completed"
+
+    await set_worker_operator_role(db_session)
+    db_session.add(
+        VideoEvent(
+            video_id=video_id,
+            team_id=team_id,
+            event_type=VideoEventType.PASS,
+            event_time_ms=1000,
+            output_frame=30,
+            shot_clock_enabled=False,
+            review_status=ReviewStatus.NEEDS_REVIEW,
+            event_metadata={
+                "source": "restricted_bard_lora_alpha_video_windows",
+                "candidate_id": "stale-alpha-candidate",
+            },
+        )
+    )
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CV_ALPHA_DETECTOR_PREVIEW_ENABLED", "true")
+    monkeypatch.setenv("CV_ALPHA_CANDIDATE_TAGS_ENABLED", "true")
+    reload_settings()
+    settings = get_settings()
+
+    preview_dir = demo_preview_env["preview_root"] / str(video_id)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview_path = preview_dir / "demo-preview.annotated.mp4"
+    preview_path.write_bytes(b"annotated-preview-with-sensitive-candidates")
+    candidate_path = preview_dir / "alpha-candidate-tags.json"
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "alpha_video_candidate_tags_v1",
+                "source": "restricted_bard_lora_alpha_video_windows",
+                "lineage": {
+                    "demo_only": True,
+                    "review_required": True,
+                    "commercial_use_allowed": False,
+                    "restricted_source": True,
+                },
+                "review_required": True,
+                "demo_only": True,
+                "commercial_use_allowed": False,
+                "not_production_analytics": True,
+                "debug_url": "https://storage.example.invalid/signed?X-Amz-Signature=secret",
+                "candidates": [],
+                "blocker": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def _fake_render(**kwargs: Any) -> DemoPreviewArtifact:
+        return DemoPreviewArtifact(
+            output_path=preview_path,
+            url_path=f"/api/v1/videos/{video_id}/demo-preview/artifact",
+            generated_at=datetime.now(tz=UTC),
+            candidate_tags_path=candidate_path,
+        )
+
+    monkeypatch.setattr(
+        "nextballup_worker.runtime.demo_preview.render_demo_preview_artifact",
+        _fake_render,
+    )
+
+    result = await execute_demo_preview(
+        db_session,
+        video_id=video_id,
+        celery_task_id="celery-demo-preview-sensitive-candidates",
+        settings=settings,
+        storage=fake_storage,
+    )
+    assert result.status == "completed"
+
+    await set_worker_operator_role(db_session)
+    event_count = await db_session.scalar(
+        select(func.count()).select_from(VideoEvent).where(VideoEvent.video_id == video_id)
+    )
+    event_job = await db_session.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video_id,
+            ProcessingJob.stage == ProcessingJobStage.EVENTS,
+        )
+    )
+    await clear_worker_context(db_session)
+
+    assert event_count == 0
+    assert event_job is not None
+    assert event_job.status is ProcessingJobStatus.FAILED
+    assert event_job.error_message is not None
+    assert "forbidden sensitive material" in event_job.error_message
 
 
 @pytest.mark.asyncio(loop_scope="session")

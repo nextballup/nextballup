@@ -323,6 +323,24 @@ class Settings(BaseSettings):
     cv_demo_max_cpu_seconds: int = Field(default=0, ge=0)
     cv_demo_max_output_bytes: int = Field(default=0, ge=0)
     cv_demo_max_open_files: int = Field(default=256, ge=64, le=4096)
+    cv_alpha_candidate_tags_enabled: bool = False
+    cv_alpha_candidate_script_path: Path = Path(
+        "../nextballup-vision-training/scripts/local_bard_candidate_infer.py"
+    )
+    cv_alpha_candidate_trainer_sidecar_path: Path = Path(
+        "../nextballup-vision-training/local_artifacts/trainer/"
+        "bard_qwen25vl3b_train_steps75_limit120_ga1_skip10_4fps8f112px_balanced_v1/"
+        "trainer_metadata.json"
+    )
+    cv_alpha_candidate_adapter_path: Path = Path(
+        "../nextballup-vision-training/local_artifacts/trainer/"
+        "bard_qwen25vl3b_train_steps75_limit120_ga1_skip10_4fps8f112px_balanced_v1/"
+        "lora_adapter"
+    )
+    cv_alpha_candidate_window_seconds: float = Field(default=8.0, gt=0.0, le=30.0)
+    cv_alpha_candidate_stride_seconds: float = Field(default=16.0, gt=0.0, le=120.0)
+    cv_alpha_candidate_max_windows: int = Field(default=40, ge=1, le=400)
+    cv_alpha_candidate_timeout_seconds: int = Field(default=7200, ge=30, le=21600)
 
     # ---- Cookies ----
     cookie_access_name: str = "nbu_access_token"
@@ -519,6 +537,10 @@ class Settings(BaseSettings):
             "test",
             "staging",
         )
+
+    def alpha_candidate_tags_enabled(self) -> bool:
+        """Whether restricted alpha candidate tagging may run locally."""
+        return self.cv_alpha_candidate_tags_enabled and self.alpha_detector_preview_enabled()
 
     def repo_root(self) -> Path:
         """Resolve the repository root independent of the process CWD."""
