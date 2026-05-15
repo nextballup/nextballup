@@ -1,8 +1,13 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { CancelUploadButton } from "@/components/cancel-upload-button";
 import { apiJson, apiVoid } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
@@ -15,10 +20,12 @@ import {
   type ReviewStatus,
   type UpdateVideoEventReviewRequest,
   type UserRole,
-  type VideoClipProposalsResponse,
-  type VideoClipProposalSummary,
   type VideoDetailResponse,
+  type VideoEventSource,
+  type VideoEventSourceFilter,
+  type VideoEventSummary,
   type VideoEventType,
+  type VideoEventsResponse,
   type VideoStatusResponse,
 } from "@/lib/contract";
 import { PLAYBACK_STATUS_LABELS } from "@/lib/video-status";
@@ -51,6 +58,50 @@ const EVENT_TYPE_FILTERS: Array<{ value: VideoEventType | "all"; label: string }
   { value: "pass", label: "Passes" },
   { value: "shot_made", label: "Made shots" },
 ];
+
+type ReviewStatusFilter = ReviewStatus | "all";
+
+const REVIEW_STATUS_FILTERS: Array<{ value: ReviewStatusFilter; label: string }> = [
+  { value: "needs_review", label: "Needs review" },
+  { value: "approved", label: "Approved" },
+  { value: "rejected", label: "Rejected" },
+  { value: "machine_only", label: "Detector only" },
+  { value: "all", label: "All" },
+];
+
+const SOURCE_FILTERS: Array<{ value: VideoEventSourceFilter; label: string }> = [
+  { value: "all", label: "All sources" },
+  { value: "alpha_model", label: "Alpha model" },
+  { value: "manual", label: "Manual tags" },
+];
+
+const SOURCE_LABELS: Record<VideoEventSource, string> = {
+  alpha_model: "Alpha model",
+  manual: "Manual tag",
+};
+
+const REVIEW_STATUS_BADGE_CLASS: Record<ReviewStatus, string> = {
+  needs_review:
+    "rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]",
+  approved:
+    "rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text)]",
+  rejected:
+    "rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-error)]",
+  machine_only:
+    "rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]",
+};
+
+const EVENTS_PAGE_SIZE = 50;
+
+const EMPTY_SUMMARY: VideoEventsResponse["summary"] = {
+  total: 0,
+  needs_review: 0,
+  approved: 0,
+  rejected: 0,
+  machine_only: 0,
+  alpha_model_source: 0,
+  manual_source: 0,
+};
 
 export function VideoPlaybackView({
   initialVideo,
@@ -142,7 +193,7 @@ export function VideoPlaybackView({
       />
       <FailedVideoRecoveryPanel video={video} viewerRole={viewerRole} />
       <DemoPreviewPanel video={video} viewerRole={viewerRole} />
-      <ClipProposalPanel
+      <CandidateReviewPanel
         video={video}
         status={statusQuery.data}
         viewerRole={viewerRole}
@@ -398,7 +449,7 @@ function DemoPreviewPanel({
   );
 }
 
-function ClipProposalPanel({
+function CandidateReviewPanel({
   video,
   status,
   viewerRole,
@@ -412,49 +463,83 @@ function ClipProposalPanel({
   getCurrentPlaybackTimeMs: () => number;
 }) {
   const queryClient = useQueryClient();
+  const [reviewStatusFilter, setReviewStatusFilter] =
+    useState<ReviewStatusFilter>("needs_review");
   const [eventTypeFilter, setEventTypeFilter] = useState<VideoEventType | "all">(
     "all",
   );
+  const [sourceFilter, setSourceFilter] = useState<VideoEventSourceFilter>("all");
+  const [searchText, setSearchText] = useState("");
   const [manualEventType, setManualEventType] =
     useState<VideoEventType>("shot_attempt");
   const [mutationError, setMutationError] = useState<string | null>(null);
+
   const canReview = viewerRole === "coach" || viewerRole === "admin";
   const eventStageStatus = status?.stages.events?.status ?? video.processing.events;
-  const canLoadProposals =
+  const canLoadEvents =
     video.status === "processed" && eventStageStatus === "completed";
-  const proposalsQuery = useQuery<VideoClipProposalsResponse>({
-    queryKey: ["video-clip-proposals", video.id],
-    enabled: canReview && canLoadProposals,
-    staleTime: 15_000,
+
+  const queryKey = [
+    "video-events",
+    video.id,
+    reviewStatusFilter,
+    eventTypeFilter,
+    sourceFilter,
+  ] as const;
+
+  const eventsQuery = useInfiniteQuery<VideoEventsResponse>({
+    queryKey,
+    enabled: canReview && canLoadEvents,
+    initialPageParam: undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    staleTime: 10_000,
     refetchInterval: (query) =>
-      canReview && canLoadProposals && (query.state.data?.proposals.length ?? 0) === 0
+      canReview &&
+      canLoadEvents &&
+      (query.state.data?.pages[0]?.summary.total ?? 0) === 0
         ? POLL_INTERVAL_MS
         : false,
-    queryFn: async () =>
-      apiJson<VideoClipProposalsResponse>(
-        `/videos/${video.id}/clip-proposals?limit=100`,
+    queryFn: async ({ pageParam }) =>
+      apiJson<VideoEventsResponse>(
+        buildEventsUrl({
+          videoId: video.id,
+          cursor: typeof pageParam === "string" ? pageParam : null,
+          reviewStatus: reviewStatusFilter,
+          eventType: eventTypeFilter,
+          source: sourceFilter,
+        }),
       ),
   });
-  const proposals = proposalsQuery.data?.proposals ?? [];
-  const visibleProposals = proposals.filter((proposal) =>
-    eventTypeFilter === "all" ? true : proposal.event_type === eventTypeFilter,
+
+  const pages = useMemo(
+    () => eventsQuery.data?.pages ?? [],
+    [eventsQuery.data?.pages],
   );
-  const eventTypeCounts = countProposalTypes(proposals);
+  const events = useMemo(() => pages.flatMap((page) => page.events), [pages]);
+  const summary = pages[0]?.summary ?? EMPTY_SUMMARY;
+  const filteredTotal = pages[0]?.total ?? events.length;
+
+  const visibleEvents = useMemo(() => {
+    const needle = searchText.trim().toLowerCase();
+    if (!needle) return events;
+    return events.filter((event) => buildSearchIndex(event).includes(needle));
+  }, [events, searchText]);
+
   const reviewMutation = useMutation({
     mutationFn: ({
-      proposal,
+      event,
       review_status,
     }: {
-      proposal: VideoClipProposalSummary;
+      event: VideoEventSummary;
       review_status: ReviewStatus;
     }) =>
-      apiJson(`/videos/${video.id}/events/${proposal.source_event_id}/review`, {
+      apiJson(`/videos/${video.id}/events/${event.id}/review`, {
         method: "PATCH",
         json: { review_status } satisfies UpdateVideoEventReviewRequest,
       }),
     onSuccess: () => {
       setMutationError(null);
-      queryClient.invalidateQueries({ queryKey: ["video-clip-proposals", video.id] });
+      queryClient.invalidateQueries({ queryKey: ["video-events", video.id] });
     },
     onError: (err) => {
       setMutationError(
@@ -462,6 +547,7 @@ function ClipProposalPanel({
       );
     },
   });
+
   const manualTagMutation = useMutation({
     mutationFn: (payload: CreateVideoEventRequest) =>
       apiJson(`/videos/${video.id}/events`, {
@@ -470,7 +556,7 @@ function ClipProposalPanel({
       }),
     onSuccess: () => {
       setMutationError(null);
-      queryClient.invalidateQueries({ queryKey: ["video-clip-proposals", video.id] });
+      queryClient.invalidateQueries({ queryKey: ["video-events", video.id] });
     },
     onError: (err) => {
       setMutationError(
@@ -479,35 +565,70 @@ function ClipProposalPanel({
     },
   });
 
-  if (!canReview || !canLoadProposals) {
+  if (!canReview || !canLoadEvents) {
     return null;
   }
 
+  const reviewStatusCounts: Record<ReviewStatusFilter, number> = {
+    needs_review: summary.needs_review,
+    approved: summary.approved,
+    rejected: summary.rejected,
+    machine_only: summary.machine_only,
+    all: summary.total,
+  };
+
   return (
     <section
-      data-testid="clip-proposal-panel"
+      data-testid="candidate-review-panel"
       className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm"
     >
       <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
-            Clip proposals
+            Alpha candidates
           </h2>
           <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
-            Alpha detector candidates for coach review. Not analytics; export is
-            not implemented.
+            Review only. Not production analytics. Export is not implemented.
           </p>
         </div>
         <span className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
-          {proposalsQuery.isLoading ? "loading" : `${proposals.length} for review`}
+          {eventsQuery.isLoading
+            ? "loading"
+            : `${filteredTotal} of ${summary.total} candidates`}
         </span>
       </div>
-      <div className="flex flex-col gap-3 rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 sm:flex-row sm:items-end sm:justify-between">
-        <div className="flex flex-wrap gap-2">
+
+      <div className="space-y-2 rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            Status
+          </span>
+          {REVIEW_STATUS_FILTERS.map((filter) => (
+            <button
+              key={filter.value}
+              type="button"
+              data-testid={`candidate-status-filter-${filter.value}`}
+              onClick={() => setReviewStatusFilter(filter.value)}
+              className={
+                reviewStatusFilter === filter.value
+                  ? "rounded-md border border-[color:var(--color-nbu-text)] px-2 py-1 text-xs font-medium"
+                  : "rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs text-[color:var(--color-nbu-text-muted)] transition hover:border-[color:var(--color-nbu-text)]"
+              }
+            >
+              {filter.label}{" "}
+              <span className="font-mono">{reviewStatusCounts[filter.value]}</span>
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            Type
+          </span>
           {EVENT_TYPE_FILTERS.map((filter) => (
             <button
               key={filter.value}
               type="button"
+              data-testid={`candidate-type-filter-${filter.value}`}
               onClick={() => setEventTypeFilter(filter.value)}
               className={
                 eventTypeFilter === filter.value
@@ -515,98 +636,149 @@ function ClipProposalPanel({
                   : "rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs text-[color:var(--color-nbu-text-muted)] transition hover:border-[color:var(--color-nbu-text)]"
               }
             >
+              {filter.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            Source
+          </span>
+          {SOURCE_FILTERS.map((filter) => (
+            <button
+              key={filter.value}
+              type="button"
+              data-testid={`candidate-source-filter-${filter.value}`}
+              onClick={() => setSourceFilter(filter.value)}
+              className={
+                sourceFilter === filter.value
+                  ? "rounded-md border border-[color:var(--color-nbu-text)] px-2 py-1 text-xs font-medium"
+                  : "rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs text-[color:var(--color-nbu-text-muted)] transition hover:border-[color:var(--color-nbu-text)]"
+              }
+            >
               {filter.label}{" "}
               <span className="font-mono">
-                {filter.value === "all" ? proposals.length : eventTypeCounts[filter.value]}
+                {filter.value === "all"
+                  ? summary.total
+                  : filter.value === "alpha_model"
+                    ? summary.alpha_model_source
+                    : summary.manual_source}
               </span>
             </button>
           ))}
         </div>
-        <div className="flex flex-wrap items-end gap-2">
-          <label className="flex flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)]">
-            Manual tag
-            <select
-              value={manualEventType}
-              onChange={(event) => setManualEventType(event.target.value as VideoEventType)}
+        <div className="flex flex-col gap-2 pt-1 sm:flex-row sm:items-end sm:justify-between">
+          <label className="flex flex-1 flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)] sm:max-w-sm">
+            Filter candidates
+            <input
+              type="search"
+              value={searchText}
+              onChange={(event) => setSearchText(event.target.value)}
+              data-testid="candidate-search"
+              placeholder="Type, timestamp, or status"
               className="rounded-md border border-[color:var(--color-nbu-border)] bg-transparent px-2 py-1 text-sm text-[color:var(--color-nbu-text)]"
-            >
-              {EVENT_TYPE_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+            />
           </label>
-          <button
-            type="button"
-            disabled={manualTagMutation.isPending}
-            onClick={() =>
-              manualTagMutation.mutate({
-                event_type: manualEventType,
-                event_time_ms: getCurrentPlaybackTimeMs(),
-              })
-            }
-            className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
-          >
-            {manualTagMutation.isPending ? "Adding..." : "Add tag at current time"}
-          </button>
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="flex flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)]">
+              Manual tag
+              <select
+                value={manualEventType}
+                onChange={(event) =>
+                  setManualEventType(event.target.value as VideoEventType)
+                }
+                className="rounded-md border border-[color:var(--color-nbu-border)] bg-transparent px-2 py-1 text-sm text-[color:var(--color-nbu-text)]"
+              >
+                {EVENT_TYPE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              disabled={manualTagMutation.isPending}
+              onClick={() =>
+                manualTagMutation.mutate({
+                  event_type: manualEventType,
+                  event_time_ms: getCurrentPlaybackTimeMs(),
+                })
+              }
+              className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+            >
+              {manualTagMutation.isPending ? "Adding..." : "Add tag at current time"}
+            </button>
+          </div>
         </div>
       </div>
+
       {mutationError ? (
         <p role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
           {mutationError}
         </p>
       ) : null}
-      {proposalsQuery.isLoading ? (
+
+      {eventsQuery.isLoading ? (
         <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
-          Loading clip proposals...
+          Loading alpha candidates...
         </div>
-      ) : proposalsQuery.isError ? (
+      ) : eventsQuery.isError ? (
         <p role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
-          Clip proposals are unavailable.
+          Alpha candidates are unavailable.
         </p>
-      ) : proposals.length === 0 ? (
+      ) : summary.total === 0 ? (
         <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
           No alpha candidates surfaced for this video.
         </div>
-      ) : visibleProposals.length === 0 ? (
+      ) : visibleEvents.length === 0 ? (
         <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
-          No {formatEventType(eventTypeFilter)} candidates are waiting for review.
+          No candidates match the current filter.
         </div>
       ) : (
         <div className="space-y-2">
-          <ul className="max-h-[34rem] divide-y divide-[color:var(--color-nbu-border)] overflow-y-auto rounded-md border border-[color:var(--color-nbu-border)]">
-            {visibleProposals.map((proposal) => (
+          <ul
+            data-testid="candidate-review-list"
+            className="max-h-[36rem] divide-y divide-[color:var(--color-nbu-border)] overflow-y-auto rounded-md border border-[color:var(--color-nbu-border)]"
+          >
+            {visibleEvents.map((event) => (
               <li
-                key={proposal.id}
+                key={event.id}
+                data-testid="candidate-row"
                 className="grid gap-3 px-3 py-2 sm:grid-cols-[1fr_auto]"
               >
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="font-medium">{proposal.label}</span>
+                    <span className="font-medium">
+                      {EVENT_TYPE_LABELS[event.event_type]}
+                    </span>
                     <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
-                      {formatClipTime(proposal.start_time_ms)} -{" "}
-                      {formatClipTime(proposal.end_time_ms)}
+                      {formatClipTime(event.event_time_ms)}
+                    </span>
+                    <span className={REVIEW_STATUS_BADGE_CLASS[event.review_status]}>
+                      {formatReviewStatus(event.review_status)}
+                    </span>
+                    <span className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+                      {SOURCE_LABELS[event.source]}
                     </span>
                   </div>
-                  <p className="mt-1 text-xs text-[color:var(--color-nbu-text-muted)]">
-                    {proposal.reason}
-                  </p>
                 </div>
                 <div className="flex flex-wrap items-start gap-2 sm:justify-end">
                   <button
                     type="button"
-                    onClick={() => onJumpToTime(proposal.start_time_ms)}
+                    onClick={() => onJumpToTime(event.event_time_ms)}
                     className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
                   >
                     Jump
                   </button>
                   <button
                     type="button"
-                    disabled={reviewMutation.isPending}
+                    disabled={
+                      reviewMutation.isPending || event.review_status === "approved"
+                    }
                     onClick={() =>
                       reviewMutation.mutate({
-                        proposal,
+                        event,
                         review_status: "approved",
                       })
                     }
@@ -616,10 +788,12 @@ function ClipProposalPanel({
                   </button>
                   <button
                     type="button"
-                    disabled={reviewMutation.isPending}
+                    disabled={
+                      reviewMutation.isPending || event.review_status === "rejected"
+                    }
                     onClick={() =>
                       reviewMutation.mutate({
-                        proposal,
+                        event,
                         review_status: "rejected",
                       })
                     }
@@ -627,17 +801,58 @@ function ClipProposalPanel({
                   >
                     Reject
                   </button>
-                  <span className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
-                    {formatReviewStatus(proposal.review_status)}
-                  </span>
                 </div>
               </li>
             ))}
           </ul>
+          {eventsQuery.hasNextPage ? (
+            <button
+              type="button"
+              data-testid="candidate-load-more"
+              disabled={eventsQuery.isFetchingNextPage}
+              onClick={() => eventsQuery.fetchNextPage()}
+              className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-3 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+            >
+              {eventsQuery.isFetchingNextPage ? "Loading more..." : "Load more"}
+            </button>
+          ) : null}
         </div>
       )}
     </section>
   );
+}
+
+function buildEventsUrl({
+  videoId,
+  cursor,
+  reviewStatus,
+  eventType,
+  source,
+}: {
+  videoId: string;
+  cursor: string | null;
+  reviewStatus: ReviewStatusFilter;
+  eventType: VideoEventType | "all";
+  source: VideoEventSourceFilter;
+}): string {
+  const params = new URLSearchParams();
+  params.set("limit", String(EVENTS_PAGE_SIZE));
+  if (cursor) params.set("cursor", cursor);
+  if (reviewStatus !== "all") params.append("review_status", reviewStatus);
+  if (eventType !== "all") params.append("event_type", eventType);
+  if (source !== "all") params.set("source", source);
+  return `/videos/${videoId}/events?${params.toString()}`;
+}
+
+function buildSearchIndex(event: VideoEventSummary): string {
+  return [
+    EVENT_TYPE_LABELS[event.event_type],
+    formatClipTime(event.event_time_ms),
+    formatReviewStatus(event.review_status),
+    SOURCE_LABELS[event.source],
+  ]
+    .join(" ")
+    .toLowerCase();
 }
 
 function PlaybackPanel({
@@ -1053,24 +1268,6 @@ function formatReviewStatus(value: string): string {
     default:
       return value.replace(/_/g, " ");
   }
-}
-
-function formatEventType(value: VideoEventType | "all"): string {
-  if (value === "all") return "alpha";
-  return EVENT_TYPE_LABELS[value].toLowerCase();
-}
-
-function countProposalTypes(
-  proposals: VideoClipProposalSummary[],
-): Record<VideoEventType, number> {
-  return {
-    shot_attempt: proposals.filter((proposal) => proposal.event_type === "shot_attempt")
-      .length,
-    shot_made: proposals.filter((proposal) => proposal.event_type === "shot_made")
-      .length,
-    rebound: proposals.filter((proposal) => proposal.event_type === "rebound").length,
-    pass: proposals.filter((proposal) => proposal.event_type === "pass").length,
-  };
 }
 
 function formatBytes(bytes: number): string {

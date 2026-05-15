@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import FileResponse, RedirectResponse, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nextballup_api.audit import write_audit
@@ -94,7 +95,9 @@ from nextballup_core.schemas.video import (
     VideoClipProposalsResponse,
     VideoClipProposalSummary,
     VideoDetailResponse,
+    VideoEventSourceValue,
     VideoEventsResponse,
+    VideoEventsSummaryCounts,
     VideoEventSummary,
     VideoStatusResponse,
 )
@@ -1607,6 +1610,21 @@ _COACH_REVIEW_STATUSES = frozenset(
     {ReviewStatus.NEEDS_REVIEW, ReviewStatus.APPROVED, ReviewStatus.REJECTED}
 )
 _MANUAL_EVENT_SOURCE = "coach_manual_alpha_tag"
+_VIDEO_EVENTS_DEFAULT_LIMIT = 50
+_VIDEO_EVENTS_MAX_LIMIT = 100
+
+
+def _derive_event_source(row: VideoEvent) -> VideoEventSourceValue:
+    """Map opaque internal source labels to a stable, externally safe value.
+
+    Never leak the underlying restricted-source string — coaches only need to
+    know whether a candidate came from the alpha detector or from a manual
+    tag, and exposing internal lineage keys would invite scraping.
+    """
+    metadata = row.event_metadata or {}
+    if metadata.get("source") == _MANUAL_EVENT_SOURCE:
+        return "manual"
+    return "alpha_model"
 
 
 def _video_event_summary(row: VideoEvent) -> VideoEventSummary:
@@ -1622,6 +1640,7 @@ def _video_event_summary(row: VideoEvent) -> VideoEventSummary:
         primary_track_key=row.primary_track_key,
         confidence=row.confidence,
         review_status=row.review_status,
+        source=_derive_event_source(row),
         created_at=row.created_at,
     )
 
@@ -1631,12 +1650,44 @@ def _estimated_output_frame(*, video: Video, event_time_ms: int) -> int:
     return max(0, round((event_time_ms / 1000) * fps))
 
 
+def _encode_event_cursor(*, event_time_ms: int, event_id: uuid.UUID) -> str:
+    raw = f"{event_time_ms}:{event_id.hex}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_event_cursor(cursor: str) -> tuple[int, uuid.UUID]:
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(cursor + padding).decode()
+        time_part, id_part = raw.split(":", 1)
+        return int(time_part), uuid.UUID(hex=id_part)
+    except (UnicodeDecodeError, ValueError, binascii.Error) as exc:
+        raise ValidationFailedError(
+            "Invalid pagination cursor",
+            details={"cursor": cursor},
+        ) from exc
+
+
 @router.get("/{video_id:uuid}/events", response_model=VideoEventsResponse)
 async def list_video_events(
     video_id: uuid.UUID,
+    limit: Annotated[int, Query(ge=1, le=_VIDEO_EVENTS_MAX_LIMIT)] = _VIDEO_EVENTS_DEFAULT_LIMIT,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    review_status: Annotated[list[ReviewStatus] | None, Query()] = None,
+    event_type: Annotated[list[VideoEventType] | None, Query()] = None,
+    source: Annotated[
+        Literal["alpha_model", "manual", "all"] | None,
+        Query(description="alpha_model | manual | all (default all)"),
+    ] = None,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> VideoEventsResponse:
+    """Paginated coach-review listing of candidate video events.
+
+    Returns alpha-model candidates and manual coach tags side by side, ordered
+    by event time. Coaches/admins only. Bounded by `limit` (max 100). Use the
+    returned `next_cursor` to fetch additional pages.
+    """
     await clear_join_invite_context(session)
     await clear_tenant_context(session)
     session.sync_session.expunge_all()
@@ -1644,21 +1695,104 @@ async def list_video_events(
     if video is None:
         raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
     await set_tenant_context(session, video.team_id)
-    await require_team_member(session, user=current_user, team_id=video.team_id)
+    # Tighter than the prior member-level read: the events listing is the
+    # coach review surface, and players/read-only members must not be able to
+    # enumerate alpha candidates.
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
 
     game = await session.get(Game, video.game_id)
-    rows = await session.execute(
-        select(VideoEvent)
-        .where(VideoEvent.video_id == video.id)
-        .order_by(VideoEvent.event_time_ms, VideoEvent.output_frame)
-    )
-    events = [_video_event_summary(row) for row in rows.scalars()]
+
+    base = select(VideoEvent).where(VideoEvent.video_id == video.id)
+
+    summary = await _compute_event_summary_counts(session, video_id=video.id)
+
+    filtered = base
+    if review_status:
+        filtered = filtered.where(VideoEvent.review_status.in_(list(review_status)))
+    if event_type:
+        filtered = filtered.where(VideoEvent.event_type.in_(list(event_type)))
+    if source == "manual":
+        filtered = filtered.where(
+            VideoEvent.event_metadata["source"].astext == _MANUAL_EVENT_SOURCE
+        )
+    elif source == "alpha_model":
+        filtered = filtered.where(
+            (VideoEvent.event_metadata["source"].astext.is_(None))
+            | (VideoEvent.event_metadata["source"].astext != _MANUAL_EVENT_SOURCE)
+        )
+
+    total = await session.scalar(select(func.count()).select_from(filtered.subquery()))
+
+    paginated = filtered.order_by(VideoEvent.event_time_ms.asc(), VideoEvent.id.asc())
+    if cursor:
+        cur_time, cur_id = _decode_event_cursor(cursor)
+        paginated = paginated.where(
+            (VideoEvent.event_time_ms > cur_time)
+            | ((VideoEvent.event_time_ms == cur_time) & (VideoEvent.id > cur_id))
+        )
+    paginated = paginated.limit(limit + 1)
+
+    rows = list((await session.execute(paginated)).scalars())
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+
+    events = [_video_event_summary(row) for row in rows]
+    next_cursor: str | None = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = _encode_event_cursor(event_time_ms=last.event_time_ms, event_id=last.id)
+
     return VideoEventsResponse(
         video_id=video.id,
         shot_clock_enabled=bool(game.shot_clock_enabled) if game is not None else False,
         shot_clock_seconds=game.shot_clock_seconds if game is not None else None,
         events=events,
-        total=len(events),
+        total=int(total or 0),
+        next_cursor=next_cursor,
+        summary=summary,
+    )
+
+
+async def _compute_event_summary_counts(
+    session: AsyncSession, *, video_id: uuid.UUID
+) -> VideoEventsSummaryCounts:
+    """One-shot aggregate for the candidate-review filter chips.
+
+    Counts every event for the video — bounded at the per-video scale, well
+    below any expected scan cost — split by review status and by source.
+    """
+    manual_source_expr = VideoEvent.event_metadata["source"].astext == _MANUAL_EVENT_SOURCE
+    result = (
+        await session.execute(
+            select(
+                func.count().label("total"),
+                func.count()
+                .filter(VideoEvent.review_status == ReviewStatus.NEEDS_REVIEW)
+                .label("needs_review"),
+                func.count()
+                .filter(VideoEvent.review_status == ReviewStatus.APPROVED)
+                .label("approved"),
+                func.count()
+                .filter(VideoEvent.review_status == ReviewStatus.REJECTED)
+                .label("rejected"),
+                func.count()
+                .filter(VideoEvent.review_status == ReviewStatus.MACHINE_ONLY)
+                .label("machine_only"),
+                func.count().filter(manual_source_expr).label("manual_source"),
+            ).where(VideoEvent.video_id == video_id)
+        )
+    ).one()
+    total = int(result.total or 0)
+    manual = int(result.manual_source or 0)
+    return VideoEventsSummaryCounts(
+        total=total,
+        needs_review=int(result.needs_review or 0),
+        approved=int(result.approved or 0),
+        rejected=int(result.rejected or 0),
+        machine_only=int(result.machine_only or 0),
+        alpha_model_source=max(0, total - manual),
+        manual_source=manual,
     )
 
 

@@ -1,11 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, act, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  act,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { VideoPlaybackView } from "@/app/(app)/videos/[videoId]/video-playback-view";
 import type {
   GenerateDemoPreviewResponse,
+  ReviewStatus,
   VideoDetailResponse,
+  VideoEventSummary,
+  VideoEventType,
 } from "@/lib/contract";
 import { server } from "./setup";
 
@@ -21,6 +31,31 @@ function wrap(ui: React.ReactElement) {
     defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
   });
   return <QueryClientProvider client={client}>{ui}</QueryClientProvider>;
+}
+
+function buildEvent(
+  overrides: Partial<VideoEventSummary> & {
+    id: string;
+    event_type: VideoEventType;
+    event_time_ms: number;
+  },
+): VideoEventSummary {
+  const review_status: ReviewStatus = overrides.review_status ?? "needs_review";
+  return {
+    id: overrides.id,
+    event_type: overrides.event_type,
+    event_time_ms: overrides.event_time_ms,
+    output_frame: overrides.output_frame ?? Math.round(overrides.event_time_ms / 33),
+    period: overrides.period ?? null,
+    game_clock_ms: overrides.game_clock_ms ?? null,
+    shot_clock_enabled: overrides.shot_clock_enabled ?? false,
+    shot_clock_ms: overrides.shot_clock_ms ?? null,
+    primary_track_key: overrides.primary_track_key ?? null,
+    confidence: overrides.confidence ?? null,
+    review_status,
+    source: overrides.source ?? "alpha_model",
+    created_at: overrides.created_at ?? "2026-05-11T00:00:00Z",
+  };
 }
 
 function baseVideo(overrides: Partial<VideoDetailResponse> = {}): VideoDetailResponse {
@@ -435,7 +470,7 @@ describe("VideoPlaybackView", () => {
     expect(screen.getByText("transcode")).toBeInTheDocument();
   });
 
-  it("shows clip proposals once event extraction has completed", async () => {
+  it("shows the candidate review panel once event extraction has completed", async () => {
     const sourceEventId = "00000000-0000-0000-0000-000000000001";
     const video = baseVideo({
       status: "processed",
@@ -455,22 +490,29 @@ describe("VideoPlaybackView", () => {
           },
         }),
       ),
-      http.get("/api/v1/videos/v1/clip-proposals", () =>
+      http.get("/api/v1/videos/v1/events", () =>
         HttpResponse.json({
           video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
           total: 1,
-          proposals: [
-            {
-              id: `event:${sourceEventId}`,
-              source_event_id: sourceEventId,
+          next_cursor: null,
+          summary: {
+            total: 1,
+            needs_review: 1,
+            approved: 0,
+            rejected: 0,
+            machine_only: 0,
+            alpha_model_source: 1,
+            manual_source: 0,
+          },
+          events: [
+            buildEvent({
+              id: sourceEventId,
               event_type: "shot_made",
-              label: "Made shot",
-              reason: "Alpha made shot candidate at 00:12. Coach review required.",
-              start_time_ms: 8_000,
-              end_time_ms: 19_000,
+              event_time_ms: 12_000,
               review_status: "needs_review",
-              created_at: "2026-05-11T00:00:00Z",
-            },
+            }),
           ],
         }),
       ),
@@ -480,35 +522,44 @@ describe("VideoPlaybackView", () => {
       render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
     });
 
-    expect(await screen.findByText("Made shot")).toBeInTheDocument();
-    expect(screen.getByText(/Not analytics; export is not implemented/)).toBeInTheDocument();
-    expect(screen.getByText(/0:08 - 0:19/)).toBeInTheDocument();
-    expect(screen.getByText("Needs review")).toBeInTheDocument();
-    expect(screen.getByText("1 for review")).toBeInTheDocument();
+    expect(await screen.findByText("Alpha candidates")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Review only. Not production analytics/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/events detected/i)).not.toBeInTheDocument();
+    const list = await screen.findByTestId("candidate-review-list");
+    expect(within(list).getByText("Made shot")).toBeInTheDocument();
+    expect(within(list).getByText(/^0:12$/)).toBeInTheDocument();
+    expect(screen.getByText("1 of 1 candidates")).toBeInTheDocument();
     expect(screen.queryByText("84%")).not.toBeInTheDocument();
   });
 
-  it("shows all alpha candidates and jumps playback to a candidate window", async () => {
+  it("shows more than five candidates and loads more pages on demand", async () => {
     const video = baseVideo({
       status: "processed",
       playback_url: "https://signed.example/v1.mp4?sig=abc",
       playback_format: "mp4",
       playback_token: "tok",
       token_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
-      duration_seconds: 120,
+      duration_seconds: 600,
       processing: { transcode: "completed", events: "completed" },
     });
-    const proposals = Array.from({ length: 6 }, (_, index) => ({
-      id: `event:00000000-0000-0000-0000-00000000000${index + 1}`,
-      source_event_id: `00000000-0000-0000-0000-00000000000${index + 1}`,
-      event_type: index === 5 ? "rebound" : "shot_attempt",
-      label: index === 5 ? "Rebound" : `Shot attempt ${index + 1}`,
-      reason: "Alpha candidate at 00:12. Coach review required.",
-      start_time_ms: 8_000 + index * 1_000,
-      end_time_ms: 14_000 + index * 1_000,
-      review_status: "needs_review",
-      created_at: "2026-05-11T00:00:00Z",
-    }));
+
+    const firstPageEvents = Array.from({ length: 6 }, (_, index) =>
+      buildEvent({
+        id: `00000000-0000-0000-0000-00000000010${index}`,
+        event_type: index === 5 ? "rebound" : "shot_attempt",
+        event_time_ms: 8_000 + index * 1_000,
+      }),
+    );
+    const secondPageEvents = [
+      buildEvent({
+        id: "00000000-0000-0000-0000-000000000201",
+        event_type: "pass",
+        event_time_ms: 60_000,
+      }),
+    ];
+
     server.use(
       http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
       http.get("/api/v1/videos/v1/status", () =>
@@ -523,9 +574,38 @@ describe("VideoPlaybackView", () => {
           },
         }),
       ),
-      http.get("/api/v1/videos/v1/clip-proposals", () =>
-        HttpResponse.json({ video_id: "v1", total: proposals.length, proposals }),
-      ),
+      http.get("/api/v1/videos/v1/events", ({ request }) => {
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        const summary = {
+          total: 7,
+          needs_review: 7,
+          approved: 0,
+          rejected: 0,
+          machine_only: 0,
+          alpha_model_source: 7,
+          manual_source: 0,
+        };
+        if (cursor) {
+          return HttpResponse.json({
+            video_id: "v1",
+            shot_clock_enabled: false,
+            shot_clock_seconds: null,
+            total: 7,
+            next_cursor: null,
+            summary,
+            events: secondPageEvents,
+          });
+        }
+        return HttpResponse.json({
+          video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
+          total: 7,
+          next_cursor: "page-2",
+          summary,
+          events: firstPageEvents,
+        });
+      }),
     );
 
     await act(async () => {
@@ -533,20 +613,221 @@ describe("VideoPlaybackView", () => {
     });
 
     const player = (await screen.findByTestId("video-player")) as HTMLVideoElement;
-    expect(await screen.findByText("Shot attempt 1")).toBeInTheDocument();
-    expect(screen.getByText("Shot attempt 5")).toBeInTheDocument();
-    expect(screen.getAllByText("Rebound").length).toBeGreaterThan(0);
-    expect(screen.queryByText(/Showing top/)).not.toBeInTheDocument();
+    const list = await screen.findByTestId("candidate-review-list");
+    expect(within(list).getAllByText("Shot attempt")).toHaveLength(5);
+    expect(within(list).getAllByText("Rebound").length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getAllByRole("button", { name: "Jump" })[0]);
+    fireEvent.click(within(list).getAllByRole("button", { name: "Jump" })[0]);
     expect(player.currentTime).toBe(8);
 
-    fireEvent.click(screen.getByRole("button", { name: /Rebounds 1/ }));
-    expect(screen.queryByText("Shot attempt 1")).not.toBeInTheDocument();
+    const loadMore = await screen.findByTestId("candidate-load-more");
+    fireEvent.click(loadMore);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(7);
+    });
+    const refreshedList = screen.getByTestId("candidate-review-list");
+    expect(within(refreshedList).getByText("Pass")).toBeInTheDocument();
+  });
+
+  it("filters candidates by event type and review status, and keeps reviewed candidates visible", async () => {
+    const video = baseVideo({
+      status: "processed",
+      duration_seconds: 600,
+      processing: { transcode: "completed", events: "completed" },
+    });
+    const requestQueries: string[] = [];
+
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/events", ({ request }) => {
+        const url = new URL(request.url);
+        requestQueries.push(url.search);
+        const reviewStatuses = url.searchParams.getAll("review_status");
+        const eventTypes = url.searchParams.getAll("event_type");
+        const summary = {
+          total: 3,
+          needs_review: 1,
+          approved: 1,
+          rejected: 1,
+          machine_only: 0,
+          alpha_model_source: 3,
+          manual_source: 0,
+        };
+        const allEvents = [
+          buildEvent({
+            id: "00000000-0000-0000-0000-000000000a01",
+            event_type: "shot_attempt",
+            event_time_ms: 8_000,
+            review_status: "needs_review",
+          }),
+          buildEvent({
+            id: "00000000-0000-0000-0000-000000000a02",
+            event_type: "shot_attempt",
+            event_time_ms: 16_000,
+            review_status: "approved",
+          }),
+          buildEvent({
+            id: "00000000-0000-0000-0000-000000000a03",
+            event_type: "rebound",
+            event_time_ms: 24_000,
+            review_status: "rejected",
+          }),
+        ];
+        let filtered = allEvents;
+        if (reviewStatuses.length > 0) {
+          filtered = filtered.filter((event) =>
+            reviewStatuses.includes(event.review_status),
+          );
+        }
+        if (eventTypes.length > 0) {
+          filtered = filtered.filter((event) =>
+            eventTypes.includes(event.event_type),
+          );
+        }
+        return HttpResponse.json({
+          video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
+          total: filtered.length,
+          next_cursor: null,
+          summary,
+          events: filtered,
+        });
+      }),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    // Default filter is needs_review.
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(1);
+    });
+
+    // Approved candidates remain discoverable once the filter switches.
+    fireEvent.click(screen.getByTestId("candidate-status-filter-approved"));
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(1);
+    });
+    expect(screen.getAllByText("Approved").length).toBeGreaterThan(0);
+
+    // Rejected too.
+    fireEvent.click(screen.getByTestId("candidate-status-filter-rejected"));
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(1);
+    });
+    expect(screen.getAllByText("Rejected").length).toBeGreaterThan(0);
+
+    // All status + Rebounds type filter narrows on the server side.
+    fireEvent.click(screen.getByTestId("candidate-status-filter-all"));
+    fireEvent.click(screen.getByTestId("candidate-type-filter-rebound"));
+    await waitFor(() => {
+      const queries = requestQueries.filter(
+        (q) => q.includes("event_type=rebound") && !q.includes("review_status="),
+      );
+      expect(queries.length).toBeGreaterThan(0);
+    });
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(1);
+    });
     expect(screen.getAllByText("Rebound").length).toBeGreaterThan(0);
   });
 
-  it("lets coaches approve candidates and create manual tags", async () => {
+  it("uses the filter box to narrow candidates without implying AI search", async () => {
+    const video = baseVideo({
+      status: "processed",
+      duration_seconds: 600,
+      processing: { transcode: "completed", events: "completed" },
+    });
+
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/events", () =>
+        HttpResponse.json({
+          video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
+          total: 3,
+          next_cursor: null,
+          summary: {
+            total: 3,
+            needs_review: 3,
+            approved: 0,
+            rejected: 0,
+            machine_only: 0,
+            alpha_model_source: 3,
+            manual_source: 0,
+          },
+          events: [
+            buildEvent({
+              id: "00000000-0000-0000-0000-000000000b01",
+              event_type: "shot_attempt",
+              event_time_ms: 8_000,
+            }),
+            buildEvent({
+              id: "00000000-0000-0000-0000-000000000b02",
+              event_type: "rebound",
+              event_time_ms: 16_000,
+            }),
+            buildEvent({
+              id: "00000000-0000-0000-0000-000000000b03",
+              event_type: "pass",
+              event_time_ms: 24_000,
+            }),
+          ],
+        }),
+      ),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    expect(await screen.findByLabelText("Filter candidates")).toBeInTheDocument();
+    expect(screen.queryByText(/AI search/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/semantic/i)).not.toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(3);
+    });
+
+    fireEvent.change(screen.getByTestId("candidate-search"), {
+      target: { value: "rebound" },
+    });
+    await waitFor(() => {
+      expect(screen.getAllByTestId("candidate-row").length).toBe(1);
+    });
+    const list = screen.getByTestId("candidate-review-list");
+    expect(within(list).getByText("Rebound")).toBeInTheDocument();
+  });
+
+  it("approves a candidate and creates a manual tag at the current playback time", async () => {
     const sourceEventId = "00000000-0000-0000-0000-000000000001";
     const video = baseVideo({
       status: "processed",
@@ -554,7 +835,7 @@ describe("VideoPlaybackView", () => {
       playback_format: "mp4",
       playback_token: "tok",
       token_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
-      duration_seconds: 120,
+      duration_seconds: 600,
       processing: { transcode: "completed", events: "completed" },
     });
     const reviewRequest = vi.fn();
@@ -573,22 +854,29 @@ describe("VideoPlaybackView", () => {
           },
         }),
       ),
-      http.get("/api/v1/videos/v1/clip-proposals", () =>
+      http.get("/api/v1/videos/v1/events", () =>
         HttpResponse.json({
           video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
           total: 1,
-          proposals: [
-            {
-              id: `event:${sourceEventId}`,
-              source_event_id: sourceEventId,
+          next_cursor: null,
+          summary: {
+            total: 1,
+            needs_review: 1,
+            approved: 0,
+            rejected: 0,
+            machine_only: 0,
+            alpha_model_source: 1,
+            manual_source: 0,
+          },
+          events: [
+            buildEvent({
+              id: sourceEventId,
               event_type: "shot_attempt",
-              label: "Shot attempt",
-              reason: "Alpha shot attempt candidate at 00:12. Coach review required.",
-              start_time_ms: 8_000,
-              end_time_ms: 14_000,
+              event_time_ms: 12_000,
               review_status: "needs_review",
-              created_at: "2026-05-11T00:00:00Z",
-            },
+            }),
           ],
         }),
       ),
@@ -596,39 +884,25 @@ describe("VideoPlaybackView", () => {
         `/api/v1/videos/v1/events/${sourceEventId}/review`,
         async ({ request }) => {
           reviewRequest(await request.json());
-          return HttpResponse.json({
-            id: sourceEventId,
-            event_type: "shot_attempt",
-            event_time_ms: 12_000,
-            output_frame: 360,
-            period: null,
-            game_clock_ms: null,
-            shot_clock_enabled: false,
-            shot_clock_ms: null,
-            primary_track_key: null,
-            confidence: null,
-            review_status: "approved",
-            created_at: "2026-05-11T00:00:00Z",
-          });
+          return HttpResponse.json(
+            buildEvent({
+              id: sourceEventId,
+              event_type: "shot_attempt",
+              event_time_ms: 12_000,
+              review_status: "approved",
+            }),
+          );
         },
       ),
       http.post("/api/v1/videos/v1/events", async ({ request }) => {
         manualRequest(await request.json());
         return HttpResponse.json(
-          {
+          buildEvent({
             id: "00000000-0000-0000-0000-000000000099",
             event_type: "rebound",
             event_time_ms: 42_000,
-            output_frame: 1260,
-            period: null,
-            game_clock_ms: null,
-            shot_clock_enabled: false,
-            shot_clock_ms: null,
-            primary_track_key: null,
-            confidence: null,
             review_status: "needs_review",
-            created_at: "2026-05-11T00:00:00Z",
-          },
+          }),
           { status: 201 },
         );
       }),
@@ -657,8 +931,8 @@ describe("VideoPlaybackView", () => {
     );
   });
 
-  it("hides clip proposals from players", async () => {
-    const proposalRequest = vi.fn();
+  it("hides the candidate review panel from players and does not query candidates", async () => {
+    const eventsRequest = vi.fn();
     server.use(
       http.get("/api/v1/videos/v1", () =>
         HttpResponse.json(
@@ -680,9 +954,25 @@ describe("VideoPlaybackView", () => {
           },
         }),
       ),
-      http.get("/api/v1/videos/v1/clip-proposals", () => {
-        proposalRequest();
-        return HttpResponse.json({ video_id: "v1", total: 0, proposals: [] });
+      http.get("/api/v1/videos/v1/events", () => {
+        eventsRequest();
+        return HttpResponse.json({
+          video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
+          total: 0,
+          next_cursor: null,
+          summary: {
+            total: 0,
+            needs_review: 0,
+            approved: 0,
+            rejected: 0,
+            machine_only: 0,
+            alpha_model_source: 0,
+            manual_source: 0,
+          },
+          events: [],
+        });
       }),
     );
 
@@ -700,11 +990,11 @@ describe("VideoPlaybackView", () => {
       );
     });
 
-    expect(screen.queryByTestId("clip-proposal-panel")).not.toBeInTheDocument();
-    expect(proposalRequest).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("candidate-review-panel")).not.toBeInTheDocument();
+    expect(eventsRequest).not.toHaveBeenCalled();
   });
 
-  it("hides clip proposals before event extraction completes", async () => {
+  it("hides the candidate review panel before event extraction completes", async () => {
     server.use(
       http.get("/api/v1/videos/v1", () =>
         HttpResponse.json(
@@ -742,7 +1032,7 @@ describe("VideoPlaybackView", () => {
       );
     });
 
-    expect(screen.queryByTestId("clip-proposal-panel")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("candidate-review-panel")).not.toBeInTheDocument();
   });
 
   it("surfaces an HLS manifest URL as the video source", async () => {

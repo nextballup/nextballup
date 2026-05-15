@@ -1862,6 +1862,259 @@ async def test_coach_can_create_manual_alpha_video_event(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_video_events_endpoint_paginates_beyond_100_candidates(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="events-pagination-coach@example.com"
+    )
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+
+    await set_worker_operator_role(db_session)
+    rows = [
+        VideoEvent(
+            video_id=video_id,
+            team_id=uuid.UUID(team["id"]),
+            event_type=VideoEventType.SHOT_ATTEMPT,
+            event_time_ms=1_000 * (index + 1),
+            output_frame=30 * (index + 1),
+            shot_clock_enabled=False,
+            review_status=ReviewStatus.NEEDS_REVIEW,
+            event_metadata={"source": "restricted_bard_lora_alpha_video_windows"},
+        )
+        for index in range(120)
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    first = await storage_client.get(f"{API}/videos/{video_id}/events?limit=100")
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["total"] == 120
+    assert body["summary"]["total"] == 120
+    assert body["summary"]["needs_review"] == 120
+    assert body["summary"]["alpha_model_source"] == 120
+    assert body["summary"]["manual_source"] == 0
+    assert len(body["events"]) == 100
+    assert body["next_cursor"] is not None
+    assert body["events"][0]["source"] == "alpha_model"
+
+    second = await storage_client.get(
+        f"{API}/videos/{video_id}/events?limit=100&cursor={body['next_cursor']}"
+    )
+    assert second.status_code == 200, second.text
+    second_body = second.json()
+    assert len(second_body["events"]) == 20
+    assert second_body["next_cursor"] is None
+    first_ids = {entry["id"] for entry in body["events"]}
+    second_ids = {entry["id"] for entry in second_body["events"]}
+    assert first_ids.isdisjoint(second_ids)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_video_events_endpoint_filters_by_status_type_and_source(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="events-filters-coach@example.com"
+    )
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+
+    await set_worker_operator_role(db_session)
+    db_session.add_all(
+        [
+            VideoEvent(
+                video_id=video_id,
+                team_id=uuid.UUID(team["id"]),
+                event_type=VideoEventType.SHOT_ATTEMPT,
+                event_time_ms=1_000,
+                output_frame=30,
+                shot_clock_enabled=False,
+                review_status=ReviewStatus.NEEDS_REVIEW,
+                event_metadata={"source": "restricted_bard_lora_alpha_video_windows"},
+            ),
+            VideoEvent(
+                video_id=video_id,
+                team_id=uuid.UUID(team["id"]),
+                event_type=VideoEventType.REBOUND,
+                event_time_ms=2_000,
+                output_frame=60,
+                shot_clock_enabled=False,
+                review_status=ReviewStatus.APPROVED,
+                event_metadata={"source": "restricted_bard_lora_alpha_video_windows"},
+            ),
+            VideoEvent(
+                video_id=video_id,
+                team_id=uuid.UUID(team["id"]),
+                event_type=VideoEventType.PASS,
+                event_time_ms=3_000,
+                output_frame=90,
+                shot_clock_enabled=False,
+                review_status=ReviewStatus.REJECTED,
+                event_metadata={"source": "restricted_bard_lora_alpha_video_windows"},
+            ),
+            VideoEvent(
+                video_id=video_id,
+                team_id=uuid.UUID(team["id"]),
+                event_type=VideoEventType.SHOT_MADE,
+                event_time_ms=4_000,
+                output_frame=120,
+                shot_clock_enabled=False,
+                review_status=ReviewStatus.NEEDS_REVIEW,
+                event_metadata={"source": "coach_manual_alpha_tag"},
+            ),
+        ]
+    )
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    needs = await storage_client.get(f"{API}/videos/{video_id}/events?review_status=needs_review")
+    assert needs.status_code == 200, needs.text
+    needs_body = needs.json()
+    assert needs_body["total"] == 2
+    assert {entry["event_type"] for entry in needs_body["events"]} == {
+        "shot_attempt",
+        "shot_made",
+    }
+
+    approved = await storage_client.get(f"{API}/videos/{video_id}/events?review_status=approved")
+    approved_body = approved.json()
+    assert approved_body["total"] == 1
+    assert approved_body["events"][0]["event_type"] == "rebound"
+    assert approved_body["events"][0]["review_status"] == "approved"
+
+    rejected = await storage_client.get(f"{API}/videos/{video_id}/events?review_status=rejected")
+    rejected_body = rejected.json()
+    assert rejected_body["total"] == 1
+    assert rejected_body["events"][0]["event_type"] == "pass"
+
+    rebounds = await storage_client.get(f"{API}/videos/{video_id}/events?event_type=rebound")
+    assert rebounds.json()["total"] == 1
+
+    manual = await storage_client.get(f"{API}/videos/{video_id}/events?source=manual")
+    manual_body = manual.json()
+    assert manual_body["total"] == 1
+    assert manual_body["events"][0]["source"] == "manual"
+
+    alpha = await storage_client.get(f"{API}/videos/{video_id}/events?source=alpha_model")
+    alpha_body = alpha.json()
+    assert alpha_body["total"] == 3
+    assert all(entry["source"] == "alpha_model" for entry in alpha_body["events"])
+
+    # Summary remains the unfiltered totals regardless of applied filters.
+    assert needs_body["summary"]["total"] == 4
+    assert needs_body["summary"]["needs_review"] == 2
+    assert needs_body["summary"]["approved"] == 1
+    assert needs_body["summary"]["rejected"] == 1
+    assert needs_body["summary"]["alpha_model_source"] == 3
+    assert needs_body["summary"]["manual_source"] == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_video_events_endpoint_does_not_leak_internal_metadata(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="events-metadata-coach@example.com"
+    )
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+
+    await set_worker_operator_role(db_session)
+    db_session.add(
+        VideoEvent(
+            video_id=video_id,
+            team_id=uuid.UUID(team["id"]),
+            event_type=VideoEventType.SHOT_ATTEMPT,
+            event_time_ms=5_000,
+            output_frame=150,
+            shot_clock_enabled=False,
+            review_status=ReviewStatus.NEEDS_REVIEW,
+            event_metadata={
+                "source": "restricted_bard_lora_alpha_video_windows",
+                "internal_track_id": "track-confidential",
+                "model_artifact_uri": "s3://restricted-bucket/secret-model.bin",
+                "raw_prompt": "do not leak this",
+            },
+        )
+    )
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    response = await storage_client.get(f"{API}/videos/{video_id}/events")
+    assert response.status_code == 200, response.text
+    body = response.text
+    # Internal model and dataset lineage stays server-side; the API only
+    # exposes the externally safe `source` enum (alpha_model / manual).
+    assert "restricted_bard_lora_alpha_video_windows" not in body
+    assert "internal_track_id" not in body
+    assert "track-confidential" not in body
+    assert "model_artifact_uri" not in body
+    assert "restricted-bucket" not in body
+    assert "raw_prompt" not in body
+    assert "do not leak this" not in body
+    parsed = response.json()
+    assert parsed["events"][0]["source"] == "alpha_model"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_video_events_endpoint_rejects_player_members(
+    storage_client: AsyncClient,
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="events-player-owner@example.com"
+    )
+    video_id = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()["id"]
+
+    await _register(storage_client, _player_payload("events-player@example.com"))
+    join = await storage_client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 33},
+    )
+    assert join.status_code == 200, join.text
+
+    response = await storage_client.get(f"{API}/videos/{video_id}/events")
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_video_events_endpoint_rejects_non_members(
+    storage_client: AsyncClient,
+) -> None:
+    _, game = await _setup_coach_team_game(
+        storage_client, coach_email="events-tenant-owner@example.com"
+    )
+    video_id = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()["id"]
+
+    await _register(storage_client, _coach_payload("events-cross-team-snoop@example.com"))
+    response = await storage_client.get(f"{API}/videos/{video_id}/events")
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_video_events_endpoint_rejects_invalid_cursor(
+    storage_client: AsyncClient,
+) -> None:
+    _, game = await _setup_coach_team_game(
+        storage_client, coach_email="events-bad-cursor-coach@example.com"
+    )
+    video_id = (
+        await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    ).json()["id"]
+
+    response = await storage_client.get(f"{API}/videos/{video_id}/events?cursor=not-base64!!!")
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == ErrorCode.VALIDATION_FAILED
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_admin_can_read_cross_team_game_and_video(
     storage_client: AsyncClient, db_session: AsyncSession
 ) -> None:

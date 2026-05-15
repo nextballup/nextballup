@@ -297,6 +297,10 @@ export type VideoEventType =
   | "rebound"
   | "pass";
 
+export type VideoEventSource = "alpha_model" | "manual";
+
+export type VideoEventSourceFilter = VideoEventSource | "all";
+
 export type VideoEventSummary = {
   id: string;
   event_type: VideoEventType;
@@ -309,7 +313,18 @@ export type VideoEventSummary = {
   primary_track_key: string | null;
   confidence: number | null;
   review_status: ReviewStatus;
+  source: VideoEventSource;
   created_at: string;
+};
+
+export type VideoEventsSummaryCounts = {
+  total: number;
+  needs_review: number;
+  approved: number;
+  rejected: number;
+  machine_only: number;
+  alpha_model_source: number;
+  manual_source: number;
 };
 
 export type VideoEventsResponse = {
@@ -318,6 +333,8 @@ export type VideoEventsResponse = {
   shot_clock_seconds: number | null;
   events: VideoEventSummary[];
   total: number;
+  next_cursor: string | null;
+  summary: VideoEventsSummaryCounts;
 };
 
 export type VideoClipProposalSummary = {

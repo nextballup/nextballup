@@ -182,6 +182,9 @@ class VideoListResponse(BaseModel):
     total: int
 
 
+VideoEventSourceValue = Literal["alpha_model", "manual"]
+
+
 class VideoEventSummary(BaseModel):
     id: uuid.UUID
     event_type: VideoEventType
@@ -194,7 +197,22 @@ class VideoEventSummary(BaseModel):
     primary_track_key: str | None = None
     confidence: float | None = None
     review_status: ReviewStatus
+    source: VideoEventSourceValue
     created_at: datetime
+
+
+class VideoEventsSummaryCounts(BaseModel):
+    """Unfiltered totals across the whole video so the UI can render filter
+    chips without paging through every candidate. Counts are bounded by the
+    `video_events` table for a single video, which is well below any limit."""
+
+    total: int = 0
+    needs_review: int = 0
+    approved: int = 0
+    rejected: int = 0
+    machine_only: int = 0
+    alpha_model_source: int = 0
+    manual_source: int = 0
 
 
 class VideoEventsResponse(BaseModel):
@@ -203,6 +221,8 @@ class VideoEventsResponse(BaseModel):
     shot_clock_seconds: int | None = None
     events: list[VideoEventSummary]
     total: int
+    next_cursor: str | None = None
+    summary: VideoEventsSummaryCounts
 
 
 class CreateVideoEventRequest(BaseModel):
