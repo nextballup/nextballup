@@ -241,6 +241,8 @@ async def _replace_alpha_candidate_events(
                 team_id=video.team_id,
                 event_type=event_type,
                 event_time_ms=event_time_ms,
+                clip_start_time_ms=candidate["start_time_ms"],
+                clip_end_time_ms=candidate["end_time_ms"],
                 output_frame=output_frame,
                 shot_clock_enabled=shot_clock_enabled,
                 confidence=None,

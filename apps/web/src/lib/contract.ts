@@ -305,6 +305,8 @@ export type VideoEventSummary = {
   id: string;
   event_type: VideoEventType;
   event_time_ms: number;
+  clip_start_time_ms: number;
+  clip_end_time_ms: number;
   output_frame: number;
   period: number | null;
   game_clock_ms: number | null;
@@ -358,10 +360,14 @@ export type VideoClipProposalsResponse = {
 export type CreateVideoEventRequest = {
   event_type: VideoEventType;
   event_time_ms: number;
+  clip_start_time_ms?: number;
+  clip_end_time_ms?: number;
 };
 
 export type UpdateVideoEventReviewRequest = {
   review_status: ReviewStatus;
+  clip_start_time_ms?: number;
+  clip_end_time_ms?: number;
 };
 
 export type GenerateDemoPreviewResponse = {

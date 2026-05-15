@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import time
 import uuid
@@ -1738,20 +1740,30 @@ async def test_coach_can_review_alpha_candidate_event(
 
     response = await storage_client.patch(
         f"{API}/videos/{video_id}/events/{event_id}/review",
-        json={"review_status": "approved"},
+        json={
+            "review_status": "approved",
+            "clip_start_time_ms": 9_000,
+            "clip_end_time_ms": 17_000,
+        },
     )
 
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["id"] == str(event_id)
     assert body["review_status"] == "approved"
+    assert body["clip_start_time_ms"] == 9_000
+    assert body["clip_end_time_ms"] == 17_000
 
     await set_worker_operator_role(db_session)
     persisted = await db_session.get(VideoEvent, event_id)
     assert persisted is not None
     assert persisted.review_status is ReviewStatus.APPROVED
+    assert persisted.clip_start_time_ms == 9_000
+    assert persisted.clip_end_time_ms == 17_000
     assert persisted.event_metadata is not None
     assert persisted.event_metadata["review_source"] == "coach_review"
+    assert persisted.event_metadata["clip_pre_ms"] == 3_000
+    assert persisted.event_metadata["clip_post_ms"] == 5_000
     audit_count = await db_session.scalar(
         select(func.count())
         .select_from(AuditLog)
@@ -1833,6 +1845,8 @@ async def test_coach_can_create_manual_alpha_video_event(
     body = response.json()
     assert body["event_type"] == "rebound"
     assert body["event_time_ms"] == 42_000
+    assert body["clip_start_time_ms"] == 38_000
+    assert body["clip_end_time_ms"] == 48_000
     assert body["output_frame"] == 1260
     assert body["review_status"] == "needs_review"
 
@@ -1855,6 +1869,85 @@ async def test_coach_can_create_manual_alpha_video_event(
             AuditLog.action == AuditAction.VIDEO_EVENT_MANUAL_CREATED,
             AuditLog.resource_id == event_id,
             AuditLog.team_id == uuid.UUID(team["id"]),
+        )
+    )
+    assert audit_count == 1
+    await clear_worker_context(db_session)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_coach_can_export_approved_event_windows_without_metadata_leak(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="events-export-coach@example.com"
+    )
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+    team_id = uuid.UUID(team["id"])
+
+    await set_worker_operator_role(db_session)
+    approved = VideoEvent(
+        video_id=video_id,
+        team_id=team_id,
+        event_type=VideoEventType.SHOT_ATTEMPT,
+        event_time_ms=12_000,
+        clip_start_time_ms=8_000,
+        clip_end_time_ms=18_000,
+        output_frame=360,
+        shot_clock_enabled=False,
+        review_status=ReviewStatus.APPROVED,
+        event_metadata={
+            "source": "restricted_bard_lora_alpha_video_windows",
+            "internal_track_id": "track-secret",
+            "model_artifact_uri": "s3://private/model",
+        },
+    )
+    rejected = VideoEvent(
+        video_id=video_id,
+        team_id=team_id,
+        event_type=VideoEventType.REBOUND,
+        event_time_ms=20_000,
+        clip_start_time_ms=16_000,
+        clip_end_time_ms=26_000,
+        output_frame=600,
+        shot_clock_enabled=False,
+        review_status=ReviewStatus.REJECTED,
+    )
+    db_session.add_all([approved, rejected])
+    await db_session.commit()
+    approved_id = approved.id
+    await clear_worker_context(db_session)
+
+    response = await storage_client.get(f"{API}/videos/{video_id}/events/export?format=csv")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "internal_track_id" not in response.text
+    assert "model_artifact_uri" not in response.text
+    rows = list(csv.DictReader(io.StringIO(response.text)))
+    assert rows == [
+        {
+            "video_id": str(video_id),
+            "event_id": str(approved_id),
+            "event_type": "shot_attempt",
+            "review_status": "approved",
+            "source": "alpha_model",
+            "clip_start_time_ms": "8000",
+            "clip_end_time_ms": "18000",
+            "event_time_ms": "12000",
+            "created_at": rows[0]["created_at"],
+        }
+    ]
+
+    await set_worker_operator_role(db_session)
+    audit_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_EVENT_EXPORT_CREATED,
+            AuditLog.resource_id == video_id,
+            AuditLog.team_id == team_id,
         )
     )
     assert audit_count == 1

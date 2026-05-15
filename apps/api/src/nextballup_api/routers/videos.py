@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import csv
+import io
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -1612,6 +1615,20 @@ _COACH_REVIEW_STATUSES = frozenset(
 _MANUAL_EVENT_SOURCE = "coach_manual_alpha_tag"
 _VIDEO_EVENTS_DEFAULT_LIMIT = 50
 _VIDEO_EVENTS_MAX_LIMIT = 100
+_DEFAULT_CLIP_PRE_MS = 4_000
+_DEFAULT_CLIP_POST_MS = 6_000
+_MAX_REVIEW_WINDOW_MS = 60_000
+_EVENT_EXPORT_FIELDS = (
+    "video_id",
+    "event_id",
+    "event_type",
+    "review_status",
+    "source",
+    "clip_start_time_ms",
+    "clip_end_time_ms",
+    "event_time_ms",
+    "created_at",
+)
 
 
 def _derive_event_source(row: VideoEvent) -> VideoEventSourceValue:
@@ -1627,11 +1644,111 @@ def _derive_event_source(row: VideoEvent) -> VideoEventSourceValue:
     return "alpha_model"
 
 
-def _video_event_summary(row: VideoEvent) -> VideoEventSummary:
+def _duration_ms(video: Video) -> int | None:
+    return int(video.duration_seconds * 1000) if video.duration_seconds else None
+
+
+def _window_from_event(row: VideoEvent, *, video: Video) -> tuple[int, int]:
+    duration_ms = _duration_ms(video)
+    if row.clip_start_time_ms is not None and row.clip_end_time_ms is not None:
+        return (
+            _clamp_clip_time(row.clip_start_time_ms, duration_ms=duration_ms),
+            _clamp_clip_time(row.clip_end_time_ms, duration_ms=duration_ms),
+        )
+    metadata = row.event_metadata or {}
+    metadata_start = metadata.get("clip_start_time_ms")
+    metadata_end = metadata.get("clip_end_time_ms")
+    if (
+        isinstance(metadata_start, int)
+        and not isinstance(metadata_start, bool)
+        and isinstance(metadata_end, int)
+        and not isinstance(metadata_end, bool)
+    ):
+        return (
+            _clamp_clip_time(metadata_start, duration_ms=duration_ms),
+            _clamp_clip_time(metadata_end, duration_ms=duration_ms),
+        )
+    pre_ms = metadata.get("clip_pre_ms")
+    post_ms = metadata.get("clip_post_ms")
+    pre = (
+        pre_ms if isinstance(pre_ms, int) and not isinstance(pre_ms, bool) else _DEFAULT_CLIP_PRE_MS
+    )
+    post = (
+        post_ms
+        if isinstance(post_ms, int) and not isinstance(post_ms, bool)
+        else _DEFAULT_CLIP_POST_MS
+    )
+    start = _clamp_clip_time(row.event_time_ms - pre, duration_ms=duration_ms)
+    end = _clamp_clip_time(row.event_time_ms + post, duration_ms=duration_ms)
+    if end <= start:
+        end = _clamp_clip_time(start + 1000, duration_ms=duration_ms)
+    return start, end
+
+
+def _clamp_clip_time(value: int, *, duration_ms: int | None) -> int:
+    clamped = max(0, value)
+    if duration_ms is not None:
+        clamped = min(clamped, duration_ms)
+    return clamped
+
+
+def _resolve_clip_window(
+    *,
+    event_time_ms: int,
+    duration_ms: int | None,
+    clip_start_time_ms: int | None,
+    clip_end_time_ms: int | None,
+) -> tuple[int, int]:
+    if (clip_start_time_ms is None) != (clip_end_time_ms is None):
+        raise ValidationFailedError(
+            "Clip review windows require both start and end timestamps",
+            details={
+                "clip_start_time_ms": clip_start_time_ms,
+                "clip_end_time_ms": clip_end_time_ms,
+            },
+        )
+    start = (
+        max(0, event_time_ms - _DEFAULT_CLIP_PRE_MS)
+        if clip_start_time_ms is None
+        else clip_start_time_ms
+    )
+    end = event_time_ms + _DEFAULT_CLIP_POST_MS if clip_end_time_ms is None else clip_end_time_ms
+    start = _clamp_clip_time(start, duration_ms=duration_ms)
+    end = _clamp_clip_time(end, duration_ms=duration_ms)
+    if start >= end:
+        raise ValidationFailedError(
+            "Clip review window start must be before the end",
+            details={"clip_start_time_ms": start, "clip_end_time_ms": end},
+        )
+    if not (start <= event_time_ms <= end):
+        raise ValidationFailedError(
+            "Event timestamp must sit inside the clip review window",
+            details={
+                "event_time_ms": event_time_ms,
+                "clip_start_time_ms": start,
+                "clip_end_time_ms": end,
+            },
+        )
+    if end - start > _MAX_REVIEW_WINDOW_MS:
+        raise ValidationFailedError(
+            "Clip review windows cannot exceed 60 seconds",
+            details={
+                "clip_start_time_ms": start,
+                "clip_end_time_ms": end,
+                "max_window_ms": _MAX_REVIEW_WINDOW_MS,
+            },
+        )
+    return start, end
+
+
+def _video_event_summary(row: VideoEvent, *, video: Video) -> VideoEventSummary:
+    clip_start_time_ms, clip_end_time_ms = _window_from_event(row, video=video)
     return VideoEventSummary(
         id=row.id,
         event_type=row.event_type,
         event_time_ms=row.event_time_ms,
+        clip_start_time_ms=clip_start_time_ms,
+        clip_end_time_ms=clip_end_time_ms,
         output_frame=row.output_frame,
         period=row.period,
         game_clock_ms=row.game_clock_ms,
@@ -1643,6 +1760,38 @@ def _video_event_summary(row: VideoEvent) -> VideoEventSummary:
         source=_derive_event_source(row),
         created_at=row.created_at,
     )
+
+
+def _clip_event_from_row(row: VideoEvent, *, video: Video) -> ClipEvent:
+    metadata = dict(row.event_metadata or {})
+    if row.clip_start_time_ms is not None and row.clip_end_time_ms is not None:
+        clip_start_time_ms, clip_end_time_ms = _window_from_event(row, video=video)
+        metadata["clip_pre_ms"] = row.event_time_ms - clip_start_time_ms
+        metadata["clip_post_ms"] = clip_end_time_ms - row.event_time_ms
+    return ClipEvent(
+        id=row.id,
+        event_type=row.event_type.value,
+        event_time_ms=row.event_time_ms,
+        confidence=row.confidence,
+        review_status=row.review_status.value,
+        created_at=row.created_at,
+        metadata=metadata,
+    )
+
+
+def _safe_event_export_row(row: VideoEvent, *, video: Video) -> dict[str, str | int]:
+    summary = _video_event_summary(row, video=video)
+    return {
+        "video_id": str(video.id),
+        "event_id": str(summary.id),
+        "event_type": summary.event_type.value,
+        "review_status": summary.review_status.value,
+        "source": summary.source,
+        "clip_start_time_ms": summary.clip_start_time_ms,
+        "clip_end_time_ms": summary.clip_end_time_ms,
+        "event_time_ms": summary.event_time_ms,
+        "created_at": summary.created_at.isoformat(),
+    }
 
 
 def _estimated_output_frame(*, video: Video, event_time_ms: int) -> int:
@@ -1737,7 +1886,7 @@ async def list_video_events(
     if has_more:
         rows = rows[:limit]
 
-    events = [_video_event_summary(row) for row in rows]
+    events = [_video_event_summary(row, video=video) for row in rows]
     next_cursor: str | None = None
     if has_more and rows:
         last = rows[-1]
@@ -1796,6 +1945,93 @@ async def _compute_event_summary_counts(
     )
 
 
+@router.get("/{video_id:uuid}/events/export", response_class=Response)
+async def export_video_events(
+    video_id: uuid.UUID,
+    request: Request,
+    export_format: Annotated[
+        Literal["csv", "json"],
+        Query(alias="format", description="csv | json"),
+    ] = "csv",
+    review_status: Annotated[ReviewStatus, Query()] = ReviewStatus.APPROVED,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+) -> Response:
+    """Export reviewed candidate windows without leaking model metadata.
+
+    This is intentionally file-based. Direct Hudl/cloud editing integrations
+    should stay separate until partner access and legal review are real.
+    """
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    rows = list(
+        (
+            await session.execute(
+                select(VideoEvent)
+                .where(VideoEvent.video_id == video.id)
+                .where(VideoEvent.review_status == review_status)
+                .order_by(VideoEvent.clip_start_time_ms, VideoEvent.event_time_ms)
+            )
+        ).scalars()
+    )
+    safe_rows = [_safe_event_export_row(row, video=video) for row in rows]
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_EVENT_EXPORT_CREATED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="video",
+        resource_id=video.id,
+        team_id=video.team_id,
+        extra={
+            "format": export_format,
+            "review_status": review_status.value,
+            "event_count": len(safe_rows),
+            "not_production_analytics": True,
+        },
+    )
+    await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=video.team_id,
+    )
+
+    filename = f"nextballup-{video.id}-events.{export_format}"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if export_format == "json":
+        payload = {
+            "schema_version": "nextballup_alpha_event_export_v1",
+            "video_id": str(video.id),
+            "review_status": review_status.value,
+            "generated_at": datetime.now(tz=UTC).isoformat(),
+            "not_production_analytics": True,
+            "events": safe_rows,
+        }
+        return Response(
+            content=json.dumps(payload, separators=(",", ":")),
+            media_type="application/json",
+            headers=headers,
+        )
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(_EVENT_EXPORT_FIELDS))
+    writer.writeheader()
+    writer.writerows(safe_rows)
+    return Response(content=output.getvalue(), media_type="text/csv", headers=headers)
+
+
 @router.post(
     "/{video_id:uuid}/events", response_model=VideoEventSummary, status_code=status.HTTP_201_CREATED
 )
@@ -1823,12 +2059,18 @@ async def create_manual_video_event(
             code=ErrorCode.INVALID_VIDEO_STATE,
             details={"current_status": video.status.value},
         )
-    duration_ms = int(video.duration_seconds * 1000) if video.duration_seconds else None
+    duration_ms = _duration_ms(video)
     if duration_ms is not None and payload.event_time_ms > duration_ms:
         raise ValidationFailedError(
             "Manual video tag timestamp is outside the video duration",
             details={"duration_ms": duration_ms},
         )
+    clip_start_time_ms, clip_end_time_ms = _resolve_clip_window(
+        event_time_ms=payload.event_time_ms,
+        duration_ms=duration_ms,
+        clip_start_time_ms=payload.clip_start_time_ms,
+        clip_end_time_ms=payload.clip_end_time_ms,
+    )
 
     game = await session.get(Game, video.game_id)
     row = VideoEvent(
@@ -1836,6 +2078,8 @@ async def create_manual_video_event(
         team_id=video.team_id,
         event_type=payload.event_type,
         event_time_ms=payload.event_time_ms,
+        clip_start_time_ms=clip_start_time_ms,
+        clip_end_time_ms=clip_end_time_ms,
         output_frame=_estimated_output_frame(video=video, event_time_ms=payload.event_time_ms),
         shot_clock_enabled=bool(game.shot_clock_enabled) if game is not None else False,
         confidence=None,
@@ -1844,8 +2088,8 @@ async def create_manual_video_event(
             "source": _MANUAL_EVENT_SOURCE,
             "not_production_analytics": True,
             "review_copy": "Coach-created alpha tag. Review before export.",
-            "clip_pre_ms": 4_000,
-            "clip_post_ms": 6_000,
+            "clip_pre_ms": payload.event_time_ms - clip_start_time_ms,
+            "clip_post_ms": clip_end_time_ms - payload.event_time_ms,
         },
     )
     session.add(row)
@@ -1863,6 +2107,8 @@ async def create_manual_video_event(
             "video_id": str(video.id),
             "event_type": row.event_type.value,
             "event_time_ms": row.event_time_ms,
+            "clip_start_time_ms": row.clip_start_time_ms,
+            "clip_end_time_ms": row.clip_end_time_ms,
             "not_production_analytics": True,
         },
     )
@@ -1874,7 +2120,7 @@ async def create_manual_video_event(
         team_id=video.team_id,
     )
     await session.refresh(row)
-    return _video_event_summary(row)
+    return _video_event_summary(row, video=video)
 
 
 @router.patch(
@@ -1912,10 +2158,21 @@ async def update_video_event_review(
         raise NotFoundError("Video event not found", code=ErrorCode.NOT_FOUND)
 
     previous_status = row.review_status
+    previous_clip_start_time_ms, previous_clip_end_time_ms = _window_from_event(row, video=video)
+    if payload.clip_start_time_ms is not None or payload.clip_end_time_ms is not None:
+        row.clip_start_time_ms, row.clip_end_time_ms = _resolve_clip_window(
+            event_time_ms=row.event_time_ms,
+            duration_ms=_duration_ms(video),
+            clip_start_time_ms=payload.clip_start_time_ms,
+            clip_end_time_ms=payload.clip_end_time_ms,
+        )
     row.review_status = payload.review_status
     metadata = dict(row.event_metadata or {})
     metadata["reviewed_at"] = datetime.now(tz=UTC).isoformat()
     metadata["review_source"] = "coach_review"
+    if row.clip_start_time_ms is not None and row.clip_end_time_ms is not None:
+        metadata["clip_pre_ms"] = row.event_time_ms - row.clip_start_time_ms
+        metadata["clip_post_ms"] = row.clip_end_time_ms - row.event_time_ms
     row.event_metadata = metadata
     await write_audit(
         session,
@@ -1931,6 +2188,10 @@ async def update_video_event_review(
             "previous_review_status": previous_status.value,
             "review_status": row.review_status.value,
             "event_type": row.event_type.value,
+            "previous_clip_start_time_ms": previous_clip_start_time_ms,
+            "previous_clip_end_time_ms": previous_clip_end_time_ms,
+            "clip_start_time_ms": row.clip_start_time_ms,
+            "clip_end_time_ms": row.clip_end_time_ms,
         },
     )
     await session.commit()
@@ -1941,7 +2202,7 @@ async def update_video_event_review(
         team_id=video.team_id,
     )
     await session.refresh(row)
-    return _video_event_summary(row)
+    return _video_event_summary(row, video=video)
 
 
 # ---- GET /videos/{video_id}/clip-proposals -------------------------------
@@ -1972,18 +2233,7 @@ async def list_video_clip_proposals(
         .limit(candidate_limit)
     )
     proposals = build_clip_proposals(
-        [
-            ClipEvent(
-                id=row.id,
-                event_type=row.event_type.value,
-                event_time_ms=row.event_time_ms,
-                confidence=row.confidence,
-                review_status=row.review_status.value,
-                created_at=row.created_at,
-                metadata=row.event_metadata,
-            )
-            for row in rows.scalars()
-        ],
+        [_clip_event_from_row(row, video=video) for row in rows.scalars()],
         duration_seconds=video.duration_seconds,
         limit=limit,
     )

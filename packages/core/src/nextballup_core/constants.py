@@ -47,6 +47,7 @@ class AuditAction:
     VIDEO_DEMO_PREVIEW_CANCELLED = "videos.demo_preview.cancelled"
     VIDEO_EVENT_REVIEWED = "videos.events.reviewed"
     VIDEO_EVENT_MANUAL_CREATED = "videos.events.manual_created"
+    VIDEO_EVENT_EXPORT_CREATED = "videos.events.export_created"
 
     PILOT_INTEREST_RECEIVED = "marketing.pilot_interest.received"
     PILOT_INTEREST_REJECTED = "marketing.pilot_interest.rejected"

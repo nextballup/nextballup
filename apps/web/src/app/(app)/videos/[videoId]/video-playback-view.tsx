@@ -92,6 +92,8 @@ const REVIEW_STATUS_BADGE_CLASS: Record<ReviewStatus, string> = {
 };
 
 const EVENTS_PAGE_SIZE = 50;
+const DEFAULT_CLIP_PRE_MS = 4_000;
+const DEFAULT_CLIP_POST_MS = 6_000;
 
 const EMPTY_SUMMARY: VideoEventsResponse["summary"] = {
   total: 0,
@@ -549,13 +551,21 @@ function CandidateReviewPanel({
     mutationFn: ({
       event,
       review_status,
+      clip_start_time_ms,
+      clip_end_time_ms,
     }: {
       event: VideoEventSummary;
       review_status: ReviewStatus;
+      clip_start_time_ms: number;
+      clip_end_time_ms: number;
     }) =>
       apiJson(`/videos/${video.id}/events/${event.id}/review`, {
         method: "PATCH",
-        json: { review_status } satisfies UpdateVideoEventReviewRequest,
+        json: {
+          review_status,
+          clip_start_time_ms,
+          clip_end_time_ms,
+        } satisfies UpdateVideoEventReviewRequest,
       }),
     onSuccess: () => {
       setMutationError(null);
@@ -602,20 +612,35 @@ function CandidateReviewPanel({
       data-testid="candidate-review-panel"
       className="space-y-3 rounded-lg border border-[color:var(--color-nbu-border)] p-4 text-sm"
     >
-      <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
             Alpha candidates
           </h2>
           <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
-            Review only. Not production analytics. Export is not implemented.
+            Review only. Not production analytics. Export reviewed windows for
+            coach workflows.
           </p>
         </div>
-        <span className="self-start rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
-          {eventsQuery.isLoading
-            ? "loading"
-            : `${filteredTotal} of ${summary.total} candidates`}
-        </span>
+        <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+          <a
+            href={candidateExportHref(video.id, "csv")}
+            className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
+          >
+            Export approved CSV
+          </a>
+          <a
+            href={candidateExportHref(video.id, "json")}
+            className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
+          >
+            JSON
+          </a>
+          <span className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+            {eventsQuery.isLoading
+              ? "loading"
+              : `${filteredTotal} of ${summary.total} candidates`}
+          </span>
+        </div>
       </div>
 
       <div className="space-y-2 rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2">
@@ -719,15 +744,22 @@ function CandidateReviewPanel({
             <button
               type="button"
               disabled={manualTagMutation.isPending}
-              onClick={() =>
+              onClick={() => {
+                const eventTimeMs = getCurrentPlaybackTimeMs();
+                const [clipStartTimeMs, clipEndTimeMs] = defaultClipWindow(
+                  eventTimeMs,
+                  video.duration_seconds,
+                );
                 manualTagMutation.mutate({
                   event_type: manualEventType,
-                  event_time_ms: getCurrentPlaybackTimeMs(),
-                })
-              }
+                  event_time_ms: eventTimeMs,
+                  clip_start_time_ms: clipStartTimeMs,
+                  clip_end_time_ms: clipEndTimeMs,
+                });
+              }}
               className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
             >
-              {manualTagMutation.isPending ? "Adding..." : "Add tag at current time"}
+              {manualTagMutation.isPending ? "Adding..." : "Add 10s tag"}
             </button>
           </div>
         </div>
@@ -763,67 +795,13 @@ function CandidateReviewPanel({
               className="max-h-[36rem] divide-y divide-[color:var(--color-nbu-border)] overflow-y-auto rounded-md border border-[color:var(--color-nbu-border)]"
             >
               {visibleEvents.map((event) => (
-                <li
+                <CandidateEventRow
                   key={event.id}
-                  data-testid="candidate-row"
-                  className="grid gap-3 px-3 py-2 sm:grid-cols-[1fr_auto]"
-                >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                      <span className="font-medium">
-                        {EVENT_TYPE_LABELS[event.event_type]}
-                      </span>
-                      <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
-                        {formatClipTime(event.event_time_ms)}
-                      </span>
-                      <span className={REVIEW_STATUS_BADGE_CLASS[event.review_status]}>
-                        {formatReviewStatus(event.review_status)}
-                      </span>
-                      <span className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
-                        {SOURCE_LABELS[event.source]}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap items-start gap-2 sm:justify-end">
-                    <button
-                      type="button"
-                      onClick={() => onJumpToTime(event.event_time_ms)}
-                      className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
-                    >
-                      Jump
-                    </button>
-                    <button
-                      type="button"
-                      disabled={
-                        reviewMutation.isPending || event.review_status === "approved"
-                      }
-                      onClick={() =>
-                        reviewMutation.mutate({
-                          event,
-                          review_status: "approved",
-                        })
-                      }
-                      className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
-                    >
-                      Approve
-                    </button>
-                    <button
-                      type="button"
-                      disabled={
-                        reviewMutation.isPending || event.review_status === "rejected"
-                      }
-                      onClick={() =>
-                        reviewMutation.mutate({
-                          event,
-                          review_status: "rejected",
-                        })
-                      }
-                      className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
-                    >
-                      Reject
-                    </button>
-                  </div>
-                </li>
+                  event={event}
+                  isReviewPending={reviewMutation.isPending}
+                  onJumpToTime={onJumpToTime}
+                  onReview={(payload) => reviewMutation.mutate(payload)}
+                />
               ))}
             </ul>
           )}
@@ -841,6 +819,131 @@ function CandidateReviewPanel({
         </div>
       )}
     </section>
+  );
+}
+
+function CandidateEventRow({
+  event,
+  isReviewPending,
+  onJumpToTime,
+  onReview,
+}: {
+  event: VideoEventSummary;
+  isReviewPending: boolean;
+  onJumpToTime: (timeMs: number) => void;
+  onReview: (payload: {
+    event: VideoEventSummary;
+    review_status: ReviewStatus;
+    clip_start_time_ms: number;
+    clip_end_time_ms: number;
+  }) => void;
+}) {
+  const [startValue, setStartValue] = useState(formatClipTimeInput(event.clip_start_time_ms));
+  const [endValue, setEndValue] = useState(formatClipTimeInput(event.clip_end_time_ms));
+  const [windowError, setWindowError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setStartValue(formatClipTimeInput(event.clip_start_time_ms));
+    setEndValue(formatClipTimeInput(event.clip_end_time_ms));
+    setWindowError(null);
+  }, [event.id, event.clip_start_time_ms, event.clip_end_time_ms]);
+
+  const submitReview = (review_status: ReviewStatus) => {
+    const clip_start_time_ms = parseClipTimeInput(startValue);
+    const clip_end_time_ms = parseClipTimeInput(endValue);
+    if (clip_start_time_ms === null || clip_end_time_ms === null) {
+      setWindowError("Enter a valid clip window.");
+      return;
+    }
+    if (clip_start_time_ms >= clip_end_time_ms) {
+      setWindowError("Clip start must be before clip end.");
+      return;
+    }
+    if (
+      event.event_time_ms < clip_start_time_ms ||
+      event.event_time_ms > clip_end_time_ms
+    ) {
+      setWindowError("The candidate timestamp must stay inside the clip window.");
+      return;
+    }
+    setWindowError(null);
+    onReview({ event, review_status, clip_start_time_ms, clip_end_time_ms });
+  };
+
+  return (
+    <li data-testid="candidate-row" className="grid gap-3 px-3 py-2">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="font-medium">{EVENT_TYPE_LABELS[event.event_type]}</span>
+          <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
+            Moment {formatClipTime(event.event_time_ms)}
+          </span>
+          <span className={REVIEW_STATUS_BADGE_CLASS[event.review_status]}>
+            {formatReviewStatus(event.review_status)}
+          </span>
+          <span className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            {SOURCE_LABELS[event.source]}
+          </span>
+        </div>
+        <p className="mt-1 text-xs text-[color:var(--color-nbu-text-muted)]">
+          Clip window {formatClipWindow(event.clip_start_time_ms, event.clip_end_time_ms)}
+        </p>
+      </div>
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="flex flex-col gap-1 text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+          Start
+          <input
+            type="number"
+            min="0"
+            step="0.5"
+            value={startValue}
+            onChange={(input) => setStartValue(input.target.value)}
+            data-testid="candidate-window-start"
+            className="w-20 rounded-md border border-[color:var(--color-nbu-border)] bg-transparent px-2 py-1 font-mono text-xs text-[color:var(--color-nbu-text)]"
+          />
+        </label>
+        <label className="flex flex-col gap-1 text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+          End
+          <input
+            type="number"
+            min="0"
+            step="0.5"
+            value={endValue}
+            onChange={(input) => setEndValue(input.target.value)}
+            data-testid="candidate-window-end"
+            className="w-20 rounded-md border border-[color:var(--color-nbu-border)] bg-transparent px-2 py-1 font-mono text-xs text-[color:var(--color-nbu-text)]"
+          />
+        </label>
+        <button
+          type="button"
+          onClick={() => onJumpToTime(event.clip_start_time_ms)}
+          className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
+        >
+          Jump
+        </button>
+        <button
+          type="button"
+          disabled={isReviewPending || event.review_status === "approved"}
+          onClick={() => submitReview("approved")}
+          className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+        >
+          Approve
+        </button>
+        <button
+          type="button"
+          disabled={isReviewPending || event.review_status === "rejected"}
+          onClick={() => submitReview("rejected")}
+          className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+        >
+          Reject
+        </button>
+      </div>
+      {windowError ? (
+        <p role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
+          {windowError}
+        </p>
+      ) : null}
+    </li>
   );
 }
 
@@ -866,10 +969,19 @@ function buildEventsUrl({
   return `/videos/${videoId}/events?${params.toString()}`;
 }
 
+function candidateExportHref(videoId: string, format: "csv" | "json"): string {
+  const params = new URLSearchParams({
+    format,
+    review_status: "approved",
+  });
+  return `/api/v1/videos/${videoId}/events/export?${params.toString()}`;
+}
+
 function buildSearchIndex(event: VideoEventSummary): string {
   return [
     EVENT_TYPE_LABELS[event.event_type],
     formatClipTime(event.event_time_ms),
+    formatClipWindow(event.clip_start_time_ms, event.clip_end_time_ms),
     formatReviewStatus(event.review_status),
     SOURCE_LABELS[event.source],
   ]
@@ -1275,6 +1387,34 @@ function formatClipTime(valueMs: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatClipWindow(startMs: number, endMs: number): string {
+  return `${formatClipTime(startMs)}-${formatClipTime(endMs)}`;
+}
+
+function formatClipTimeInput(valueMs: number): string {
+  const seconds = valueMs / 1_000;
+  return Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1);
+}
+
+function parseClipTimeInput(value: string): number | null {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.round(seconds * 1_000);
+}
+
+function defaultClipWindow(
+  eventTimeMs: number,
+  durationSeconds: number | null | undefined,
+): [number, number] {
+  const durationMs =
+    durationSeconds !== null && durationSeconds !== undefined
+      ? Math.round(durationSeconds * 1_000)
+      : null;
+  const start = Math.max(0, eventTimeMs - DEFAULT_CLIP_PRE_MS);
+  const end = eventTimeMs + DEFAULT_CLIP_POST_MS;
+  return [start, durationMs === null ? end : Math.min(end, durationMs)];
 }
 
 function formatReviewStatus(value: string): string {

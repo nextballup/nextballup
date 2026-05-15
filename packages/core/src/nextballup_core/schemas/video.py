@@ -189,6 +189,8 @@ class VideoEventSummary(BaseModel):
     id: uuid.UUID
     event_type: VideoEventType
     event_time_ms: int
+    clip_start_time_ms: int
+    clip_end_time_ms: int
     output_frame: int
     period: int | None = None
     game_clock_ms: int | None = None
@@ -230,12 +232,16 @@ class CreateVideoEventRequest(BaseModel):
 
     event_type: VideoEventType
     event_time_ms: int = Field(ge=0)
+    clip_start_time_ms: int | None = Field(default=None, ge=0)
+    clip_end_time_ms: int | None = Field(default=None, ge=0)
 
 
 class UpdateVideoEventReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     review_status: ReviewStatus
+    clip_start_time_ms: int | None = Field(default=None, ge=0)
+    clip_end_time_ms: int | None = Field(default=None, ge=0)
 
 
 class VideoClipProposalSummary(BaseModel):

@@ -45,6 +45,9 @@ function buildEvent(
     id: overrides.id,
     event_type: overrides.event_type,
     event_time_ms: overrides.event_time_ms,
+    clip_start_time_ms:
+      overrides.clip_start_time_ms ?? Math.max(0, overrides.event_time_ms - 4_000),
+    clip_end_time_ms: overrides.clip_end_time_ms ?? overrides.event_time_ms + 6_000,
     output_frame: overrides.output_frame ?? Math.round(overrides.event_time_ms / 33),
     period: overrides.period ?? null,
     game_clock_ms: overrides.game_clock_ms ?? null,
@@ -529,7 +532,8 @@ describe("VideoPlaybackView", () => {
     expect(screen.queryByText(/events detected/i)).not.toBeInTheDocument();
     const list = await screen.findByTestId("candidate-review-list");
     expect(within(list).getByText("Made shot")).toBeInTheDocument();
-    expect(within(list).getByText(/^0:12$/)).toBeInTheDocument();
+    expect(within(list).getByText("Moment 0:12")).toBeInTheDocument();
+    expect(within(list).getByText("Clip window 0:08-0:18")).toBeInTheDocument();
     expect(screen.getByText("1 of 1 candidates")).toBeInTheDocument();
     expect(screen.queryByText("84%")).not.toBeInTheDocument();
   });
@@ -612,13 +616,22 @@ describe("VideoPlaybackView", () => {
       render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
     });
 
+    expect(await screen.findByRole("link", { name: "Export approved CSV" })).toHaveAttribute(
+      "href",
+      "/api/v1/videos/v1/events/export?format=csv&review_status=approved",
+    );
+    expect(screen.getByRole("link", { name: "JSON" })).toHaveAttribute(
+      "href",
+      "/api/v1/videos/v1/events/export?format=json&review_status=approved",
+    );
+
     const player = (await screen.findByTestId("video-player")) as HTMLVideoElement;
     const list = await screen.findByTestId("candidate-review-list");
     expect(within(list).getAllByText("Shot attempt")).toHaveLength(5);
     expect(within(list).getAllByText("Rebound").length).toBeGreaterThan(0);
 
     fireEvent.click(within(list).getAllByRole("button", { name: "Jump" })[0]);
-    expect(player.currentTime).toBe(8);
+    expect(player.currentTime).toBe(4);
 
     const loadMore = await screen.findByTestId("candidate-load-more");
     fireEvent.click(loadMore);
@@ -1018,17 +1031,23 @@ describe("VideoPlaybackView", () => {
     player.currentTime = 42;
     fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
     await waitFor(() =>
-      expect(reviewRequest).toHaveBeenCalledWith({ review_status: "approved" }),
+      expect(reviewRequest).toHaveBeenCalledWith({
+        review_status: "approved",
+        clip_start_time_ms: 8_000,
+        clip_end_time_ms: 18_000,
+      }),
     );
 
     fireEvent.change(screen.getByLabelText("Manual tag"), {
       target: { value: "rebound" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Add tag at current time" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add 10s tag" }));
     await waitFor(() =>
       expect(manualRequest).toHaveBeenCalledWith({
         event_type: "rebound",
         event_time_ms: 42_000,
+        clip_start_time_ms: 38_000,
+        clip_end_time_ms: 48_000,
       }),
     );
   });

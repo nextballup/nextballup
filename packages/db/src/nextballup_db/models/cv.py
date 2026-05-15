@@ -189,6 +189,8 @@ class VideoEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     event_time_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    clip_start_time_ms: Mapped[int | None] = mapped_column(BigInteger)
+    clip_end_time_ms: Mapped[int | None] = mapped_column(BigInteger)
     output_frame: Mapped[int] = mapped_column(Integer, nullable=False)
     period: Mapped[int | None] = mapped_column(Integer)
     game_clock_ms: Mapped[int | None] = mapped_column(BigInteger)
@@ -215,6 +217,13 @@ class VideoEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="fk_video_events_video_team_videos",
         ),
         Index("ix_video_events_team_video_time", "team_id", "video_id", "event_time_ms"),
+        Index(
+            "ix_video_events_team_video_window",
+            "team_id",
+            "video_id",
+            "clip_start_time_ms",
+            "clip_end_time_ms",
+        ),
         Index("ix_video_events_type_review", "event_type", "review_status"),
     )
 
