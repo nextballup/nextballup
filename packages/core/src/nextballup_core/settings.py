@@ -384,6 +384,10 @@ class Settings(BaseSettings):
             "/api/v1/auth/password/forgot",
             "/api/v1/auth/password/reset",
             "/api/v1/_csp-report",
+            # Marketing pilot-interest is intentionally unauthenticated and
+            # rate-limited per IP; there is no logged-in session to bind a
+            # CSRF token to from the public marketing site.
+            "/api/v1/pilot-interest",
         ]
     )
 

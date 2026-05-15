@@ -48,6 +48,9 @@ class AuditAction:
     VIDEO_EVENT_REVIEWED = "videos.events.reviewed"
     VIDEO_EVENT_MANUAL_CREATED = "videos.events.manual_created"
 
+    PILOT_INTEREST_RECEIVED = "marketing.pilot_interest.received"
+    PILOT_INTEREST_REJECTED = "marketing.pilot_interest.rejected"
+
     GAME_UPDATED = "games.update"
     VIDEO_PROCESSING_REQUEUED = "videos.processing.requeued"
     VIDEO_DELETED = "videos.delete"

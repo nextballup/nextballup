@@ -22,6 +22,7 @@ from nextballup_api.routers import auth as auth_router
 from nextballup_api.routers import csp as csp_router
 from nextballup_api.routers import games as games_router
 from nextballup_api.routers import health as health_router
+from nextballup_api.routers import marketing as marketing_router
 from nextballup_api.routers import mfa as mfa_router
 from nextballup_api.routers import teams as teams_router
 from nextballup_api.routers import videos as videos_router
@@ -281,6 +282,7 @@ def create_app() -> FastAPI:
     app.include_router(videos_router.router, prefix=API_PREFIX)
     app.include_router(admin_router.router, prefix=API_PREFIX)
     app.include_router(csp_router.router, prefix=API_PREFIX)
+    app.include_router(marketing_router.router, prefix=API_PREFIX)
 
     return app
 
