@@ -52,6 +52,9 @@ class _ProbeResult:
     height: int | None = None
     fps: float | None = None
     codec: str | None = None
+    audio_codec: str | None = None
+    pix_fmt: str | None = None
+    format_name: str | None = None
 
 
 _MEDIA_ENV_ALLOWLIST = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL")
@@ -124,6 +127,41 @@ def _build_ffmpeg_command(
         "128k",
         "-movflags",
         "+faststart",
+        str(output_path),
+    ]
+
+
+def _build_ffmpeg_remux_command(
+    *,
+    binary: str,
+    input_path: Path,
+    output_path: Path,
+) -> list[str]:
+    return [
+        binary,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-sn",
+        "-dn",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-avoid_negative_ts",
+        "make_zero",
         str(output_path),
     ]
 
@@ -361,7 +399,7 @@ def _probe_output_sync(output_path: Path, settings: Settings) -> _ProbeResult:
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration:stream=codec_name,width,height,r_frame_rate",
+                "format=duration,format_name:stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate",
                 "-of",
                 "json",
                 str(output_path),
@@ -377,7 +415,23 @@ def _probe_output_sync(output_path: Path, settings: Settings) -> _ProbeResult:
         return _ProbeResult(codec="h264")
 
     streams = payload.get("streams")
-    stream = streams[0] if isinstance(streams, list) and streams else {}
+    stream_list = streams if isinstance(streams, list) else []
+    stream = next(
+        (
+            item
+            for item in stream_list
+            if isinstance(item, dict) and item.get("codec_type") == "video"
+        ),
+        {},
+    )
+    audio_stream = next(
+        (
+            item
+            for item in stream_list
+            if isinstance(item, dict) and item.get("codec_type") == "audio"
+        ),
+        {},
+    )
     fmt = payload.get("format") if isinstance(payload.get("format"), dict) else {}
     duration_seconds = None
     raw_duration = fmt.get("duration")
@@ -398,12 +452,41 @@ def _probe_output_sync(output_path: Path, settings: Settings) -> _ProbeResult:
     width = stream.get("width")
     height = stream.get("height")
     codec = stream.get("codec_name")
+    audio_codec = audio_stream.get("codec_name")
+    pix_fmt = stream.get("pix_fmt")
+    format_name = fmt.get("format_name")
     return _ProbeResult(
         duration_seconds=duration_seconds,
         width=width if isinstance(width, int) else None,
         height=height if isinstance(height, int) else None,
         fps=fps,
         codec=codec if isinstance(codec, str) else "h264",
+        audio_codec=audio_codec if isinstance(audio_codec, str) else None,
+        pix_fmt=pix_fmt if isinstance(pix_fmt, str) else None,
+        format_name=format_name if isinstance(format_name, str) else None,
+    )
+
+
+def _is_browser_safe_remux_candidate(probe: _ProbeResult, settings: Settings) -> bool:
+    if not settings.worker_playback_remux_enabled:
+        return False
+    format_name = probe.format_name or ""
+    format_names = {part.strip().lower() for part in format_name.split(",") if part.strip()}
+    if not format_names.intersection({"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}):
+        return False
+    if (probe.codec or "").lower() != "h264":
+        return False
+    if (probe.pix_fmt or "").lower() not in {"yuv420p", "yuvj420p"}:
+        return False
+    if probe.audio_codec is not None and probe.audio_codec.lower() != "aac":
+        return False
+    if settings.worker_playback_remux_max_width > 0 and (
+        probe.width is None or probe.width > settings.worker_playback_remux_max_width
+    ):
+        return False
+    return not (
+        settings.worker_playback_remux_max_fps > 0
+        and (probe.fps is None or probe.fps > settings.worker_playback_remux_max_fps + 0.01)
     )
 
 
@@ -478,19 +561,30 @@ async def create_browser_mezzanine(
         )
 
         transcoder, binaries = _select_transcoder(settings)
+        transcode_mode = transcoder
         if transcoder == "ffmpeg":
+            input_probe = await to_thread.run_sync(lambda: _probe_output_sync(input_path, settings))
+            if _is_browser_safe_remux_candidate(input_probe, settings):
+                command = _build_ffmpeg_remux_command(
+                    binary=binaries[0],
+                    input_path=input_path,
+                    output_path=output_path,
+                )
+                transcode_mode = "ffmpeg-remux"
+            else:
+                command = _build_ffmpeg_command(
+                    binary=binaries[0],
+                    input_path=input_path,
+                    output_path=output_path,
+                    threads=settings.worker_ffmpeg_threads,
+                    max_width=settings.worker_playback_max_width,
+                    max_fps=settings.worker_playback_max_fps,
+                    crf=settings.worker_playback_crf,
+                    preset=settings.worker_playback_preset,
+                )
             await to_thread.run_sync(
                 lambda: _run_subprocess(
-                    cmd=_build_ffmpeg_command(
-                        binary=binaries[0],
-                        input_path=input_path,
-                        output_path=output_path,
-                        threads=settings.worker_ffmpeg_threads,
-                        max_width=settings.worker_playback_max_width,
-                        max_fps=settings.worker_playback_max_fps,
-                        crf=settings.worker_playback_crf,
-                        preset=settings.worker_playback_preset,
-                    ),
+                    cmd=command,
                     timeout_seconds=settings.worker_transcode_timeout_seconds,
                     unavailable_code=ErrorCode.PROCESSING_TRANSCODER_UNAVAILABLE,
                     settings=settings,
@@ -569,5 +663,5 @@ async def create_browser_mezzanine(
             height=probe.height,
             fps=probe.fps,
             codec=probe.codec,
-            transcoder=transcoder,
+            transcoder=transcode_mode,
         )

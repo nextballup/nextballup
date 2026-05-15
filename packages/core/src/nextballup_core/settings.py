@@ -265,6 +265,9 @@ class Settings(BaseSettings):
     worker_playback_max_fps: int = Field(default=30, ge=0, le=240)
     worker_playback_crf: int = Field(default=26, ge=0, le=51)
     worker_playback_preset: str = "veryfast"
+    worker_playback_remux_enabled: bool = True
+    worker_playback_remux_max_width: int = Field(default=1920, ge=0, le=7680)
+    worker_playback_remux_max_fps: int = Field(default=60, ge=0, le=240)
     worker_media_subprocess_sandbox: bool = True
     worker_media_max_cpu_seconds: int = Field(default=7_200, ge=0)
     worker_media_max_output_bytes: int = Field(default=100 * 1024 * 1024 * 1024, ge=0)

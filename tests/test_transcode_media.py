@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,8 +11,11 @@ from nextballup_worker.runtime import media as media_module
 from nextballup_worker.runtime.media import (
     _build_containerized_ffmpeg_command,
     _build_ffmpeg_command,
+    _build_ffmpeg_remux_command,
+    _is_browser_safe_remux_candidate,
     _media_subprocess_env,
     _media_subprocess_kwargs,
+    _ProbeResult,
     _select_transcoder,
     create_browser_mezzanine,
 )
@@ -123,6 +125,87 @@ def test_build_ffmpeg_command_can_disable_alpha_playback_caps() -> None:
     assert "-vf" not in command
     assert command[command.index("-crf") + 1] == "23"
     assert command[command.index("-preset") + 1] == "superfast"
+
+
+def test_build_ffmpeg_remux_command_copies_streams_and_strips_metadata() -> None:
+    command = _build_ffmpeg_remux_command(
+        binary="ffmpeg",
+        input_path=Path("/tmp/input.mp4"),
+        output_path=Path("/tmp/output.mp4"),
+    )
+
+    assert "-map_metadata" in command
+    assert "-map_chapters" in command
+    assert "-sn" in command
+    assert "-dn" in command
+    assert command[command.index("-c") + 1] == "copy"
+    assert "-movflags" in command
+    assert "+faststart" in command
+    assert command[-1] == "/tmp/output.mp4"
+
+
+def test_browser_safe_remux_candidate_accepts_h264_aac_mp4_within_caps() -> None:
+    settings = get_settings()
+    probe = _ProbeResult(
+        width=1920,
+        fps=30.0,
+        codec="h264",
+        audio_codec="aac",
+        pix_fmt="yuv420p",
+        format_name="mov,mp4,m4a,3gp,3g2,mj2",
+    )
+
+    assert _is_browser_safe_remux_candidate(probe, settings) is True
+
+
+def test_browser_safe_remux_candidate_rejects_oversized_or_unsafe_inputs() -> None:
+    settings = get_settings()
+
+    def _candidate(
+        *,
+        width: int = 1920,
+        fps: float = 30.0,
+        codec: str = "h264",
+        audio_codec: str = "aac",
+        pix_fmt: str = "yuv420p",
+    ) -> _ProbeResult:
+        return _ProbeResult(
+            width=width,
+            fps=fps,
+            codec=codec,
+            audio_codec=audio_codec,
+            pix_fmt=pix_fmt,
+            format_name="mov,mp4,m4a,3gp,3g2,mj2",
+        )
+
+    assert (
+        _is_browser_safe_remux_candidate(
+            _candidate(width=3840),
+            settings,
+        )
+        is False
+    )
+    assert (
+        _is_browser_safe_remux_candidate(
+            _candidate(codec="hevc"),
+            settings,
+        )
+        is False
+    )
+    assert (
+        _is_browser_safe_remux_candidate(
+            _candidate(pix_fmt="yuv422p"),
+            settings,
+        )
+        is False
+    )
+    assert (
+        _is_browser_safe_remux_candidate(
+            _candidate(audio_codec="pcm_s16le"),
+            settings,
+        )
+        is False
+    )
 
 
 def test_media_subprocess_env_drops_application_secrets(
@@ -285,7 +368,7 @@ async def test_create_browser_mezzanine_hashes_and_uploads_output_metadata(
     monkeypatch.setattr(
         media_module,
         "_probe_output_sync",
-        lambda _path, _settings: SimpleNamespace(
+        lambda _path, _settings: _ProbeResult(
             duration_seconds=1.0,
             width=640,
             height=360,
@@ -304,6 +387,65 @@ async def test_create_browser_mezzanine_hashes_and_uploads_output_metadata(
     assert artifact.output_sha256 == expected_sha
     assert artifact.output_size_bytes == len(output_payload)
     assert storage.uploaded_metadata[artifact.mezzanine_key] == {"nbu-output-sha256": expected_sha}
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_create_browser_mezzanine_remuxes_browser_safe_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _MP4_PAYLOAD + b"declared-object"
+    output_payload = b"browser-safe-remux"
+    video = Video(
+        id=uuid.uuid4(),
+        team_id=uuid.uuid4(),
+        storage_key_raw="raw/team/video/input.mp4",
+        filename="input.mp4",
+        content_type="video/mp4",
+        checksum_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    storage = _DownloadedObjectStorage(payload)
+    commands: list[list[str]] = []
+
+    def _fake_run_subprocess(**kwargs: Any) -> None:
+        cmd = kwargs["cmd"]
+        commands.append(cmd)
+        Path(cmd[-1]).write_bytes(output_payload)
+
+    def _fake_probe(path: Path, _settings: Any) -> _ProbeResult:
+        if path.name.startswith("input"):
+            return _ProbeResult(
+                duration_seconds=1.0,
+                width=1280,
+                height=720,
+                fps=30.0,
+                codec="h264",
+                audio_codec="aac",
+                pix_fmt="yuv420p",
+                format_name="mov,mp4,m4a,3gp,3g2,mj2",
+            )
+        return _ProbeResult(
+            duration_seconds=1.0,
+            width=1280,
+            height=720,
+            fps=30.0,
+            codec="h264",
+        )
+
+    monkeypatch.setattr(
+        media_module, "_select_transcoder", lambda _settings: ("ffmpeg", ["ffmpeg"])
+    )
+    monkeypatch.setattr(media_module, "_run_subprocess", _fake_run_subprocess)
+    monkeypatch.setattr(media_module, "_probe_output_sync", _fake_probe)
+
+    artifact = await create_browser_mezzanine(
+        video=video,
+        presigner=storage,
+        settings=get_settings(),
+    )
+
+    assert artifact.transcoder == "ffmpeg-remux"
+    assert commands
+    assert commands[0][commands[0].index("-c") + 1] == "copy"
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -337,7 +479,7 @@ async def test_create_browser_mezzanine_uses_configured_media_temp_dir(
     monkeypatch.setattr(
         media_module,
         "_probe_output_sync",
-        lambda _path, _settings: SimpleNamespace(
+        lambda _path, _settings: _ProbeResult(
             duration_seconds=1.0,
             width=640,
             height=360,

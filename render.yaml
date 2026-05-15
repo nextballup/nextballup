@@ -113,11 +113,17 @@ services:
       - key: WORKER_PLAYBACK_MAX_WIDTH
         value: "1280"
       - key: WORKER_PLAYBACK_MAX_FPS
-        value: "30"
+        value: "24"
       - key: WORKER_PLAYBACK_CRF
-        value: "26"
+        value: "28"
       - key: WORKER_PLAYBACK_PRESET
         value: superfast
+      - key: WORKER_PLAYBACK_REMUX_ENABLED
+        value: "true"
+      - key: WORKER_PLAYBACK_REMUX_MAX_WIDTH
+        value: "1920"
+      - key: WORKER_PLAYBACK_REMUX_MAX_FPS
+        value: "60"
 
   - type: worker
     name: nextballup-alpha-beat
