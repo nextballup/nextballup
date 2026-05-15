@@ -7,9 +7,11 @@ import io
 import json
 import logging
 import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import FileResponse, RedirectResponse, Response
@@ -1618,16 +1620,59 @@ _VIDEO_EVENTS_MAX_LIMIT = 100
 _DEFAULT_CLIP_PRE_MS = 4_000
 _DEFAULT_CLIP_POST_MS = 6_000
 _MAX_REVIEW_WINDOW_MS = 60_000
+_EVENT_EXPORT_FORMAT_EXTENSIONS = {
+    "csv": "csv",
+    "json": "json",
+    "sportscode_xml": "xml",
+    "package_zip": "zip",
+}
+_EVENT_EXPORT_FORMAT_MEDIA_TYPES = {
+    "csv": "text/csv",
+    "json": "application/json",
+    "sportscode_xml": "application/xml",
+    "package_zip": "application/zip",
+}
 _EVENT_EXPORT_FIELDS = (
     "video_id",
     "event_id",
+    "label",
     "event_type",
     "review_status",
     "source",
+    "clip_start_seconds",
+    "clip_end_seconds",
+    "event_seconds",
     "clip_start_time_ms",
     "clip_end_time_ms",
     "event_time_ms",
     "created_at",
+    "notes",
+)
+_EVENT_TYPE_EXPORT_LABELS: dict[VideoEventType, str] = {
+    VideoEventType.SHOT_ATTEMPT: "Shot attempt",
+    VideoEventType.SHOT_MADE: "Made shot",
+    VideoEventType.REBOUND: "Rebound",
+    VideoEventType.PASS: "Pass",
+}
+_EXPORT_README = """NextBallUp alpha timeline export
+
+This package contains reviewed candidate clip windows only. It does not include
+raw video, signed playback URLs, storage keys, model prompts, private model
+artifact paths, or internal restricted-source lineage.
+
+Files:
+- reviewed_windows.csv: coach-facing timeline rows.
+- manifest.json: app-neutral timeline manifest.
+- sportscode.xml: Sportscode-style XML timeline for import testing.
+- review_feedback.json: review labels for future model-evaluation/training
+  pipelines, gated by the consent flags inside the file.
+
+Direct Hudl cloud upload is not implemented. Validate imports in your editing
+software before relying on an export in a production workflow.
+"""
+
+_EVENT_EXPORT_NOTES = (
+    "Review only. Not production analytics. Direct Hudl cloud export is not implemented."
 )
 
 
@@ -1779,19 +1824,188 @@ def _clip_event_from_row(row: VideoEvent, *, video: Video) -> ClipEvent:
     )
 
 
-def _safe_event_export_row(row: VideoEvent, *, video: Video) -> dict[str, str | int]:
+def _seconds(value_ms: int) -> float:
+    return round(value_ms / 1000, 3)
+
+
+def _export_label(event_type: VideoEventType) -> str:
+    return _EVENT_TYPE_EXPORT_LABELS.get(event_type, event_type.value.replace("_", " ").title())
+
+
+def _safe_event_export_row(row: VideoEvent, *, video: Video) -> dict[str, str | int | float]:
     summary = _video_event_summary(row, video=video)
+    label = _export_label(summary.event_type)
     return {
         "video_id": str(video.id),
         "event_id": str(summary.id),
+        "label": label,
         "event_type": summary.event_type.value,
         "review_status": summary.review_status.value,
         "source": summary.source,
+        "clip_start_seconds": _seconds(summary.clip_start_time_ms),
+        "clip_end_seconds": _seconds(summary.clip_end_time_ms),
+        "event_seconds": _seconds(summary.event_time_ms),
         "clip_start_time_ms": summary.clip_start_time_ms,
         "clip_end_time_ms": summary.clip_end_time_ms,
         "event_time_ms": summary.event_time_ms,
         "created_at": summary.created_at.isoformat(),
+        "notes": _EVENT_EXPORT_NOTES,
     }
+
+
+def _render_event_csv(rows: list[dict[str, str | int | float]]) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(_EVENT_EXPORT_FIELDS), extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
+
+
+def _render_event_manifest(
+    *,
+    video: Video,
+    review_status: ReviewStatus,
+    generated_at: datetime,
+    rows: list[dict[str, str | int | float]],
+) -> str:
+    payload = {
+        "schema_version": "nextballup_alpha_event_export_v1",
+        "video_id": str(video.id),
+        "review_status": review_status.value,
+        "generated_at": generated_at.isoformat(),
+        "not_production_analytics": True,
+        "direct_hudl_cloud_export_implemented": False,
+        "includes_video_bytes": False,
+        "events": rows,
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _render_review_feedback_manifest(
+    *,
+    video: Video,
+    review_status: ReviewStatus,
+    generated_at: datetime,
+    rows: list[dict[str, str | int | float]],
+    consent: TeamPrivacyConsent | None,
+) -> str:
+    commercial_training_allowed = bool(
+        consent is not None
+        and consent.covers_cv_processing
+        and consent.commercial_ml_training_allowed
+    )
+    payload = {
+        "schema_version": "nextballup_alpha_review_feedback_v1",
+        "video_id": str(video.id),
+        "team_id": str(video.team_id),
+        "review_status": review_status.value,
+        "generated_at": generated_at.isoformat(),
+        "governance": {
+            "review_only": True,
+            "not_production_analytics": True,
+            "includes_video_bytes": False,
+            "includes_signed_urls": False,
+            "commercial_training_allowed": commercial_training_allowed,
+            "commercial_training_consent_id": str(consent.id)
+            if commercial_training_allowed and consent is not None
+            else None,
+            "global_model_training_requires_operator_rights_review": True,
+        },
+        "examples": [
+            {
+                "event_id": row["event_id"],
+                "video_id": row["video_id"],
+                "label": row["event_type"],
+                "review_status": row["review_status"],
+                "accepted": row["review_status"] == ReviewStatus.APPROVED.value,
+                "source": row["source"],
+                "clip_start_time_ms": row["clip_start_time_ms"],
+                "clip_end_time_ms": row["clip_end_time_ms"],
+                "event_time_ms": row["event_time_ms"],
+            }
+            for row in rows
+        ],
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _render_sportscode_xml(rows: list[dict[str, str | int | float]]) -> str:
+    root = ET.Element("file")
+    all_instances = ET.SubElement(root, "ALL_INSTANCES")
+    for index, row in enumerate(rows, start=1):
+        instance = ET.SubElement(all_instances, "instance")
+        ET.SubElement(instance, "ID").text = str(index)
+        ET.SubElement(instance, "start").text = f"{float(row['clip_start_seconds']):.3f}"
+        ET.SubElement(instance, "end").text = f"{float(row['clip_end_seconds']):.3f}"
+        ET.SubElement(instance, "code").text = str(row["label"])
+        status_label = ET.SubElement(instance, "label")
+        ET.SubElement(status_label, "group").text = "NextBallUp review"
+        ET.SubElement(status_label, "text").text = str(row["review_status"])
+        source_label = ET.SubElement(instance, "label")
+        ET.SubElement(source_label, "group").text = "NextBallUp source"
+        ET.SubElement(source_label, "text").text = str(row["source"])
+    ET.indent(root, space="  ")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        + ET.tostring(root, encoding="unicode", short_empty_elements=False)
+        + "\n"
+    )
+
+
+async def _latest_active_training_consent(
+    session: AsyncSession,
+    *,
+    team_id: uuid.UUID,
+) -> TeamPrivacyConsent | None:
+    now = datetime.now(tz=UTC)
+    return cast(
+        "TeamPrivacyConsent | None",
+        await session.scalar(
+            select(TeamPrivacyConsent)
+            .where(
+                TeamPrivacyConsent.team_id == team_id,
+                TeamPrivacyConsent.revoked_at.is_(None),
+                (TeamPrivacyConsent.expires_at.is_(None)) | (TeamPrivacyConsent.expires_at > now),
+            )
+            .order_by(TeamPrivacyConsent.effective_at.desc(), TeamPrivacyConsent.created_at.desc())
+            .limit(1)
+        ),
+    )
+
+
+def _render_event_package(
+    *,
+    video: Video,
+    review_status: ReviewStatus,
+    generated_at: datetime,
+    rows: list[dict[str, str | int | float]],
+    consent: TeamPrivacyConsent | None,
+) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("README.txt", _EXPORT_README)
+        archive.writestr("reviewed_windows.csv", _render_event_csv(rows))
+        archive.writestr(
+            "manifest.json",
+            _render_event_manifest(
+                video=video,
+                review_status=review_status,
+                generated_at=generated_at,
+                rows=rows,
+            ),
+        )
+        archive.writestr("sportscode.xml", _render_sportscode_xml(rows))
+        archive.writestr(
+            "review_feedback.json",
+            _render_review_feedback_manifest(
+                video=video,
+                review_status=review_status,
+                generated_at=generated_at,
+                rows=rows,
+                consent=consent,
+            ),
+        )
+    return output.getvalue()
 
 
 def _estimated_output_frame(*, video: Video, event_time_ms: int) -> int:
@@ -1950,8 +2164,8 @@ async def export_video_events(
     video_id: uuid.UUID,
     request: Request,
     export_format: Annotated[
-        Literal["csv", "json"],
-        Query(alias="format", description="csv | json"),
+        Literal["csv", "json", "sportscode_xml", "package_zip"],
+        Query(alias="format", description="csv | json | sportscode_xml | package_zip"),
     ] = "csv",
     review_status: Annotated[ReviewStatus, Query()] = ReviewStatus.APPROVED,
     session: AsyncSession = Depends(get_db),
@@ -1984,6 +2198,12 @@ async def export_video_events(
         ).scalars()
     )
     safe_rows = [_safe_event_export_row(row, video=video) for row in rows]
+    generated_at = datetime.now(tz=UTC)
+    consent = (
+        await _latest_active_training_consent(session, team_id=video.team_id)
+        if export_format == "package_zip"
+        else None
+    )
     await write_audit(
         session,
         action=AuditAction.VIDEO_EVENT_EXPORT_CREATED,
@@ -1997,6 +2217,7 @@ async def export_video_events(
             "format": export_format,
             "review_status": review_status.value,
             "event_count": len(safe_rows),
+            "includes_video_bytes": False,
             "not_production_analytics": True,
         },
     )
@@ -2008,28 +2229,44 @@ async def export_video_events(
         team_id=video.team_id,
     )
 
-    filename = f"nextballup-{video.id}-events.{export_format}"
+    extension = _EVENT_EXPORT_FORMAT_EXTENSIONS[export_format]
+    filename = f"nextballup-{video.id}-events.{extension}"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     if export_format == "json":
-        payload = {
-            "schema_version": "nextballup_alpha_event_export_v1",
-            "video_id": str(video.id),
-            "review_status": review_status.value,
-            "generated_at": datetime.now(tz=UTC).isoformat(),
-            "not_production_analytics": True,
-            "events": safe_rows,
-        }
         return Response(
-            content=json.dumps(payload, separators=(",", ":")),
-            media_type="application/json",
+            content=_render_event_manifest(
+                video=video,
+                review_status=review_status,
+                generated_at=generated_at,
+                rows=safe_rows,
+            ),
+            media_type=_EVENT_EXPORT_FORMAT_MEDIA_TYPES[export_format],
+            headers=headers,
+        )
+    if export_format == "sportscode_xml":
+        return Response(
+            content=_render_sportscode_xml(safe_rows),
+            media_type=_EVENT_EXPORT_FORMAT_MEDIA_TYPES[export_format],
+            headers=headers,
+        )
+    if export_format == "package_zip":
+        return Response(
+            content=_render_event_package(
+                video=video,
+                review_status=review_status,
+                generated_at=generated_at,
+                rows=safe_rows,
+                consent=consent,
+            ),
+            media_type=_EVENT_EXPORT_FORMAT_MEDIA_TYPES[export_format],
             headers=headers,
         )
 
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=list(_EVENT_EXPORT_FIELDS))
-    writer.writeheader()
-    writer.writerows(safe_rows)
-    return Response(content=output.getvalue(), media_type="text/csv", headers=headers)
+    return Response(
+        content=_render_event_csv(safe_rows),
+        media_type=_EVENT_EXPORT_FORMAT_MEDIA_TYPES[export_format],
+        headers=headers,
+    )
 
 
 @router.post(

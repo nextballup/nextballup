@@ -620,7 +620,15 @@ describe("VideoPlaybackView", () => {
       "href",
       "/api/v1/videos/v1/events/export?format=csv&review_status=approved",
     );
-    expect(screen.getByRole("link", { name: "JSON" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Sportscode XML" })).toHaveAttribute(
+      "href",
+      "/api/v1/videos/v1/events/export?format=sportscode_xml&review_status=approved",
+    );
+    expect(screen.getByRole("link", { name: "Package" })).toHaveAttribute(
+      "href",
+      "/api/v1/videos/v1/events/export?format=package_zip&review_status=approved",
+    );
+    expect(screen.getByRole("link", { name: "Manifest JSON" })).toHaveAttribute(
       "href",
       "/api/v1/videos/v1/events/export?format=json&review_status=approved",
     );

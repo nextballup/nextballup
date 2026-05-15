@@ -619,7 +619,7 @@ function CandidateReviewPanel({
           </h2>
           <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
             Review only. Not production analytics. Export reviewed windows for
-            coach workflows.
+            coach and editing workflows.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:justify-end">
@@ -630,10 +630,22 @@ function CandidateReviewPanel({
             Export approved CSV
           </a>
           <a
+            href={candidateExportHref(video.id, "sportscode_xml")}
+            className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
+          >
+            Sportscode XML
+          </a>
+          <a
+            href={candidateExportHref(video.id, "package_zip")}
+            className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
+          >
+            Package
+          </a>
+          <a
             href={candidateExportHref(video.id, "json")}
             className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
           >
-            JSON
+            Manifest JSON
           </a>
           <span className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
             {eventsQuery.isLoading
@@ -969,7 +981,9 @@ function buildEventsUrl({
   return `/videos/${videoId}/events?${params.toString()}`;
 }
 
-function candidateExportHref(videoId: string, format: "csv" | "json"): string {
+type CandidateExportFormat = "csv" | "json" | "sportscode_xml" | "package_zip";
+
+function candidateExportHref(videoId: string, format: CandidateExportFormat): string {
   const params = new URLSearchParams({
     format,
     review_status: "approved",

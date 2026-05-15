@@ -6,6 +6,8 @@ import io
 import json
 import time
 import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1930,13 +1932,21 @@ async def test_coach_can_export_approved_event_windows_without_metadata_leak(
         {
             "video_id": str(video_id),
             "event_id": str(approved_id),
+            "label": "Shot attempt",
             "event_type": "shot_attempt",
             "review_status": "approved",
             "source": "alpha_model",
+            "clip_start_seconds": "8.0",
+            "clip_end_seconds": "18.0",
+            "event_seconds": "12.0",
             "clip_start_time_ms": "8000",
             "clip_end_time_ms": "18000",
             "event_time_ms": "12000",
             "created_at": rows[0]["created_at"],
+            "notes": (
+                "Review only. Not production analytics. Direct Hudl cloud export "
+                "is not implemented."
+            ),
         }
     ]
 
@@ -1952,6 +1962,95 @@ async def test_coach_can_export_approved_event_windows_without_metadata_leak(
     )
     assert audit_count == 1
     await clear_worker_context(db_session)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_coach_can_export_editing_package_with_training_governance(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="events-package-coach@example.com"
+    )
+    consent_response = await storage_client.post(
+        f"{API}/teams/{team['id']}/privacy-consents",
+        json=_privacy_consent_body(commercial_ml_training_allowed=True),
+    )
+    assert consent_response.status_code == 201, consent_response.text
+    consent_id = consent_response.json()["id"]
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+    team_id = uuid.UUID(team["id"])
+
+    await set_worker_operator_role(db_session)
+    event = VideoEvent(
+        video_id=video_id,
+        team_id=team_id,
+        event_type=VideoEventType.SHOT_MADE,
+        event_time_ms=12_500,
+        clip_start_time_ms=9_000,
+        clip_end_time_ms=19_000,
+        output_frame=375,
+        shot_clock_enabled=False,
+        review_status=ReviewStatus.APPROVED,
+        event_metadata={
+            "source": "restricted_bard_lora_alpha_video_windows",
+            "raw_prompt": "private prompt",
+            "model_artifact_uri": "s3://private/model",
+        },
+    )
+    db_session.add(event)
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    xml_response = await storage_client.get(
+        f"{API}/videos/{video_id}/events/export?format=sportscode_xml"
+    )
+    assert xml_response.status_code == 200, xml_response.text
+    assert xml_response.headers["content-type"].startswith("application/xml")
+    assert "raw_prompt" not in xml_response.text
+    assert "restricted_bard_lora_alpha_video_windows" not in xml_response.text
+    sportscode = ET.fromstring(xml_response.text)
+    assert sportscode.findtext("./ALL_INSTANCES/instance/code") == "Made shot"
+    assert sportscode.findtext("./ALL_INSTANCES/instance/start") == "9.000"
+    assert sportscode.findtext("./ALL_INSTANCES/instance/end") == "19.000"
+
+    package_response = await storage_client.get(
+        f"{API}/videos/{video_id}/events/export?format=package_zip"
+    )
+    assert package_response.status_code == 200, package_response.text
+    assert package_response.headers["content-type"].startswith("application/zip")
+    with zipfile.ZipFile(io.BytesIO(package_response.content)) as archive:
+        assert set(archive.namelist()) == {
+            "README.txt",
+            "reviewed_windows.csv",
+            "manifest.json",
+            "sportscode.xml",
+            "review_feedback.json",
+        }
+        package_text = "\n".join(archive.read(name).decode() for name in archive.namelist())
+        assert "raw_prompt" not in package_text
+        assert "model_artifact_uri" not in package_text
+        assert "restricted_bard_lora_alpha_video_windows" not in package_text
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["includes_video_bytes"] is False
+        assert manifest["direct_hudl_cloud_export_implemented"] is False
+        feedback = json.loads(archive.read("review_feedback.json"))
+        assert feedback["governance"]["commercial_training_allowed"] is True
+        assert feedback["governance"]["commercial_training_consent_id"] == consent_id
+        assert feedback["governance"]["includes_signed_urls"] is False
+        assert feedback["examples"] == [
+            {
+                "event_id": str(event.id),
+                "video_id": str(video_id),
+                "label": "shot_made",
+                "review_status": "approved",
+                "accepted": True,
+                "source": "alpha_model",
+                "clip_start_time_ms": 9000,
+                "clip_end_time_ms": 19000,
+                "event_time_ms": 12500,
+            }
+        ]
 
 
 @pytest.mark.asyncio(loop_scope="session")
