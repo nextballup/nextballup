@@ -84,7 +84,11 @@ class MultipartMockXHR {
     );
     this.status = 200;
     if (MultipartMockXHR.delayLoad) {
-      window.setTimeout(() => this.onload?.(), 25);
+      // Real-world multipart uploads take seconds; the cancel-path test
+      // needs a generous window between send() and onload so that a slow
+      // CI runner can still click "Cancel upload" before each part
+      // finishes. 25 ms was tight enough to flake on shared runners.
+      window.setTimeout(() => this.onload?.(), 500);
     } else {
       this.onload?.();
     }
