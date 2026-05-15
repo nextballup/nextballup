@@ -1,11 +1,9 @@
 import { MarketingHeader } from "@/components/marketing/header";
 import {
-  FaqSection,
   HeroSection,
+  HomepageTeasers,
   MarketingFooter,
-  SecuritySection,
-  UseCasesSection,
-  WorkflowSection,
+  PilotCallToAction,
 } from "@/components/marketing/sections";
 
 export default function LandingPage() {
@@ -20,10 +18,8 @@ export default function LandingPage() {
       <MarketingHeader />
       <main id="main" className="flex-1">
         <HeroSection />
-        <WorkflowSection />
-        <UseCasesSection />
-        <SecuritySection />
-        <FaqSection />
+        <HomepageTeasers />
+        <PilotCallToAction />
       </main>
       <MarketingFooter />
     </div>

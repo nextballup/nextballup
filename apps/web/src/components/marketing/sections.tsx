@@ -27,7 +27,7 @@ export function HeroSection() {
               Request pilot access
             </Link>
             <Link
-              href="#workflow"
+              href="/product"
               className="rounded-md border border-[color:var(--color-nbu-border)] px-4 py-2.5 text-sm font-medium transition hover:border-[color:var(--color-nbu-text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--color-nbu-text)]"
             >
               See how it works
@@ -284,6 +284,118 @@ export function FaqSection() {
             </div>
           ))}
         </dl>
+      </div>
+    </section>
+  );
+}
+
+const HOMEPAGE_TEASERS: ReadonlyArray<{
+  href: string;
+  eyebrow: string;
+  title: string;
+  body: string;
+}> = [
+  {
+    href: "/product",
+    eyebrow: "Product",
+    title: "Upload, review, tag — in that order.",
+    body: "A five-step workflow that keeps the coach in the loop and the model honest. Upload film, get playback, surface candidates, confirm or reject.",
+  },
+  {
+    href: "/use-cases",
+    eyebrow: "Use cases",
+    title: "Built for the coaches actually pressing play.",
+    body: "High-school programs, club and AAU teams, skills trainers, and small staffs that don't have an editor sitting next to them.",
+  },
+  {
+    href: "/security",
+    eyebrow: "Security & privacy",
+    title: "Defaults that make sense for school and club film.",
+    body: "Restricted access, private storage, coach review required, audit on every change. No public athlete pages, no third-party trackers.",
+  },
+  {
+    href: "/faq",
+    eyebrow: "FAQ",
+    title: "Straight answers about the alpha.",
+    body: "What works today, what doesn't, where the model breaks down, and how invite-only pilot access actually works.",
+  },
+];
+
+export function HomepageTeasers() {
+  return (
+    <section
+      aria-labelledby="teasers-heading"
+      className="border-b border-[color:var(--color-nbu-border)]"
+    >
+      <div className="mx-auto w-full max-w-6xl px-4 py-16 sm:px-6">
+        <div className="max-w-2xl space-y-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+            What&apos;s inside
+          </p>
+          <h2
+            id="teasers-heading"
+            className="text-3xl font-semibold tracking-tight sm:text-4xl"
+          >
+            Pick the part you care about.
+          </h2>
+        </div>
+        <div className="mt-10 grid gap-4 sm:grid-cols-2">
+          {HOMEPAGE_TEASERS.map((teaser) => (
+            <Link
+              key={teaser.href}
+              href={teaser.href}
+              data-testid={`teaser-${teaser.href.replace(/^\/+/, "")}`}
+              className="group block rounded-lg border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-bg)] p-5 transition hover:border-[color:var(--color-nbu-text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--color-nbu-text)]"
+            >
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+                {teaser.eyebrow}
+              </p>
+              <h3 className="mt-2 text-lg font-semibold tracking-tight">
+                {teaser.title}
+              </h3>
+              <p className="mt-2 text-sm text-[color:var(--color-nbu-text-muted)]">
+                {teaser.body}
+              </p>
+              <p className="mt-3 text-xs font-medium text-[color:var(--color-nbu-text)] transition group-hover:underline">
+                Learn more →
+              </p>
+            </Link>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export function PilotCallToAction({
+  eyebrow = "Ready to try the alpha?",
+  body = "Pilot access is invite-only. Tell us about your team and we will reach out when a slot opens.",
+}: {
+  eyebrow?: string;
+  body?: string;
+} = {}) {
+  return (
+    <section
+      aria-labelledby="pilot-cta-heading"
+      className="border-b border-[color:var(--color-nbu-border)]"
+    >
+      <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 px-4 py-12 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+        <div className="max-w-2xl space-y-1">
+          <h2
+            id="pilot-cta-heading"
+            className="text-2xl font-semibold tracking-tight sm:text-3xl"
+          >
+            {eyebrow}
+          </h2>
+          <p className="text-sm text-[color:var(--color-nbu-text-muted)]">{body}</p>
+        </div>
+        <Link
+          href="/pilot"
+          data-testid="cta-pilot"
+          className="self-start rounded-md bg-[color:var(--color-nbu-text)] px-4 py-2.5 text-sm font-medium text-[color:var(--color-nbu-bg)] transition hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[color:var(--color-nbu-text)] sm:self-auto"
+        >
+          Request pilot access
+        </Link>
       </div>
     </section>
   );

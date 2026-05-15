@@ -16,10 +16,10 @@ function productBaseUrl(): string {
 }
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "#workflow", label: "Workflow" },
-  { href: "#use-cases", label: "Use cases" },
-  { href: "#security", label: "Security" },
-  { href: "#faq", label: "FAQ" },
+  { href: "/product", label: "Product" },
+  { href: "/use-cases", label: "Use cases" },
+  { href: "/security", label: "Security" },
+  { href: "/faq", label: "FAQ" },
 ];
 
 export function MarketingHeader() {

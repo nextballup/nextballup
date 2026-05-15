@@ -7,27 +7,39 @@ vi.mock("next/navigation", () => ({
 }));
 
 describe("Marketing home", () => {
-  it("renders headline, workflow steps, security, and FAQ sections", async () => {
+  it("renders the hero and teaser cards linking out to each detail route", async () => {
     await act(async () => {
       render(<LandingPage />);
     });
 
-    // Hero — the prompt asks for "AI-assisted basketball film review" framing.
     const main = screen.getByRole("main");
+    // Hero — the prompt asks for "AI-assisted basketball film review" framing.
     expect(
       within(main).getByRole("heading", { level: 1 }).textContent,
     ).toMatch(/AI-assisted basketball film review/i);
 
-    // Workflow section: at least the five honest steps.
-    expect(within(main).getByText(/1\. Upload game or practice film/i)).toBeInTheDocument();
-    expect(within(main).getByText(/2\. Browser playback/i)).toBeInTheDocument();
-    expect(within(main).getByText(/3\. Alpha detector preview/i)).toBeInTheDocument();
-    expect(within(main).getByText(/4\. Review candidate moments/i)).toBeInTheDocument();
-    expect(within(main).getByText(/5\. Coach confirms, rejects, or tags/i)).toBeInTheDocument();
-
-    // Security and FAQ headings exist.
-    expect(within(main).getByText(/Security & privacy/i)).toBeInTheDocument();
-    expect(within(main).getByText(/Straight answers about the alpha/i)).toBeInTheDocument();
+    // Homepage now teases each detail page via cards instead of inlining
+    // every section. Each card must link to its dedicated route.
+    expect(
+      (screen.getByTestId("teaser-product") as HTMLAnchorElement).getAttribute(
+        "href",
+      ),
+    ).toBe("/product");
+    expect(
+      (screen.getByTestId("teaser-use-cases") as HTMLAnchorElement).getAttribute(
+        "href",
+      ),
+    ).toBe("/use-cases");
+    expect(
+      (screen.getByTestId("teaser-security") as HTMLAnchorElement).getAttribute(
+        "href",
+      ),
+    ).toBe("/security");
+    expect(
+      (screen.getByTestId("teaser-faq") as HTMLAnchorElement).getAttribute(
+        "href",
+      ),
+    ).toBe("/faq");
   });
 
   it("never asserts forbidden marketing phrases without an explicit negation in the same sentence", async () => {
@@ -61,19 +73,6 @@ describe("Marketing home", () => {
     }
   });
 
-  it("explicitly disclaims production analytics in the FAQ", async () => {
-    await act(async () => {
-      render(<LandingPage />);
-    });
-
-    // The FAQ asks whether the alpha is production-grade analytics and
-    // answers "No." The negation must be present somewhere on the page so
-    // visitors who skim the FAQ get the correct read.
-    const body = screen.getByRole("main").textContent ?? "";
-    expect(body).toMatch(/production-grade analytics/i);
-    expect(body).toMatch(/\bno\b\.?\s*the current alpha detector/i);
-  });
-
   it("does not mention competitor or third-party trade names anywhere", async () => {
     await act(async () => {
       render(<LandingPage />);
@@ -103,5 +102,24 @@ describe("Marketing home", () => {
       "https://beta.nextballup.com/login",
     );
     expect(signIn.getAttribute("href")).not.toBe("/login");
+  });
+
+  it("nav links point at routes, not in-page anchors", async () => {
+    await act(async () => {
+      render(<LandingPage />);
+    });
+
+    const nav = screen.getByRole("navigation", { name: /primary/i });
+    const links = within(nav)
+      .getAllByRole("link")
+      .map((link) => link.getAttribute("href") ?? "");
+    expect(links).toEqual(
+      expect.arrayContaining(["/product", "/use-cases", "/security", "/faq"]),
+    );
+    // No anchor-only links anywhere in the primary nav — anchors break on
+    // any page that doesn't have that section (e.g. /pilot).
+    for (const href of links) {
+      expect(href.startsWith("#")).toBe(false);
+    }
   });
 });
