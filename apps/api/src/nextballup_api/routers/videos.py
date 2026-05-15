@@ -82,6 +82,7 @@ from nextballup_core.schemas.video import (
     CompleteUploadResponse,
     CreateUploadRequest,
     CreateUploadResponse,
+    CreateVideoEventRequest,
     GenerateDemoPreviewResponse,
     PlaybackVerifyRequest,
     PlaybackVerifyResponse,
@@ -89,6 +90,7 @@ from nextballup_core.schemas.video import (
     ProcessingStageStatus,
     RequeueProcessingRequest,
     RequeueProcessingResponse,
+    UpdateVideoEventReviewRequest,
     VideoClipProposalsResponse,
     VideoClipProposalSummary,
     VideoDetailResponse,
@@ -1601,6 +1603,34 @@ async def get_video_status(
 # ---- GET /videos/{video_id}/events ----------------------------------------
 
 
+_COACH_REVIEW_STATUSES = frozenset(
+    {ReviewStatus.NEEDS_REVIEW, ReviewStatus.APPROVED, ReviewStatus.REJECTED}
+)
+_MANUAL_EVENT_SOURCE = "coach_manual_alpha_tag"
+
+
+def _video_event_summary(row: VideoEvent) -> VideoEventSummary:
+    return VideoEventSummary(
+        id=row.id,
+        event_type=row.event_type,
+        event_time_ms=row.event_time_ms,
+        output_frame=row.output_frame,
+        period=row.period,
+        game_clock_ms=row.game_clock_ms,
+        shot_clock_enabled=row.shot_clock_enabled,
+        shot_clock_ms=row.shot_clock_ms,
+        primary_track_key=row.primary_track_key,
+        confidence=row.confidence,
+        review_status=row.review_status,
+        created_at=row.created_at,
+    )
+
+
+def _estimated_output_frame(*, video: Video, event_time_ms: int) -> int:
+    fps = video.fps if video.fps is not None and video.fps > 0 else 30.0
+    return max(0, round((event_time_ms / 1000) * fps))
+
+
 @router.get("/{video_id:uuid}/events", response_model=VideoEventsResponse)
 async def list_video_events(
     video_id: uuid.UUID,
@@ -1622,23 +1652,7 @@ async def list_video_events(
         .where(VideoEvent.video_id == video.id)
         .order_by(VideoEvent.event_time_ms, VideoEvent.output_frame)
     )
-    events = [
-        VideoEventSummary(
-            id=row.id,
-            event_type=row.event_type,
-            event_time_ms=row.event_time_ms,
-            output_frame=row.output_frame,
-            period=row.period,
-            game_clock_ms=row.game_clock_ms,
-            shot_clock_enabled=row.shot_clock_enabled,
-            shot_clock_ms=row.shot_clock_ms,
-            primary_track_key=row.primary_track_key,
-            confidence=row.confidence,
-            review_status=row.review_status,
-            created_at=row.created_at,
-        )
-        for row in rows.scalars()
-    ]
+    events = [_video_event_summary(row) for row in rows.scalars()]
     return VideoEventsResponse(
         video_id=video.id,
         shot_clock_enabled=bool(game.shot_clock_enabled) if game is not None else False,
@@ -1648,13 +1662,161 @@ async def list_video_events(
     )
 
 
+@router.post(
+    "/{video_id:uuid}/events", response_model=VideoEventSummary, status_code=status.HTTP_201_CREATED
+)
+async def create_manual_video_event(
+    video_id: uuid.UUID,
+    payload: CreateVideoEventRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+) -> VideoEventSummary:
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    if video.status is not VideoStatus.PROCESSED:
+        raise ConflictError(
+            "Manual video tags can only be added after playback processing finishes",
+            code=ErrorCode.INVALID_VIDEO_STATE,
+            details={"current_status": video.status.value},
+        )
+    duration_ms = int(video.duration_seconds * 1000) if video.duration_seconds else None
+    if duration_ms is not None and payload.event_time_ms > duration_ms:
+        raise ValidationFailedError(
+            "Manual video tag timestamp is outside the video duration",
+            details={"duration_ms": duration_ms},
+        )
+
+    game = await session.get(Game, video.game_id)
+    row = VideoEvent(
+        video_id=video.id,
+        team_id=video.team_id,
+        event_type=payload.event_type,
+        event_time_ms=payload.event_time_ms,
+        output_frame=_estimated_output_frame(video=video, event_time_ms=payload.event_time_ms),
+        shot_clock_enabled=bool(game.shot_clock_enabled) if game is not None else False,
+        confidence=None,
+        review_status=ReviewStatus.NEEDS_REVIEW,
+        event_metadata={
+            "source": _MANUAL_EVENT_SOURCE,
+            "not_production_analytics": True,
+            "review_copy": "Coach-created alpha tag. Review before export.",
+            "clip_pre_ms": 4_000,
+            "clip_post_ms": 6_000,
+        },
+    )
+    session.add(row)
+    await session.flush()
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_EVENT_MANUAL_CREATED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="video_event",
+        resource_id=row.id,
+        team_id=video.team_id,
+        extra={
+            "video_id": str(video.id),
+            "event_type": row.event_type.value,
+            "event_time_ms": row.event_time_ms,
+            "not_production_analytics": True,
+        },
+    )
+    await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=video.team_id,
+    )
+    await session.refresh(row)
+    return _video_event_summary(row)
+
+
+@router.patch(
+    "/{video_id:uuid}/events/{event_id:uuid}/review",
+    response_model=VideoEventSummary,
+)
+async def update_video_event_review(
+    video_id: uuid.UUID,
+    event_id: uuid.UUID,
+    payload: UpdateVideoEventReviewRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_app_settings),
+) -> VideoEventSummary:
+    require_verified_account(current_user, settings=settings)
+    await clear_join_invite_context(session)
+    await clear_tenant_context(session)
+    session.sync_session.expunge_all()
+    video = await _load_video(session, video_id)
+    if video is None:
+        raise NotFoundError("Video not found", code=ErrorCode.VIDEO_NOT_FOUND)
+    await set_tenant_context(session, video.team_id)
+    await require_team_coach(session, user=current_user, team_id=video.team_id)
+
+    if payload.review_status not in _COACH_REVIEW_STATUSES:
+        raise ValidationFailedError(
+            "Coach review can only mark a video event as needs review, approved, or rejected",
+            details={"review_status": payload.review_status.value},
+        )
+    row = await session.scalar(
+        select(VideoEvent).where(VideoEvent.id == event_id, VideoEvent.video_id == video.id)
+    )
+    if row is None:
+        raise NotFoundError("Video event not found", code=ErrorCode.NOT_FOUND)
+
+    previous_status = row.review_status
+    row.review_status = payload.review_status
+    metadata = dict(row.event_metadata or {})
+    metadata["reviewed_at"] = datetime.now(tz=UTC).isoformat()
+    metadata["review_source"] = "coach_review"
+    row.event_metadata = metadata
+    await write_audit(
+        session,
+        action=AuditAction.VIDEO_EVENT_REVIEWED,
+        request=request,
+        actor_user_id=current_user.id,
+        actor_email=current_user.email,
+        resource_type="video_event",
+        resource_id=row.id,
+        team_id=video.team_id,
+        extra={
+            "video_id": str(video.id),
+            "previous_review_status": previous_status.value,
+            "review_status": row.review_status.value,
+            "event_type": row.event_type.value,
+        },
+    )
+    await session.commit()
+    await bind_authenticated_context(
+        session,
+        user_id=current_user.id,
+        role=current_user.role,
+        team_id=video.team_id,
+    )
+    await session.refresh(row)
+    return _video_event_summary(row)
+
+
 # ---- GET /videos/{video_id}/clip-proposals -------------------------------
 
 
 @router.get("/{video_id:uuid}/clip-proposals", response_model=VideoClipProposalsResponse)
 async def list_video_clip_proposals(
     video_id: uuid.UUID,
-    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
     session: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> VideoClipProposalsResponse:

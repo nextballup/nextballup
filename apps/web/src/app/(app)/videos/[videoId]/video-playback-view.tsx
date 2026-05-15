@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { CancelUploadButton } from "@/components/cancel-upload-button";
 import { apiJson, apiVoid } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
@@ -11,9 +11,14 @@ import {
   type GenerateDemoPreviewResponse,
   IMPLEMENTED_PIPELINE_STAGES,
   VIDEO_TERMINAL_STATUSES,
+  type CreateVideoEventRequest,
+  type ReviewStatus,
+  type UpdateVideoEventReviewRequest,
   type UserRole,
   type VideoClipProposalsResponse,
+  type VideoClipProposalSummary,
   type VideoDetailResponse,
+  type VideoEventType,
   type VideoStatusResponse,
 } from "@/lib/contract";
 import { PLAYBACK_STATUS_LABELS } from "@/lib/video-status";
@@ -24,6 +29,28 @@ const WORKER_HEARTBEAT_STALE_MS = 5 * 60 * 1_000;
 // before token_expires_at — 30 s of slack gives the user time to start
 // playback on a slow connection without the URL expiring mid-stream.
 const TOKEN_REFRESH_SLACK_MS = 30_000;
+
+const EVENT_TYPE_LABELS: Record<VideoEventType, string> = {
+  shot_attempt: "Shot attempt",
+  shot_made: "Made shot",
+  rebound: "Rebound",
+  pass: "Pass",
+};
+
+const EVENT_TYPE_OPTIONS: Array<{ value: VideoEventType; label: string }> = [
+  { value: "shot_attempt", label: EVENT_TYPE_LABELS.shot_attempt },
+  { value: "shot_made", label: EVENT_TYPE_LABELS.shot_made },
+  { value: "rebound", label: EVENT_TYPE_LABELS.rebound },
+  { value: "pass", label: EVENT_TYPE_LABELS.pass },
+];
+
+const EVENT_TYPE_FILTERS: Array<{ value: VideoEventType | "all"; label: string }> = [
+  { value: "all", label: "All" },
+  { value: "shot_attempt", label: "Shots" },
+  { value: "rebound", label: "Rebounds" },
+  { value: "pass", label: "Passes" },
+  { value: "shot_made", label: "Made shots" },
+];
 
 export function VideoPlaybackView({
   initialVideo,
@@ -68,6 +95,25 @@ export function VideoPlaybackView({
   });
 
   const video = videoQuery.data ?? initialVideo;
+  const playbackVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  const jumpToPlaybackTime = (timeMs: number) => {
+    const el = playbackVideoRef.current;
+    if (!el) return;
+    el.currentTime = Math.max(0, timeMs / 1_000);
+    el.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    try {
+      const playResult = el.play();
+      if (playResult && "catch" in playResult) {
+        void playResult.catch(() => undefined);
+      }
+    } catch {
+      // Browser autoplay policies can still block playback; seeking is enough.
+    }
+  };
+
+  const getCurrentPlaybackTimeMs = () =>
+    Math.max(0, Math.round((playbackVideoRef.current?.currentTime ?? 0) * 1_000));
 
   // Re-fetch the video (and its signed URL) shortly before token expiry so
   // long-form playback doesn't 403 mid-seek.
@@ -87,7 +133,7 @@ export function VideoPlaybackView({
 
   return (
     <div className="space-y-4">
-      <PlaybackPanel video={video} />
+      <PlaybackPanel video={video} videoRef={playbackVideoRef} />
       <PendingUploadRecoveryPanel video={video} viewerRole={viewerRole} />
       <ActiveProcessingRecoveryPanel
         video={video}
@@ -100,6 +146,8 @@ export function VideoPlaybackView({
         video={video}
         status={statusQuery.data}
         viewerRole={viewerRole}
+        onJumpToTime={jumpToPlaybackTime}
+        getCurrentPlaybackTimeMs={getCurrentPlaybackTimeMs}
       />
       <MetadataPanel video={video} />
       <ProcessingPanel
@@ -354,11 +402,22 @@ function ClipProposalPanel({
   video,
   status,
   viewerRole,
+  onJumpToTime,
+  getCurrentPlaybackTimeMs,
 }: {
   video: VideoDetailResponse;
   status: VideoStatusResponse | undefined;
   viewerRole: UserRole | null;
+  onJumpToTime: (timeMs: number) => void;
+  getCurrentPlaybackTimeMs: () => number;
 }) {
+  const queryClient = useQueryClient();
+  const [eventTypeFilter, setEventTypeFilter] = useState<VideoEventType | "all">(
+    "all",
+  );
+  const [manualEventType, setManualEventType] =
+    useState<VideoEventType>("shot_attempt");
+  const [mutationError, setMutationError] = useState<string | null>(null);
   const canReview = viewerRole === "coach" || viewerRole === "admin";
   const eventStageStatus = status?.stages.events?.status ?? video.processing.events;
   const canLoadProposals =
@@ -372,10 +431,53 @@ function ClipProposalPanel({
         ? POLL_INTERVAL_MS
         : false,
     queryFn: async () =>
-      apiJson<VideoClipProposalsResponse>(`/videos/${video.id}/clip-proposals`),
+      apiJson<VideoClipProposalsResponse>(
+        `/videos/${video.id}/clip-proposals?limit=100`,
+      ),
   });
   const proposals = proposalsQuery.data?.proposals ?? [];
-  const visibleProposals = proposals.slice(0, 5);
+  const visibleProposals = proposals.filter((proposal) =>
+    eventTypeFilter === "all" ? true : proposal.event_type === eventTypeFilter,
+  );
+  const eventTypeCounts = countProposalTypes(proposals);
+  const reviewMutation = useMutation({
+    mutationFn: ({
+      proposal,
+      review_status,
+    }: {
+      proposal: VideoClipProposalSummary;
+      review_status: ReviewStatus;
+    }) =>
+      apiJson(`/videos/${video.id}/events/${proposal.source_event_id}/review`, {
+        method: "PATCH",
+        json: { review_status } satisfies UpdateVideoEventReviewRequest,
+      }),
+    onSuccess: () => {
+      setMutationError(null);
+      queryClient.invalidateQueries({ queryKey: ["video-clip-proposals", video.id] });
+    },
+    onError: (err) => {
+      setMutationError(
+        err instanceof ApiError ? err.message : "Unable to update candidate review.",
+      );
+    },
+  });
+  const manualTagMutation = useMutation({
+    mutationFn: (payload: CreateVideoEventRequest) =>
+      apiJson(`/videos/${video.id}/events`, {
+        method: "POST",
+        json: payload,
+      }),
+    onSuccess: () => {
+      setMutationError(null);
+      queryClient.invalidateQueries({ queryKey: ["video-clip-proposals", video.id] });
+    },
+    onError: (err) => {
+      setMutationError(
+        err instanceof ApiError ? err.message : "Unable to add manual tag.",
+      );
+    },
+  });
 
   if (!canReview || !canLoadProposals) {
     return null;
@@ -400,6 +502,61 @@ function ClipProposalPanel({
           {proposalsQuery.isLoading ? "loading" : `${proposals.length} for review`}
         </span>
       </div>
+      <div className="flex flex-col gap-3 rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2 sm:flex-row sm:items-end sm:justify-between">
+        <div className="flex flex-wrap gap-2">
+          {EVENT_TYPE_FILTERS.map((filter) => (
+            <button
+              key={filter.value}
+              type="button"
+              onClick={() => setEventTypeFilter(filter.value)}
+              className={
+                eventTypeFilter === filter.value
+                  ? "rounded-md border border-[color:var(--color-nbu-text)] px-2 py-1 text-xs font-medium"
+                  : "rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs text-[color:var(--color-nbu-text-muted)] transition hover:border-[color:var(--color-nbu-text)]"
+              }
+            >
+              {filter.label}{" "}
+              <span className="font-mono">
+                {filter.value === "all" ? proposals.length : eventTypeCounts[filter.value]}
+              </span>
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-end gap-2">
+          <label className="flex flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)]">
+            Manual tag
+            <select
+              value={manualEventType}
+              onChange={(event) => setManualEventType(event.target.value as VideoEventType)}
+              className="rounded-md border border-[color:var(--color-nbu-border)] bg-transparent px-2 py-1 text-sm text-[color:var(--color-nbu-text)]"
+            >
+              {EVENT_TYPE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            disabled={manualTagMutation.isPending}
+            onClick={() =>
+              manualTagMutation.mutate({
+                event_type: manualEventType,
+                event_time_ms: getCurrentPlaybackTimeMs(),
+              })
+            }
+            className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+          >
+            {manualTagMutation.isPending ? "Adding..." : "Add tag at current time"}
+          </button>
+        </div>
+      </div>
+      {mutationError ? (
+        <p role="alert" className="text-xs text-[color:var(--color-nbu-error)]">
+          {mutationError}
+        </p>
+      ) : null}
       {proposalsQuery.isLoading ? (
         <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
           Loading clip proposals...
@@ -412,18 +569,17 @@ function ClipProposalPanel({
         <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
           No alpha candidates surfaced for this video.
         </div>
+      ) : visibleProposals.length === 0 ? (
+        <div className="rounded-md border border-dashed border-[color:var(--color-nbu-border)] px-3 py-4 text-xs text-[color:var(--color-nbu-text-muted)]">
+          No {formatEventType(eventTypeFilter)} candidates are waiting for review.
+        </div>
       ) : (
         <div className="space-y-2">
-          {proposals.length > visibleProposals.length ? (
-            <p className="text-xs text-[color:var(--color-nbu-text-muted)]">
-              Showing top {visibleProposals.length} of {proposals.length}.
-            </p>
-          ) : null}
-          <ul className="divide-y divide-[color:var(--color-nbu-border)] rounded-md border border-[color:var(--color-nbu-border)]">
+          <ul className="max-h-[34rem] divide-y divide-[color:var(--color-nbu-border)] overflow-y-auto rounded-md border border-[color:var(--color-nbu-border)]">
             {visibleProposals.map((proposal) => (
               <li
                 key={proposal.id}
-                className="grid gap-2 px-3 py-2 sm:grid-cols-[1fr_auto]"
+                className="grid gap-3 px-3 py-2 sm:grid-cols-[1fr_auto]"
               >
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -437,7 +593,40 @@ function ClipProposalPanel({
                     {proposal.reason}
                   </p>
                 </div>
-                <div className="flex items-start gap-2 sm:justify-end">
+                <div className="flex flex-wrap items-start gap-2 sm:justify-end">
+                  <button
+                    type="button"
+                    onClick={() => onJumpToTime(proposal.start_time_ms)}
+                    className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)]"
+                  >
+                    Jump
+                  </button>
+                  <button
+                    type="button"
+                    disabled={reviewMutation.isPending}
+                    onClick={() =>
+                      reviewMutation.mutate({
+                        proposal,
+                        review_status: "approved",
+                      })
+                    }
+                    className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+                  >
+                    Approve
+                  </button>
+                  <button
+                    type="button"
+                    disabled={reviewMutation.isPending}
+                    onClick={() =>
+                      reviewMutation.mutate({
+                        proposal,
+                        review_status: "rejected",
+                      })
+                    }
+                    className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+                  >
+                    Reject
+                  </button>
                   <span className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-0.5 font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
                     {formatReviewStatus(proposal.review_status)}
                   </span>
@@ -451,7 +640,13 @@ function ClipProposalPanel({
   );
 }
 
-function PlaybackPanel({ video }: { video: VideoDetailResponse }) {
+function PlaybackPanel({
+  video,
+  videoRef,
+}: {
+  video: VideoDetailResponse;
+  videoRef: RefObject<HTMLVideoElement | null>;
+}) {
   if (!video.playback_url || !video.playback_format) {
     const processedWithoutArtifact = video.status === "processed";
     const processingFailed = video.status === "failed";
@@ -491,6 +686,7 @@ function PlaybackPanel({ video }: { video: VideoDetailResponse }) {
       url={video.playback_url}
       format={video.playback_format}
       poster={video.thumbnail_url ?? undefined}
+      videoRef={videoRef}
     />
   );
 }
@@ -859,6 +1055,24 @@ function formatReviewStatus(value: string): string {
   }
 }
 
+function formatEventType(value: VideoEventType | "all"): string {
+  if (value === "all") return "alpha";
+  return EVENT_TYPE_LABELS[value].toLowerCase();
+}
+
+function countProposalTypes(
+  proposals: VideoClipProposalSummary[],
+): Record<VideoEventType, number> {
+  return {
+    shot_attempt: proposals.filter((proposal) => proposal.event_type === "shot_attempt")
+      .length,
+    shot_made: proposals.filter((proposal) => proposal.event_type === "shot_made")
+      .length,
+    rebound: proposals.filter((proposal) => proposal.event_type === "rebound").length,
+    pass: proposals.filter((proposal) => proposal.event_type === "pass").length,
+  };
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
@@ -894,12 +1108,15 @@ function VideoPlayer({
   url,
   format,
   poster,
+  videoRef: externalVideoRef,
 }: {
   url: string;
   format: string;
   poster?: string;
+  videoRef?: RefObject<HTMLVideoElement | null>;
 }) {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const internalVideoRef = useRef<HTMLVideoElement | null>(null);
+  const videoRef = externalVideoRef ?? internalVideoRef;
   const [playbackError, setPlaybackError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -942,7 +1159,7 @@ function VideoPlayer({
       cancelled = true;
       hlsInstance?.destroy();
     };
-  }, [url, format]);
+  }, [url, format, videoRef]);
 
   return (
     <div className="space-y-2">

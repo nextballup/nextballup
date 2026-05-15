@@ -205,6 +205,19 @@ class VideoEventsResponse(BaseModel):
     total: int
 
 
+class CreateVideoEventRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: VideoEventType
+    event_time_ms: int = Field(ge=0)
+
+
+class UpdateVideoEventReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_status: ReviewStatus
+
+
 class VideoClipProposalSummary(BaseModel):
     id: str
     source_event_id: uuid.UUID

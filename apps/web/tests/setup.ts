@@ -67,3 +67,11 @@ Object.defineProperty(HTMLMediaElement.prototype, "canPlayType", {
   configurable: true,
   value: () => "",
 });
+Object.defineProperty(HTMLMediaElement.prototype, "play", {
+  configurable: true,
+  value: () => Promise.resolve(),
+});
+Object.defineProperty(HTMLMediaElement.prototype, "pause", {
+  configurable: true,
+  value: () => undefined,
+});

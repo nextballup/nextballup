@@ -1707,6 +1707,161 @@ async def test_clip_proposals_endpoint_rejects_player_members(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_coach_can_review_alpha_candidate_event(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="candidate-review-coach@example.com"
+    )
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+
+    await set_worker_operator_role(db_session)
+    event = VideoEvent(
+        video_id=video_id,
+        team_id=uuid.UUID(team["id"]),
+        event_type=VideoEventType.SHOT_ATTEMPT,
+        event_time_ms=12_000,
+        output_frame=360,
+        shot_clock_enabled=False,
+        confidence=None,
+        review_status=ReviewStatus.NEEDS_REVIEW,
+        event_metadata={
+            "source": "restricted_bard_lora_alpha_video_windows",
+            "not_production_analytics": True,
+        },
+    )
+    db_session.add(event)
+    await db_session.commit()
+    event_id = event.id
+    await clear_worker_context(db_session)
+
+    response = await storage_client.patch(
+        f"{API}/videos/{video_id}/events/{event_id}/review",
+        json={"review_status": "approved"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == str(event_id)
+    assert body["review_status"] == "approved"
+
+    await set_worker_operator_role(db_session)
+    persisted = await db_session.get(VideoEvent, event_id)
+    assert persisted is not None
+    assert persisted.review_status is ReviewStatus.APPROVED
+    assert persisted.event_metadata is not None
+    assert persisted.event_metadata["review_source"] == "coach_review"
+    audit_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_EVENT_REVIEWED,
+            AuditLog.resource_id == event_id,
+            AuditLog.team_id == uuid.UUID(team["id"]),
+        )
+    )
+    assert audit_count == 1
+    await clear_worker_context(db_session)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_player_cannot_review_alpha_candidate_event(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="candidate-review-owner@example.com"
+    )
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+
+    await set_worker_operator_role(db_session)
+    event = VideoEvent(
+        video_id=video_id,
+        team_id=uuid.UUID(team["id"]),
+        event_type=VideoEventType.REBOUND,
+        event_time_ms=8_000,
+        output_frame=240,
+        shot_clock_enabled=False,
+        review_status=ReviewStatus.NEEDS_REVIEW,
+    )
+    db_session.add(event)
+    await db_session.commit()
+    event_id = event.id
+    await clear_worker_context(db_session)
+
+    await _register(storage_client, _player_payload("candidate-review-player@example.com"))
+    join = await storage_client.post(
+        f"{API}/teams/join",
+        json={"invite_code": team["invite_code"], "jersey_number": 24},
+    )
+    assert join.status_code == 200, join.text
+
+    response = await storage_client.patch(
+        f"{API}/videos/{video_id}/events/{event_id}/review",
+        json={"review_status": "approved"},
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_coach_can_create_manual_alpha_video_event(
+    storage_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    team, game = await _setup_coach_team_game(
+        storage_client, coach_email="manual-event-coach@example.com"
+    )
+    upload = await storage_client.post(f"{API}/videos/upload", json=_upload_body(game["id"]))
+    video_id = uuid.UUID(upload.json()["id"])
+
+    await set_worker_operator_role(db_session)
+    await db_session.execute(
+        update(Video)
+        .where(Video.id == video_id)
+        .values(status=VideoStatus.PROCESSED, duration_seconds=120.0, fps=30.0)
+    )
+    await db_session.commit()
+    await clear_worker_context(db_session)
+
+    response = await storage_client.post(
+        f"{API}/videos/{video_id}/events",
+        json={"event_type": "rebound", "event_time_ms": 42_000},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["event_type"] == "rebound"
+    assert body["event_time_ms"] == 42_000
+    assert body["output_frame"] == 1260
+    assert body["review_status"] == "needs_review"
+
+    event_id = uuid.UUID(body["id"])
+    await set_worker_operator_role(db_session)
+    persisted = await db_session.get(VideoEvent, event_id)
+    assert persisted is not None
+    assert persisted.team_id == uuid.UUID(team["id"])
+    assert persisted.event_metadata == {
+        "source": "coach_manual_alpha_tag",
+        "not_production_analytics": True,
+        "review_copy": "Coach-created alpha tag. Review before export.",
+        "clip_pre_ms": 4_000,
+        "clip_post_ms": 6_000,
+    }
+    audit_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(
+            AuditLog.action == AuditAction.VIDEO_EVENT_MANUAL_CREATED,
+            AuditLog.resource_id == event_id,
+            AuditLog.team_id == uuid.UUID(team["id"]),
+        )
+    )
+    assert audit_count == 1
+    await clear_worker_context(db_session)
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_admin_can_read_cross_team_game_and_video(
     storage_client: AsyncClient, db_session: AsyncSession
 ) -> None:

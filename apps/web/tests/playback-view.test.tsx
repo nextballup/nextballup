@@ -488,6 +488,175 @@ describe("VideoPlaybackView", () => {
     expect(screen.queryByText("84%")).not.toBeInTheDocument();
   });
 
+  it("shows all alpha candidates and jumps playback to a candidate window", async () => {
+    const video = baseVideo({
+      status: "processed",
+      playback_url: "https://signed.example/v1.mp4?sig=abc",
+      playback_format: "mp4",
+      playback_token: "tok",
+      token_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      duration_seconds: 120,
+      processing: { transcode: "completed", events: "completed" },
+    });
+    const proposals = Array.from({ length: 6 }, (_, index) => ({
+      id: `event:00000000-0000-0000-0000-00000000000${index + 1}`,
+      source_event_id: `00000000-0000-0000-0000-00000000000${index + 1}`,
+      event_type: index === 5 ? "rebound" : "shot_attempt",
+      label: index === 5 ? "Rebound" : `Shot attempt ${index + 1}`,
+      reason: "Alpha candidate at 00:12. Coach review required.",
+      start_time_ms: 8_000 + index * 1_000,
+      end_time_ms: 14_000 + index * 1_000,
+      review_status: "needs_review",
+      created_at: "2026-05-11T00:00:00Z",
+    }));
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/clip-proposals", () =>
+        HttpResponse.json({ video_id: "v1", total: proposals.length, proposals }),
+      ),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    const player = (await screen.findByTestId("video-player")) as HTMLVideoElement;
+    expect(await screen.findByText("Shot attempt 1")).toBeInTheDocument();
+    expect(screen.getByText("Shot attempt 5")).toBeInTheDocument();
+    expect(screen.getAllByText("Rebound").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Showing top/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Jump" })[0]);
+    expect(player.currentTime).toBe(8);
+
+    fireEvent.click(screen.getByRole("button", { name: /Rebounds 1/ }));
+    expect(screen.queryByText("Shot attempt 1")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Rebound").length).toBeGreaterThan(0);
+  });
+
+  it("lets coaches approve candidates and create manual tags", async () => {
+    const sourceEventId = "00000000-0000-0000-0000-000000000001";
+    const video = baseVideo({
+      status: "processed",
+      playback_url: "https://signed.example/v1.mp4?sig=abc",
+      playback_format: "mp4",
+      playback_token: "tok",
+      token_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      duration_seconds: 120,
+      processing: { transcode: "completed", events: "completed" },
+    });
+    const reviewRequest = vi.fn();
+    const manualRequest = vi.fn();
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/clip-proposals", () =>
+        HttpResponse.json({
+          video_id: "v1",
+          total: 1,
+          proposals: [
+            {
+              id: `event:${sourceEventId}`,
+              source_event_id: sourceEventId,
+              event_type: "shot_attempt",
+              label: "Shot attempt",
+              reason: "Alpha shot attempt candidate at 00:12. Coach review required.",
+              start_time_ms: 8_000,
+              end_time_ms: 14_000,
+              review_status: "needs_review",
+              created_at: "2026-05-11T00:00:00Z",
+            },
+          ],
+        }),
+      ),
+      http.patch(
+        `/api/v1/videos/v1/events/${sourceEventId}/review`,
+        async ({ request }) => {
+          reviewRequest(await request.json());
+          return HttpResponse.json({
+            id: sourceEventId,
+            event_type: "shot_attempt",
+            event_time_ms: 12_000,
+            output_frame: 360,
+            period: null,
+            game_clock_ms: null,
+            shot_clock_enabled: false,
+            shot_clock_ms: null,
+            primary_track_key: null,
+            confidence: null,
+            review_status: "approved",
+            created_at: "2026-05-11T00:00:00Z",
+          });
+        },
+      ),
+      http.post("/api/v1/videos/v1/events", async ({ request }) => {
+        manualRequest(await request.json());
+        return HttpResponse.json(
+          {
+            id: "00000000-0000-0000-0000-000000000099",
+            event_type: "rebound",
+            event_time_ms: 42_000,
+            output_frame: 1260,
+            period: null,
+            game_clock_ms: null,
+            shot_clock_enabled: false,
+            shot_clock_ms: null,
+            primary_track_key: null,
+            confidence: null,
+            review_status: "needs_review",
+            created_at: "2026-05-11T00:00:00Z",
+          },
+          { status: 201 },
+        );
+      }),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    const player = (await screen.findByTestId("video-player")) as HTMLVideoElement;
+    player.currentTime = 42;
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+    await waitFor(() =>
+      expect(reviewRequest).toHaveBeenCalledWith({ review_status: "approved" }),
+    );
+
+    fireEvent.change(screen.getByLabelText("Manual tag"), {
+      target: { value: "rebound" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add tag at current time" }));
+    await waitFor(() =>
+      expect(manualRequest).toHaveBeenCalledWith({
+        event_type: "rebound",
+        event_time_ms: 42_000,
+      }),
+    );
+  });
+
   it("hides clip proposals from players", async () => {
     const proposalRequest = vi.fn();
     server.use(

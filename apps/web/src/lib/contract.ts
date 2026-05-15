@@ -338,6 +338,15 @@ export type VideoClipProposalsResponse = {
   total: number;
 };
 
+export type CreateVideoEventRequest = {
+  event_type: VideoEventType;
+  event_time_ms: number;
+};
+
+export type UpdateVideoEventReviewRequest = {
+  review_status: ReviewStatus;
+};
+
 export type GenerateDemoPreviewResponse = {
   status: DemoPreviewStatus;
   preview_url: string | null;
