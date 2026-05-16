@@ -7,7 +7,14 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import { CancelUploadButton } from "@/components/cancel-upload-button";
 import { apiJson, apiVoid } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
@@ -80,6 +87,38 @@ const SOURCE_LABELS: Record<VideoEventSource, string> = {
   manual: "Manual tag",
 };
 
+const EVENT_TYPE_THEME: Record<
+  VideoEventType,
+  {
+    dotClass: string;
+    markerClass: string;
+    rowBorderClass: string;
+  }
+> = {
+  shot_attempt: {
+    dotClass: "bg-sky-500",
+    markerClass: "bg-sky-500 hover:bg-sky-400 focus-visible:ring-sky-500",
+    rowBorderClass: "border-l-sky-500",
+  },
+  shot_made: {
+    dotClass: "bg-emerald-500",
+    markerClass:
+      "bg-emerald-500 hover:bg-emerald-400 focus-visible:ring-emerald-500",
+    rowBorderClass: "border-l-emerald-500",
+  },
+  rebound: {
+    dotClass: "bg-amber-500",
+    markerClass: "bg-amber-500 hover:bg-amber-400 focus-visible:ring-amber-500",
+    rowBorderClass: "border-l-amber-500",
+  },
+  pass: {
+    dotClass: "bg-fuchsia-500",
+    markerClass:
+      "bg-fuchsia-500 hover:bg-fuchsia-400 focus-visible:ring-fuchsia-500",
+    rowBorderClass: "border-l-fuchsia-500",
+  },
+};
+
 const REVIEW_STATUS_BADGE_CLASS: Record<ReviewStatus, string> = {
   needs_review:
     "rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]",
@@ -94,6 +133,7 @@ const REVIEW_STATUS_BADGE_CLASS: Record<ReviewStatus, string> = {
 const EVENTS_PAGE_SIZE = 50;
 const DEFAULT_CLIP_PRE_MS = 4_000;
 const DEFAULT_CLIP_POST_MS = 6_000;
+const MAX_REVIEW_WINDOW_MS = 60_000;
 
 const EMPTY_SUMMARY: VideoEventsResponse["summary"] = {
   total: 0,
@@ -149,6 +189,9 @@ export function VideoPlaybackView({
 
   const video = videoQuery.data ?? initialVideo;
   const playbackVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [candidateTimelineEvents, setCandidateTimelineEvents] = useState<
+    VideoEventSummary[]
+  >([]);
 
   const jumpToPlaybackTime = (timeMs: number) => {
     const el = playbackVideoRef.current;
@@ -167,6 +210,13 @@ export function VideoPlaybackView({
 
   const getCurrentPlaybackTimeMs = () =>
     Math.max(0, Math.round((playbackVideoRef.current?.currentTime ?? 0) * 1_000));
+
+  const handleCandidateTimelineEventsChange = useCallback(
+    (events: VideoEventSummary[]) => {
+      setCandidateTimelineEvents(events);
+    },
+    [],
+  );
 
   // Re-fetch the video (and its signed URL) shortly before token expiry so
   // long-form playback doesn't 403 mid-seek.
@@ -190,6 +240,12 @@ export function VideoPlaybackView({
     viewerRole,
   );
 
+  useEffect(() => {
+    if (!showCandidateReview) {
+      setCandidateTimelineEvents([]);
+    }
+  }, [showCandidateReview]);
+
   return (
     <div className="space-y-4">
       {showCandidateReview ? (
@@ -197,13 +253,19 @@ export function VideoPlaybackView({
           data-testid="playback-review-row"
           className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] lg:items-start"
         >
-          <PlaybackPanel video={video} videoRef={playbackVideoRef} />
+          <PlaybackPanel
+            video={video}
+            videoRef={playbackVideoRef}
+            timelineEvents={candidateTimelineEvents}
+            onJumpToTime={jumpToPlaybackTime}
+          />
           <CandidateReviewPanel
             video={video}
             status={statusQuery.data}
             viewerRole={viewerRole}
             onJumpToTime={jumpToPlaybackTime}
             getCurrentPlaybackTimeMs={getCurrentPlaybackTimeMs}
+            onTimelineEventsChange={handleCandidateTimelineEventsChange}
           />
         </div>
       ) : (
@@ -482,12 +544,14 @@ function CandidateReviewPanel({
   viewerRole,
   onJumpToTime,
   getCurrentPlaybackTimeMs,
+  onTimelineEventsChange,
 }: {
   video: VideoDetailResponse;
   status: VideoStatusResponse | undefined;
   viewerRole: UserRole | null;
   onJumpToTime: (timeMs: number) => void;
   getCurrentPlaybackTimeMs: () => number;
+  onTimelineEventsChange: (events: VideoEventSummary[]) => void;
 }) {
   const queryClient = useQueryClient();
   const [reviewStatusFilter, setReviewStatusFilter] =
@@ -499,6 +563,12 @@ function CandidateReviewPanel({
   const [searchText, setSearchText] = useState("");
   const [manualEventType, setManualEventType] =
     useState<VideoEventType>("shot_attempt");
+  const [manualPreSeconds, setManualPreSeconds] = useState(
+    formatClipTimeInput(DEFAULT_CLIP_PRE_MS),
+  );
+  const [manualPostSeconds, setManualPostSeconds] = useState(
+    formatClipTimeInput(DEFAULT_CLIP_POST_MS),
+  );
   const [mutationError, setMutationError] = useState<string | null>(null);
 
   const isVisible = shouldShowCandidateReview(video, status, viewerRole);
@@ -546,6 +616,10 @@ function CandidateReviewPanel({
     if (!needle) return events;
     return events.filter((event) => buildSearchIndex(event).includes(needle));
   }, [events, searchText]);
+
+  useEffect(() => {
+    onTimelineEventsChange(isVisible ? visibleEvents : []);
+  }, [isVisible, onTimelineEventsChange, visibleEvents]);
 
   const reviewMutation = useMutation({
     mutationFn: ({
@@ -753,15 +827,48 @@ function CandidateReviewPanel({
                 ))}
               </select>
             </label>
+            <label className="flex flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)]">
+              Pre-roll (s)
+              <input
+                type="number"
+                min="0"
+                max="60"
+                step="0.5"
+                value={manualPreSeconds}
+                onChange={(event) => setManualPreSeconds(event.target.value)}
+                data-testid="manual-tag-pre-roll"
+                className="w-20 rounded-md border border-[color:var(--color-nbu-border)] bg-transparent px-2 py-1 font-mono text-sm text-[color:var(--color-nbu-text)]"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-[color:var(--color-nbu-text-muted)]">
+              Post-roll (s)
+              <input
+                type="number"
+                min="0"
+                max="60"
+                step="0.5"
+                value={manualPostSeconds}
+                onChange={(event) => setManualPostSeconds(event.target.value)}
+                data-testid="manual-tag-post-roll"
+                className="w-20 rounded-md border border-[color:var(--color-nbu-border)] bg-transparent px-2 py-1 font-mono text-sm text-[color:var(--color-nbu-text)]"
+              />
+            </label>
             <button
               type="button"
               disabled={manualTagMutation.isPending}
               onClick={() => {
                 const eventTimeMs = getCurrentPlaybackTimeMs();
-                const [clipStartTimeMs, clipEndTimeMs] = defaultClipWindow(
+                const resolvedWindow = manualClipWindow(
                   eventTimeMs,
                   video.duration_seconds,
+                  manualPreSeconds,
+                  manualPostSeconds,
                 );
+                if (typeof resolvedWindow === "string") {
+                  setMutationError(resolvedWindow);
+                  return;
+                }
+                const [clipStartTimeMs, clipEndTimeMs] = resolvedWindow;
                 manualTagMutation.mutate({
                   event_type: manualEventType,
                   event_time_ms: eventTimeMs,
@@ -771,7 +878,7 @@ function CandidateReviewPanel({
               }}
               className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
             >
-              {manualTagMutation.isPending ? "Adding..." : "Add 10s tag"}
+              {manualTagMutation.isPending ? "Adding..." : "Add tag at playhead"}
             </button>
           </div>
         </div>
@@ -883,9 +990,16 @@ function CandidateEventRow({
   };
 
   return (
-    <li data-testid="candidate-row" className="grid gap-3 px-3 py-2">
+    <li
+      data-testid="candidate-row"
+      className={`grid gap-3 border-l-4 px-3 py-2 ${EVENT_TYPE_THEME[event.event_type].rowBorderClass}`}
+    >
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span
+            aria-hidden="true"
+            className={`h-2.5 w-2.5 rounded-full ${EVENT_TYPE_THEME[event.event_type].dotClass}`}
+          />
           <span className="font-medium">{EVENT_TYPE_LABELS[event.event_type]}</span>
           <span className="font-mono text-xs text-[color:var(--color-nbu-text-muted)]">
             Moment {formatClipTime(event.event_time_ms)}
@@ -1006,9 +1120,13 @@ function buildSearchIndex(event: VideoEventSummary): string {
 function PlaybackPanel({
   video,
   videoRef,
+  timelineEvents = [],
+  onJumpToTime,
 }: {
   video: VideoDetailResponse;
   videoRef: RefObject<HTMLVideoElement | null>;
+  timelineEvents?: VideoEventSummary[];
+  onJumpToTime?: (timeMs: number) => void;
 }) {
   if (!video.playback_url || !video.playback_format) {
     const processedWithoutArtifact = video.status === "processed";
@@ -1050,6 +1168,9 @@ function PlaybackPanel({
       format={video.playback_format}
       poster={video.thumbnail_url ?? undefined}
       videoRef={videoRef}
+      timelineEvents={timelineEvents}
+      durationSeconds={video.duration_seconds}
+      onJumpToTime={onJumpToTime}
     />
   );
 }
@@ -1418,17 +1539,34 @@ function parseClipTimeInput(value: string): number | null {
   return Math.round(seconds * 1_000);
 }
 
-function defaultClipWindow(
+function manualClipWindow(
   eventTimeMs: number,
   durationSeconds: number | null | undefined,
-): [number, number] {
+  preSecondsValue: string,
+  postSecondsValue: string,
+): [number, number] | string {
+  const preMs = parseClipTimeInput(preSecondsValue);
+  const postMs = parseClipTimeInput(postSecondsValue);
+  if (preMs === null || postMs === null) {
+    return "Enter valid pre-roll and post-roll values.";
+  }
+  if (preMs + postMs <= 0) {
+    return "Manual tag window must be longer than zero seconds.";
+  }
+  if (preMs + postMs > MAX_REVIEW_WINDOW_MS) {
+    return "Manual tag window cannot exceed 60 seconds.";
+  }
   const durationMs =
     durationSeconds !== null && durationSeconds !== undefined
       ? Math.round(durationSeconds * 1_000)
       : null;
-  const start = Math.max(0, eventTimeMs - DEFAULT_CLIP_PRE_MS);
-  const end = eventTimeMs + DEFAULT_CLIP_POST_MS;
-  return [start, durationMs === null ? end : Math.min(end, durationMs)];
+  const start = Math.max(0, eventTimeMs - preMs);
+  const end =
+    durationMs === null ? eventTimeMs + postMs : Math.min(eventTimeMs + postMs, durationMs);
+  if (start >= end) {
+    return "Manual tag window must start before it ends.";
+  }
+  return [start, end];
 }
 
 function formatReviewStatus(value: string): string {
@@ -1482,11 +1620,17 @@ function VideoPlayer({
   format,
   poster,
   videoRef: externalVideoRef,
+  timelineEvents = [],
+  durationSeconds,
+  onJumpToTime,
 }: {
   url: string;
   format: string;
   poster?: string;
   videoRef?: RefObject<HTMLVideoElement | null>;
+  timelineEvents?: VideoEventSummary[];
+  durationSeconds?: number | null;
+  onJumpToTime?: (timeMs: number) => void;
 }) {
   const internalVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRef = externalVideoRef ?? internalVideoRef;
@@ -1558,6 +1702,84 @@ function VideoPlayer({
           {playbackError}
         </p>
       )}
+      {onJumpToTime ? (
+        <CandidateTimeline
+          events={timelineEvents}
+          durationSeconds={durationSeconds}
+          onJumpToTime={onJumpToTime}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function CandidateTimeline({
+  events,
+  durationSeconds,
+  onJumpToTime,
+}: {
+  events: VideoEventSummary[];
+  durationSeconds: number | null | undefined;
+  onJumpToTime: (timeMs: number) => void;
+}) {
+  const durationMs =
+    durationSeconds !== null && durationSeconds !== undefined
+      ? Math.max(1, Math.round(durationSeconds * 1_000))
+      : null;
+  if (durationMs === null || events.length === 0) return null;
+
+  return (
+    <div
+      data-testid="candidate-timeline"
+      className="space-y-2 rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-surface)] px-3 py-2"
+    >
+      <div className="relative h-10 overflow-hidden rounded-md border border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-background)]">
+        {events.map((event) => {
+          const start = Math.min(
+            Math.max(0, event.clip_start_time_ms),
+            Math.max(0, durationMs - 1),
+          );
+          const end = Math.min(
+            Math.max(start + 1, event.clip_end_time_ms),
+            durationMs,
+          );
+          const left = (start / durationMs) * 100;
+          const width = Math.max(0.75, ((end - start) / durationMs) * 100);
+          const safeWidth = Math.min(width, 100 - left);
+          const laneIndex = EVENT_TYPE_OPTIONS.findIndex(
+            (option) => option.value === event.event_type,
+          );
+          const top = 7 + Math.max(0, laneIndex) * 7;
+          return (
+            <button
+              key={event.id}
+              type="button"
+              title={`${EVENT_TYPE_LABELS[event.event_type]} ${formatClipWindow(event.clip_start_time_ms, event.clip_end_time_ms)}`}
+              aria-label={`${EVENT_TYPE_LABELS[event.event_type]} at ${formatClipTime(event.event_time_ms)}`}
+              data-testid="candidate-timeline-marker"
+              onClick={() => onJumpToTime(event.event_time_ms)}
+              className={`absolute h-1.5 rounded-full opacity-80 outline-none transition focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-[color:var(--color-nbu-surface)] ${EVENT_TYPE_THEME[event.event_type].markerClass}`}
+              style={{
+                left: `${left}%`,
+                top,
+                minWidth: "0.75rem",
+                width: `${safeWidth}%`,
+              }}
+            />
+          );
+        })}
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-[color:var(--color-nbu-text-muted)]">
+        {EVENT_TYPE_OPTIONS.map((option) => (
+          <span key={option.value} className="inline-flex items-center gap-1">
+            <span
+              aria-hidden="true"
+              className={`h-2 w-2 rounded-full ${EVENT_TYPE_THEME[option.value].dotClass}`}
+            />
+            {option.label}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }

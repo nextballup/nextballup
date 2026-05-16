@@ -635,8 +635,15 @@ describe("VideoPlaybackView", () => {
 
     const player = (await screen.findByTestId("video-player")) as HTMLVideoElement;
     const list = await screen.findByTestId("candidate-review-list");
+    const timeline = await screen.findByTestId("candidate-timeline");
     expect(within(list).getAllByText("Shot attempt")).toHaveLength(5);
     expect(within(list).getAllByText("Rebound").length).toBeGreaterThan(0);
+    expect(within(timeline).getAllByTestId("candidate-timeline-marker")).toHaveLength(
+      6,
+    );
+
+    fireEvent.click(within(timeline).getAllByTestId("candidate-timeline-marker")[0]);
+    expect(player.currentTime).toBe(8);
 
     fireEvent.click(within(list).getAllByRole("button", { name: "Jump" })[0]);
     expect(player.currentTime).toBe(4);
@@ -1049,15 +1056,105 @@ describe("VideoPlaybackView", () => {
     fireEvent.change(screen.getByLabelText("Manual tag"), {
       target: { value: "rebound" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Add 10s tag" }));
+    fireEvent.change(screen.getByTestId("manual-tag-pre-roll"), {
+      target: { value: "2" },
+    });
+    fireEvent.change(screen.getByTestId("manual-tag-post-roll"), {
+      target: { value: "8" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add tag at playhead" }));
     await waitFor(() =>
       expect(manualRequest).toHaveBeenCalledWith({
         event_type: "rebound",
         event_time_ms: 42_000,
-        clip_start_time_ms: 38_000,
-        clip_end_time_ms: 48_000,
+        clip_start_time_ms: 40_000,
+        clip_end_time_ms: 50_000,
       }),
     );
+  });
+
+  it("blocks manual tag windows that exceed the reviewed-window limit", async () => {
+    const video = baseVideo({
+      status: "processed",
+      playback_url: "https://signed.example/v1.mp4?sig=abc",
+      playback_format: "mp4",
+      playback_token: "tok",
+      token_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      duration_seconds: 600,
+      processing: { transcode: "completed", events: "completed" },
+    });
+    const manualRequest = vi.fn();
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/events", () =>
+        HttpResponse.json({
+          video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
+          total: 1,
+          next_cursor: null,
+          summary: {
+            total: 1,
+            needs_review: 1,
+            approved: 0,
+            rejected: 0,
+            machine_only: 0,
+            alpha_model_source: 1,
+            manual_source: 0,
+          },
+          events: [
+            buildEvent({
+              id: "00000000-0000-0000-0000-000000000401",
+              event_type: "shot_attempt",
+              event_time_ms: 12_000,
+              review_status: "needs_review",
+            }),
+          ],
+        }),
+      ),
+      http.post("/api/v1/videos/v1/events", async ({ request }) => {
+        manualRequest(await request.json());
+        return HttpResponse.json(
+          buildEvent({
+            id: "00000000-0000-0000-0000-000000000402",
+            event_type: "shot_attempt",
+            event_time_ms: 42_000,
+          }),
+          { status: 201 },
+        );
+      }),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    const player = (await screen.findByTestId("video-player")) as HTMLVideoElement;
+    player.currentTime = 42;
+    fireEvent.change(screen.getByTestId("manual-tag-pre-roll"), {
+      target: { value: "61" },
+    });
+    fireEvent.change(screen.getByTestId("manual-tag-post-roll"), {
+      target: { value: "0" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add tag at playhead" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Manual tag window cannot exceed 60 seconds.",
+    );
+    expect(manualRequest).not.toHaveBeenCalled();
   });
 
   it("hides the candidate review panel from players and does not query candidates", async () => {
