@@ -8,6 +8,7 @@ RLS-gated INSERTs go through the audited code paths.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import time
@@ -126,6 +127,7 @@ class FakeWorkerStorage:
         # Toggle to simulate object gone missing mid-pipeline.
         self.drop_keys: set[str] = set()
         self.head_fail_keys: set[str] = set()
+        self.head_fail_details: dict[str, dict[str, Any]] = {}
         self.delete_fail_keys: set[str] = set()
         self.abort_fail_upload_ids: set[str] = set()
 
@@ -182,7 +184,10 @@ class FakeWorkerStorage:
         if key in self.head_fail_keys:
             from nextballup_api.storage import StorageFailureError
 
-            raise StorageFailureError("Simulated storage failure", details={"key": key})
+            raise StorageFailureError(
+                "Simulated storage failure",
+                details=self.head_fail_details.get(key, {"key": key}),
+            )
         if key in self.drop_keys:
             return None
         size = self.object_sizes.get(key)
@@ -1208,19 +1213,30 @@ async def test_execute_transcode_transient_error_leaves_job_retryable(
     storage_client: AsyncClient,
     db_session: AsyncSession,
     fake_storage: FakeWorkerStorage,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     team_id, video_id, job_id = await _seed_queued_video(
         storage_client, coach_email="trans-coach@example.com"
     )
     video = await _load_video(db_session, video_id)
     assert video.storage_key_raw is not None
-    fake_storage.head_fail_keys.add(video.storage_key_raw)
+    raw_key = video.storage_key_raw
+    fake_storage.head_fail_keys.add(raw_key)
+    fake_storage.head_fail_details[raw_key] = {
+        "operation": "head_object",
+        "provider_error_code": "AccessDenied",
+        "http_status_code": 403,
+        "exception_type": "ClientError",
+        "storage_key_sha256": "abc123",
+        "key": raw_key,
+    }
 
-    result = await execute_transcode(
-        db_session,
-        job_id=job_id,
-        storage=fake_storage,
-    )
+    with caplog.at_level(logging.WARNING, logger="nextballup_worker.runtime.transcode"):
+        result = await execute_transcode(
+            db_session,
+            job_id=job_id,
+            storage=fake_storage,
+        )
     assert result.status == "failed"
     assert result.retryable is True
     assert result.error_code == ErrorCode.PROCESSING_STORAGE_FAILURE
@@ -1231,10 +1247,38 @@ async def test_execute_transcode_transient_error_leaves_job_retryable(
     assert (job.result_metadata or {}).get(
         "last_error_code"
     ) == ErrorCode.PROCESSING_STORAGE_FAILURE
+    diagnostics = (job.result_metadata or {}).get("last_error_details")
+    assert diagnostics == {
+        "storage_failure": {
+            "operation": "head_object",
+            "provider_error_code": "AccessDenied",
+            "http_status_code": 403,
+            "exception_type": "ClientError",
+            "storage_key_sha256": "abc123",
+        }
+    }
+    assert raw_key not in repr(diagnostics)
     assert job.error_message is None
 
     video = await _load_video(db_session, video_id)
     assert video.status is VideoStatus.QUEUED
+
+    await set_worker_operator_role(db_session)
+    audit = await db_session.scalar(
+        select(AuditLog)
+        .where(
+            AuditLog.team_id == team_id,
+            AuditLog.action == AuditAction.VIDEO_PROCESSING_FAILED,
+        )
+        .order_by(AuditLog.created_at.desc())
+    )
+    await clear_worker_context(db_session)
+    assert audit is not None
+    assert audit.extra is not None
+    assert audit.extra["storage_failure"]["provider_error_code"] == "AccessDenied"
+    assert raw_key not in repr(audit.extra)
+    assert "provider_error_code=AccessDenied" in caplog.text
+    assert raw_key not in caplog.text
 
     assert (
         await _count_actions(

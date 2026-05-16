@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import math
 import re
@@ -239,12 +240,24 @@ class S3StoragePresigner:
             response: dict[str, Any] = self._client.head_object(Bucket=self._bucket, Key=key)
             return response
         except ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code", "")
+            details = _storage_client_error_details(
+                operation="head_object",
+                key=key,
+                exc=exc,
+            )
+            error_code = details.get("provider_error_code", "")
             if error_code in {"404", "NoSuchKey", "NotFound"}:
                 return None
-            raise StorageFailureError("Storage head_object failed", details={"key": key}) from exc
+            raise StorageFailureError("Storage head_object failed", details=details) from exc
         except BotoCoreError as exc:
-            raise StorageFailureError("Storage head_object failed", details={"key": key}) from exc
+            raise StorageFailureError(
+                "Storage head_object failed",
+                details=_storage_boto_error_details(
+                    operation="head_object",
+                    key=key,
+                    exc=exc,
+                ),
+            ) from exc
 
     def presign_get(
         self, *, key: str, expires_in: int, response_content_type: str | None = None
@@ -303,6 +316,58 @@ def get_storage_presigner(settings: Settings) -> StoragePresigner | None:
     if not settings.storage_configured():
         return None
     return S3StoragePresigner(settings)
+
+
+def _storage_key_sha256(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _safe_storage_token(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    token = re.sub(r"[^A-Za-z0-9_.:-]", "_", value)
+    return token[:160] if token else None
+
+
+def _storage_client_error_details(
+    *,
+    operation: str,
+    key: str,
+    exc: ClientError,
+) -> dict[str, Any]:
+    response = exc.response if isinstance(exc.response, dict) else {}
+    error = response.get("Error", {})
+    metadata = response.get("ResponseMetadata", {})
+    details: dict[str, Any] = {
+        "operation": operation,
+        "storage_key_sha256": _storage_key_sha256(key),
+        "exception_type": type(exc).__name__,
+    }
+    if isinstance(error, dict):
+        provider_code = _safe_storage_token(error.get("Code"))
+        if provider_code:
+            details["provider_error_code"] = provider_code
+    if isinstance(metadata, dict):
+        status_code = metadata.get("HTTPStatusCode")
+        if isinstance(status_code, int):
+            details["http_status_code"] = status_code
+        request_id = _safe_storage_token(metadata.get("RequestId"))
+        if request_id:
+            details["request_id"] = request_id
+    return details
+
+
+def _storage_boto_error_details(
+    *,
+    operation: str,
+    key: str,
+    exc: BotoCoreError,
+) -> dict[str, Any]:
+    return {
+        "operation": operation,
+        "storage_key_sha256": _storage_key_sha256(key),
+        "exception_type": type(exc).__name__,
+    }
 
 
 async def storage_presign_upload(

@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import cast
 
 import pytest
+from botocore.exceptions import ClientError
 from nextballup_api.storage import (
     S3StoragePresigner,
     StorageFailureError,
@@ -102,6 +103,48 @@ def test_s3_multipart_requires_provider_upload_id(monkeypatch: pytest.MonkeyPatc
             content_type="video/quicktime",
             file_size_bytes=2 * 1024 * 1024 * 1024,
         )
+
+
+def test_s3_head_object_failure_keeps_sanitized_provider_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingHeadClient:
+        def head_object(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs["Bucket"] == "nextballup-alpha-raw"
+            assert kwargs["Key"] == "raw/team-secret/video-secret/clip.mov"
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "SignatureDoesNotMatch",
+                        "Message": "credential scope contains test-secret-key",
+                    },
+                    "ResponseMetadata": {
+                        "HTTPStatusCode": 403,
+                        "RequestId": "r2-request-123",
+                    },
+                },
+                "HeadObject",
+            )
+
+    monkeypatch.setattr(
+        "nextballup_api.storage.boto3.client",
+        lambda *_args, **_kwargs: _FailingHeadClient(),
+    )
+    presigner = S3StoragePresigner(_storage_settings())
+
+    with pytest.raises(StorageFailureError) as exc_info:
+        presigner.head_object(key="raw/team-secret/video-secret/clip.mov")
+
+    details = exc_info.value.details
+    assert details["operation"] == "head_object"
+    assert details["provider_error_code"] == "SignatureDoesNotMatch"
+    assert details["http_status_code"] == 403
+    assert details["request_id"] == "r2-request-123"
+    assert "storage_key_sha256" in details
+    serialized = repr(details)
+    assert "raw/team-secret/video-secret/clip.mov" not in serialized
+    assert "test-secret-key" not in serialized
+    assert "credential scope" not in serialized
 
 
 def test_s3_multipart_presign_uses_r2_compatible_shape(

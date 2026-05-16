@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import time
 import uuid
 from contextlib import suppress
@@ -48,6 +49,19 @@ from nextballup_worker.tenant import (
     clear_worker_context,
     set_worker_context,
     set_worker_operator_role,
+)
+
+logger = logging.getLogger(__name__)
+
+_STORAGE_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "operation",
+        "provider_error_code",
+        "http_status_code",
+        "request_id",
+        "exception_type",
+        "storage_key_sha256",
+    }
 )
 
 
@@ -128,9 +142,20 @@ async def _verify_storage(
     try:
         metadata = await storage_head_object(presigner, key=key)
     except StorageFailureError as exc:
+        storage_failure = _sanitized_storage_failure_details(exc)
+        logger.warning(
+            "Transcode storage verification failed: operation=%s provider_error_code=%s "
+            "http_status_code=%s exception_type=%s storage_key_sha256=%s",
+            storage_failure.get("operation", "unknown"),
+            storage_failure.get("provider_error_code", "unknown"),
+            storage_failure.get("http_status_code", "unknown"),
+            storage_failure.get("exception_type", "unknown"),
+            storage_failure.get("storage_key_sha256", "unknown"),
+        )
         raise TransientProcessingError(
             "Storage head_object failed",
             code=ErrorCode.PROCESSING_STORAGE_FAILURE,
+            details={"storage_failure": storage_failure} if storage_failure else None,
         ) from exc
 
     if metadata is None:
@@ -552,6 +577,8 @@ async def _handle_task_failure(
         merged_meta["attempt"] = attempt
         merged_meta["last_error"] = error_message
         merged_meta["last_error_code"] = error_code
+        if isinstance(error_details, dict):
+            merged_meta["last_error_details"] = error_details
         await release_job_for_retry(
             session,
             job_id=job.id,
@@ -623,3 +650,18 @@ async def _handle_task_failure(
     await session.commit()
     await clear_worker_context(session)
     return TranscodeResult(job_id=job.id, status="failed", retryable=False, error_code=error_code)
+
+
+def _sanitized_storage_failure_details(exc: StorageFailureError) -> dict[str, Any]:
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key, value in details.items():
+        if key not in _STORAGE_DIAGNOSTIC_KEYS:
+            continue
+        if isinstance(value, str):
+            sanitized[key] = value[:256]
+        elif isinstance(value, int):
+            sanitized[key] = value
+    return sanitized
