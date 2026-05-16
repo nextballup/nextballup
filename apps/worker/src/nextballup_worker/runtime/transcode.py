@@ -17,6 +17,7 @@ from nextballup_api.storage import (
     get_storage_presigner,
     normalize_etag,
     storage_delete_object,
+    storage_failure_diagnostics,
     storage_head_object,
 )
 from sqlalchemy import select, update
@@ -52,17 +53,6 @@ from nextballup_worker.tenant import (
 )
 
 logger = logging.getLogger(__name__)
-
-_STORAGE_DIAGNOSTIC_KEYS = frozenset(
-    {
-        "operation",
-        "provider_error_code",
-        "http_status_code",
-        "request_id",
-        "exception_type",
-        "storage_key_sha256",
-    }
-)
 
 
 def _metadata_checksum_sha256(metadata: dict[str, Any]) -> str | None:
@@ -142,7 +132,7 @@ async def _verify_storage(
     try:
         metadata = await storage_head_object(presigner, key=key)
     except StorageFailureError as exc:
-        storage_failure = _sanitized_storage_failure_details(exc)
+        storage_failure = storage_failure_diagnostics(exc)
         logger.warning(
             "Transcode storage verification failed: operation=%s provider_error_code=%s "
             "http_status_code=%s exception_type=%s storage_key_sha256=%s",
@@ -650,18 +640,3 @@ async def _handle_task_failure(
     await session.commit()
     await clear_worker_context(session)
     return TranscodeResult(job_id=job.id, status="failed", retryable=False, error_code=error_code)
-
-
-def _sanitized_storage_failure_details(exc: StorageFailureError) -> dict[str, Any]:
-    details = getattr(exc, "details", None)
-    if not isinstance(details, dict):
-        return {}
-    sanitized: dict[str, Any] = {}
-    for key, value in details.items():
-        if key not in _STORAGE_DIAGNOSTIC_KEYS:
-            continue
-        if isinstance(value, str):
-            sanitized[key] = value[:256]
-        elif isinstance(value, int):
-            sanitized[key] = value
-    return sanitized

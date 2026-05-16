@@ -280,7 +280,15 @@ class S3StoragePresigner:
         try:
             self._client.download_file(self._bucket, key, destination)
         except (BotoCoreError, ClientError) as exc:
-            raise StorageFailureError("Failed to download object", details={"key": key}) from exc
+            details = (
+                _storage_client_error_details(operation="download_file", key=key, exc=exc)
+                if isinstance(exc, ClientError)
+                else _storage_boto_error_details(operation="download_file", key=key, exc=exc)
+            )
+            raise StorageFailureError(
+                "Failed to download object",
+                details=details,
+            ) from exc
 
     def upload_file(
         self,
@@ -301,7 +309,12 @@ class S3StoragePresigner:
                 ExtraArgs=extra_args,
             )
         except (BotoCoreError, ClientError) as exc:
-            raise StorageFailureError("Failed to upload object", details={"key": key}) from exc
+            details = (
+                _storage_client_error_details(operation="upload_file", key=key, exc=exc)
+                if isinstance(exc, ClientError)
+                else _storage_boto_error_details(operation="upload_file", key=key, exc=exc)
+            )
+            raise StorageFailureError("Failed to upload object", details=details) from exc
 
     def delete_object(self, *, key: str) -> None:
         try:
@@ -368,6 +381,33 @@ def _storage_boto_error_details(
         "storage_key_sha256": _storage_key_sha256(key),
         "exception_type": type(exc).__name__,
     }
+
+
+_STORAGE_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "operation",
+        "provider_error_code",
+        "http_status_code",
+        "request_id",
+        "exception_type",
+        "storage_key_sha256",
+    }
+)
+
+
+def storage_failure_diagnostics(exc: StorageFailureError) -> dict[str, Any]:
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key, value in details.items():
+        if key not in _STORAGE_DIAGNOSTIC_KEYS:
+            continue
+        if isinstance(value, str):
+            sanitized[key] = value[:256]
+        elif isinstance(value, int):
+            sanitized[key] = value
+    return sanitized
 
 
 async def storage_presign_upload(

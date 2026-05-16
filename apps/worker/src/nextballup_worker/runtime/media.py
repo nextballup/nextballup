@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ from nextballup_api.storage import (
     StoragePresigner,
     normalize_etag,
     storage_download_file,
+    storage_failure_diagnostics,
     storage_head_object,
     storage_key_for_mezzanine,
     storage_upload_file,
@@ -29,6 +31,8 @@ from nextballup_core.constants import ErrorCode
 from nextballup_core.settings import Settings
 from nextballup_db.models.video import Video
 from nextballup_worker.errors import PermanentProcessingError, TransientProcessingError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -542,9 +546,12 @@ async def create_browser_mezzanine(
                 destination=str(input_path),
             )
         except StorageFailureError as exc:
+            storage_failure = storage_failure_diagnostics(exc)
+            _log_storage_failure("download_raw", storage_failure)
             raise TransientProcessingError(
                 "Failed to download uploaded object for transcoding",
                 code=ErrorCode.PROCESSING_STORAGE_FAILURE,
+                details={"storage_failure": storage_failure} if storage_failure else None,
             ) from exc
         if video.checksum_sha256:
             actual_sha256 = await to_thread.run_sync(lambda: _sha256_file(input_path))
@@ -632,9 +639,12 @@ async def create_browser_mezzanine(
             )
             metadata = await storage_head_object(presigner, key=mezzanine_key)
         except StorageFailureError as exc:
+            storage_failure = storage_failure_diagnostics(exc)
+            _log_storage_failure("upload_mezzanine", storage_failure)
             raise TransientProcessingError(
                 "Failed to upload browser playback artifact",
                 code=ErrorCode.PROCESSING_STORAGE_FAILURE,
+                details={"storage_failure": storage_failure} if storage_failure else None,
             ) from exc
 
         if metadata is None:
@@ -665,3 +675,16 @@ async def create_browser_mezzanine(
             codec=probe.codec,
             transcoder=transcode_mode,
         )
+
+
+def _log_storage_failure(context: str, details: dict[str, Any]) -> None:
+    logger.warning(
+        "Transcode media storage failed: context=%s operation=%s provider_error_code=%s "
+        "http_status_code=%s exception_type=%s storage_key_sha256=%s",
+        context,
+        details.get("operation", "unknown"),
+        details.get("provider_error_code", "unknown"),
+        details.get("http_status_code", "unknown"),
+        details.get("exception_type", "unknown"),
+        details.get("storage_key_sha256", "unknown"),
+    )

@@ -147,6 +147,50 @@ def test_s3_head_object_failure_keeps_sanitized_provider_diagnostics(
     assert "credential scope" not in serialized
 
 
+def test_s3_download_failure_keeps_sanitized_provider_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingDownloadClient:
+        def download_file(self, bucket: str, key: str, destination: str) -> None:
+            assert bucket == "nextballup-alpha-raw"
+            assert key == "raw/team-secret/video-secret/clip.mov"
+            assert destination == "/tmp/clip.mov"
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "AccessDenied",
+                        "Message": "contains test-secret-key",
+                    },
+                    "ResponseMetadata": {
+                        "HTTPStatusCode": 403,
+                        "RequestId": "r2-download-request-123",
+                    },
+                },
+                "GetObject",
+            )
+
+    monkeypatch.setattr(
+        "nextballup_api.storage.boto3.client",
+        lambda *_args, **_kwargs: _FailingDownloadClient(),
+    )
+    presigner = S3StoragePresigner(_storage_settings())
+
+    with pytest.raises(StorageFailureError) as exc_info:
+        presigner.download_file(
+            key="raw/team-secret/video-secret/clip.mov",
+            destination="/tmp/clip.mov",
+        )
+
+    details = exc_info.value.details
+    assert details["operation"] == "download_file"
+    assert details["provider_error_code"] == "AccessDenied"
+    assert details["http_status_code"] == 403
+    assert details["request_id"] == "r2-download-request-123"
+    serialized = repr(details)
+    assert "raw/team-secret/video-secret/clip.mov" not in serialized
+    assert "test-secret-key" not in serialized
+
+
 def test_s3_multipart_presign_uses_r2_compatible_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

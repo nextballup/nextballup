@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
-from nextballup_worker.errors import PermanentProcessingError
+from nextballup_api.storage import StorageFailureError
+from nextballup_worker.errors import PermanentProcessingError, TransientProcessingError
 from nextballup_worker.runtime import media as media_module
 from nextballup_worker.runtime.media import (
     _build_containerized_ffmpeg_command,
@@ -84,6 +86,21 @@ class _DownloadedObjectStorage:
 
     def delete_object(self, *, key: str) -> None:
         return None
+
+
+class _FailingDownloadStorage(_DownloadedObjectStorage):
+    def download_file(self, *, key: str, destination: str) -> None:
+        raise StorageFailureError(
+            "simulated download failure",
+            details={
+                "operation": "download_file",
+                "provider_error_code": "AccessDenied",
+                "http_status_code": 403,
+                "exception_type": "ClientError",
+                "storage_key_sha256": "safe-key-hash",
+                "key": key,
+            },
+        )
 
 
 def test_build_ffmpeg_command_strips_sensitive_metadata_and_targets_mp4() -> None:
@@ -339,6 +356,44 @@ async def test_create_browser_mezzanine_rehashes_download_before_transcode() -> 
         )
 
     assert exc.value.code == ErrorCode.PROCESSING_CHECKSUM_MISMATCH
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_create_browser_mezzanine_download_failure_logs_sanitized_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_key = "raw/team-secret/video-secret/input.mp4"
+    video = Video(
+        id=uuid.uuid4(),
+        team_id=uuid.uuid4(),
+        storage_key_raw=raw_key,
+        filename="input.mp4",
+        content_type="video/mp4",
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="nextballup_worker.runtime.media"),
+        pytest.raises(TransientProcessingError) as exc,
+    ):
+        await create_browser_mezzanine(
+            video=video,
+            presigner=_FailingDownloadStorage(_MP4_PAYLOAD),
+            settings=get_settings(),
+        )
+
+    assert exc.value.code == ErrorCode.PROCESSING_STORAGE_FAILURE
+    assert exc.value.details == {
+        "storage_failure": {
+            "operation": "download_file",
+            "provider_error_code": "AccessDenied",
+            "http_status_code": 403,
+            "exception_type": "ClientError",
+            "storage_key_sha256": "safe-key-hash",
+        }
+    }
+    assert "context=download_raw" in caplog.text
+    assert "provider_error_code=AccessDenied" in caplog.text
+    assert raw_key not in caplog.text
 
 
 @pytest.mark.asyncio(loop_scope="session")
