@@ -58,6 +58,13 @@ const EVENT_TYPE_OPTIONS: Array<{ value: VideoEventType; label: string }> = [
   { value: "pass", label: EVENT_TYPE_LABELS.pass },
 ];
 
+const MANUAL_TAG_SHORTCUTS: Record<string, VideoEventType> = {
+  "1": "shot_attempt",
+  "2": "shot_made",
+  "3": "rebound",
+  "4": "pass",
+};
+
 const EVENT_TYPE_FILTERS: Array<{ value: VideoEventType | "all"; label: string }> = [
   { value: "all", label: "All" },
   { value: "shot_attempt", label: "Shots" },
@@ -669,6 +676,59 @@ function CandidateReviewPanel({
     },
   });
 
+  const submitManualTag = useCallback(
+    (eventType: VideoEventType) => {
+      const eventTimeMs = getCurrentPlaybackTimeMs();
+      const resolvedWindow = manualClipWindow(
+        eventTimeMs,
+        video.duration_seconds,
+        manualPreSeconds,
+        manualPostSeconds,
+      );
+      if (typeof resolvedWindow === "string") {
+        setMutationError(resolvedWindow);
+        return;
+      }
+      const [clipStartTimeMs, clipEndTimeMs] = resolvedWindow;
+      setManualEventType(eventType);
+      manualTagMutation.mutate({
+        event_type: eventType,
+        event_time_ms: eventTimeMs,
+        clip_start_time_ms: clipStartTimeMs,
+        clip_end_time_ms: clipEndTimeMs,
+      });
+    },
+    [
+      getCurrentPlaybackTimeMs,
+      manualPostSeconds,
+      manualPreSeconds,
+      manualTagMutation,
+      video.duration_seconds,
+    ],
+  );
+
+  useEffect(() => {
+    if (!isVisible) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const eventType = MANUAL_TAG_SHORTCUTS[event.key];
+      if (
+        !eventType ||
+        event.repeat ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        manualTagMutation.isPending ||
+        isEditableTarget(event.target)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      submitManualTag(eventType);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isVisible, manualTagMutation.isPending, submitManualTag]);
+
   if (!isVisible) {
     return null;
   }
@@ -856,30 +916,33 @@ function CandidateReviewPanel({
             <button
               type="button"
               disabled={manualTagMutation.isPending}
-              onClick={() => {
-                const eventTimeMs = getCurrentPlaybackTimeMs();
-                const resolvedWindow = manualClipWindow(
-                  eventTimeMs,
-                  video.duration_seconds,
-                  manualPreSeconds,
-                  manualPostSeconds,
-                );
-                if (typeof resolvedWindow === "string") {
-                  setMutationError(resolvedWindow);
-                  return;
-                }
-                const [clipStartTimeMs, clipEndTimeMs] = resolvedWindow;
-                manualTagMutation.mutate({
-                  event_type: manualEventType,
-                  event_time_ms: eventTimeMs,
-                  clip_start_time_ms: clipStartTimeMs,
-                  clip_end_time_ms: clipEndTimeMs,
-                });
-              }}
+              onClick={() => submitManualTag(manualEventType)}
               className="rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
             >
               {manualTagMutation.isPending ? "Adding..." : "Add tag at playhead"}
             </button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wide text-[color:var(--color-nbu-text-muted)]">
+              Quick tag
+            </span>
+            {EVENT_TYPE_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                disabled={manualTagMutation.isPending}
+                title={`Create ${option.label.toLowerCase()} at the current playhead`}
+                data-testid={`manual-quick-tag-${option.value}`}
+                onClick={() => submitManualTag(option.value)}
+                className="inline-flex items-center gap-1.5 rounded-md border border-[color:var(--color-nbu-border)] px-2 py-1 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] disabled:opacity-50"
+              >
+                <span
+                  aria-hidden="true"
+                  className={`h-2 w-2 rounded-full ${EVENT_TYPE_THEME[option.value].dotClass}`}
+                />
+                {option.label}
+              </button>
+            ))}
           </div>
         </div>
       </div>
@@ -1567,6 +1630,17 @@ function manualClipWindow(
     return "Manual tag window must start before it ends.";
   }
   return [start, end];
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tagName = target.tagName.toLowerCase();
+  return (
+    target.isContentEditable ||
+    tagName === "input" ||
+    tagName === "select" ||
+    tagName === "textarea"
+  );
 }
 
 function formatReviewStatus(value: string): string {

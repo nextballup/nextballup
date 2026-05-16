@@ -1157,6 +1157,110 @@ describe("VideoPlaybackView", () => {
     expect(manualRequest).not.toHaveBeenCalled();
   });
 
+  it("creates quick manual tags and ignores shortcut keys while editing", async () => {
+    const video = baseVideo({
+      status: "processed",
+      playback_url: "https://signed.example/v1.mp4?sig=abc",
+      playback_format: "mp4",
+      playback_token: "tok",
+      token_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      duration_seconds: 600,
+      processing: { transcode: "completed", events: "completed" },
+    });
+    const manualRequest = vi.fn();
+    server.use(
+      http.get("/api/v1/videos/v1", () => HttpResponse.json(video)),
+      http.get("/api/v1/videos/v1/status", () =>
+        HttpResponse.json({
+          status: "processed",
+          playback_status: "ready_for_playback",
+          stage: null,
+          progress_percent: 100,
+          stages: {
+            transcode: { status: "completed" },
+            events: { status: "completed" },
+          },
+        }),
+      ),
+      http.get("/api/v1/videos/v1/events", () =>
+        HttpResponse.json({
+          video_id: "v1",
+          shot_clock_enabled: false,
+          shot_clock_seconds: null,
+          total: 1,
+          next_cursor: null,
+          summary: {
+            total: 1,
+            needs_review: 1,
+            approved: 0,
+            rejected: 0,
+            machine_only: 0,
+            alpha_model_source: 1,
+            manual_source: 0,
+          },
+          events: [
+            buildEvent({
+              id: "00000000-0000-0000-0000-000000000501",
+              event_type: "shot_attempt",
+              event_time_ms: 12_000,
+              review_status: "needs_review",
+            }),
+          ],
+        }),
+      ),
+      http.post("/api/v1/videos/v1/events", async ({ request }) => {
+        const payload = await request.json();
+        manualRequest(payload);
+        return HttpResponse.json(
+          buildEvent({
+            id: `00000000-0000-0000-0000-00000000050${manualRequest.mock.calls.length + 1}`,
+            event_type: (payload as { event_type: VideoEventType }).event_type,
+            event_time_ms: (payload as { event_time_ms: number }).event_time_ms,
+            source: "manual",
+          }),
+          { status: 201 },
+        );
+      }),
+    );
+
+    await act(async () => {
+      render(wrap(<VideoPlaybackView initialVideo={video} viewerRole="coach" />));
+    });
+
+    const player = (await screen.findByTestId("video-player")) as HTMLVideoElement;
+    player.currentTime = 42;
+    fireEvent.click(screen.getByTestId("manual-quick-tag-rebound"));
+    await waitFor(() =>
+      expect(manualRequest).toHaveBeenLastCalledWith({
+        event_type: "rebound",
+        event_time_ms: 42_000,
+        clip_start_time_ms: 38_000,
+        clip_end_time_ms: 48_000,
+      }),
+    );
+
+    fireEvent.change(screen.getByTestId("manual-tag-pre-roll"), {
+      target: { value: "2" },
+    });
+    fireEvent.change(screen.getByTestId("manual-tag-post-roll"), {
+      target: { value: "8" },
+    });
+    player.currentTime = 55;
+    fireEvent.keyDown(window, { key: "4" });
+    await waitFor(() =>
+      expect(manualRequest).toHaveBeenLastCalledWith({
+        event_type: "pass",
+        event_time_ms: 55_000,
+        clip_start_time_ms: 53_000,
+        clip_end_time_ms: 63_000,
+      }),
+    );
+
+    const callsAfterShortcut = manualRequest.mock.calls.length;
+    fireEvent.keyDown(screen.getByTestId("candidate-search"), { key: "1" });
+    expect(manualRequest).toHaveBeenCalledTimes(callsAfterShortcut);
+  });
+
   it("hides the candidate review panel from players and does not query candidates", async () => {
     const eventsRequest = vi.fn();
     server.use(
