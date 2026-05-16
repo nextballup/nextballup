@@ -8,7 +8,7 @@ if a future code path constructs a storage key with a weaker validator
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from botocore.exceptions import ClientError
@@ -81,6 +81,25 @@ def test_s3_presigner_rejects_invalid_endpoint_before_upload() -> None:
         S3StoragePresigner(settings)
 
     assert exc_info.value.details == {"reason": "invalid_endpoint_url"}
+
+
+def test_s3_client_uses_r2_compatible_checksum_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _StorageClient:
+        pass
+
+    def _capture_client(*_args: object, **kwargs: object) -> _StorageClient:
+        captured.update(kwargs)
+        return _StorageClient()
+
+    monkeypatch.setattr("nextballup_api.storage.boto3.client", _capture_client)
+
+    S3StoragePresigner(_storage_settings())
+
+    config = cast("Any", captured["config"])
+    assert config.request_checksum_calculation == "when_required"
+    assert config.response_checksum_validation == "when_required"
 
 
 def test_s3_multipart_requires_provider_upload_id(monkeypatch: pytest.MonkeyPatch) -> None:

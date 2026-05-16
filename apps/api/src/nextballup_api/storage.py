@@ -116,6 +116,8 @@ class S3StoragePresigner:
                     signature_version="s3v4",
                     s3={"addressing_style": "path"},
                     retries={"max_attempts": 3, "mode": "standard"},
+                    request_checksum_calculation="when_required",
+                    response_checksum_validation="when_required",
                 ),
             )
         except (BotoCoreError, ValueError) as exc:
