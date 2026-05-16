@@ -8,8 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:${PATH}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg gosu \
     && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 nextballup \
+    && useradd --uid 10001 --gid nextballup --home-dir /app --shell /usr/sbin/nologin --no-create-home nextballup
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -26,4 +29,7 @@ COPY scripts ./scripts
 
 RUN uv sync --frozen --no-dev
 
-CMD ["uvicorn", "nextballup_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+RUN mkdir -p /var/data/nextballup-transcode /tmp/nextballup \
+    && chown -R nextballup:nextballup /app /var/data /tmp/nextballup
+
+CMD ["sh", "scripts/render_start_api.sh"]

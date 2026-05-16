@@ -120,6 +120,11 @@ scratch space. The Blueprint attaches `alpha-worker-media-scratch` at
 If a worker event says `/tmp exceeded the limit of 2GB`, the worker is not on
 the current Blueprint/env or the scratch disk is missing.
 
+The backend image defines a non-login `nextballup` runtime user. Render start
+scripts briefly run as root only to create/chown mounted runtime directories,
+then use `gosu` to start API, beat, and worker processes as `nextballup`. If
+Celery logs a superuser warning, the deployed image or start command is stale.
+
 Alpha playback transcode is optimized for pilot turnaround, not archival
 quality. The worker caps playback artifacts at 720p/30fps with
 `WORKER_PLAYBACK_MAX_WIDTH=1280`, `WORKER_PLAYBACK_MAX_FPS=30`,
