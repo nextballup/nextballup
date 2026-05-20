@@ -3,16 +3,14 @@ import Link from "next/link";
 import { ThemeToggle } from "@/components/theme-toggle";
 
 /**
- * The "product" link on the public marketing site points at the gated
- * pilot environment, not the same-origin app routes — the marketing
- * deployment must never serve the product auth surface, so cookies stay
- * scoped to beta/alpha hosts. Override via NEXT_PUBLIC_PRODUCT_BASE_URL
- * if a non-default product host is in use.
+ * The public marketing deployment points Sign in at the gated product host
+ * by setting NEXT_PUBLIC_PRODUCT_BASE_URL. Product-host builds such as alpha
+ * intentionally omit it so the same landing shell routes to same-origin auth.
  */
 function productBaseUrl(): string {
   const explicit = process.env.NEXT_PUBLIC_PRODUCT_BASE_URL?.trim();
   if (explicit) return explicit.replace(/\/+$/, "");
-  return "https://beta.nextballup.com";
+  return "";
 }
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
@@ -24,6 +22,7 @@ const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
 
 export function MarketingHeader() {
   const productBase = productBaseUrl();
+  const signInHref = productBase ? `${productBase}/login` : "/login";
   return (
     <header className="sticky top-0 z-30 border-b border-[color:var(--color-nbu-border)] bg-[color:var(--color-nbu-bg)]/90 backdrop-blur">
       <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
@@ -61,7 +60,7 @@ export function MarketingHeader() {
         <div className="flex items-center gap-2">
           <ThemeToggle />
           <Link
-            href={`${productBase}/login`}
+            href={signInHref}
             className="hidden rounded-md border border-[color:var(--color-nbu-border)] px-3 py-1.5 text-xs font-medium transition hover:border-[color:var(--color-nbu-text)] sm:inline-flex"
             data-testid="header-signin"
           >

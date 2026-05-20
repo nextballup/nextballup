@@ -1,10 +1,20 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, within } from "@testing-library/react";
 import LandingPage from "@/app/page";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
 }));
+
+const originalProductBase = process.env.NEXT_PUBLIC_PRODUCT_BASE_URL;
+
+afterEach(() => {
+  if (originalProductBase === undefined) {
+    delete process.env.NEXT_PUBLIC_PRODUCT_BASE_URL;
+  } else {
+    process.env.NEXT_PUBLIC_PRODUCT_BASE_URL = originalProductBase;
+  }
+});
 
 describe("Marketing home", () => {
   it("renders the hero and teaser cards linking out to each detail route", async () => {
@@ -86,7 +96,9 @@ describe("Marketing home", () => {
     }
   });
 
-  it("points the hero pilot CTA at /pilot and sign-in at the gated product host", async () => {
+  it("points the hero pilot CTA at /pilot and defaults sign-in to same-origin auth", async () => {
+    delete process.env.NEXT_PUBLIC_PRODUCT_BASE_URL;
+
     await act(async () => {
       render(<LandingPage />);
     });
@@ -95,13 +107,22 @@ describe("Marketing home", () => {
     expect(pilot.getAttribute("href")).toBe("/pilot");
 
     const signIn = screen.getByTestId("header-signin") as HTMLAnchorElement;
-    // Default product host is beta.nextballup.com per the marketing header;
-    // marketing must not deep-link into same-origin /login (cookies must
-    // stay scoped to the gated host).
+    // Alpha hosts this shell and omits NEXT_PUBLIC_PRODUCT_BASE_URL, so Sign in
+    // must stay on alpha instead of sending coaches to beta.
+    expect(signIn.getAttribute("href")).toBe("/login");
+  });
+
+  it("uses the configured product host for public marketing sign-in", async () => {
+    process.env.NEXT_PUBLIC_PRODUCT_BASE_URL = "https://beta.nextballup.com/";
+
+    await act(async () => {
+      render(<LandingPage />);
+    });
+
+    const signIn = screen.getByTestId("header-signin") as HTMLAnchorElement;
     expect(signIn.getAttribute("href")).toBe(
       "https://beta.nextballup.com/login",
     );
-    expect(signIn.getAttribute("href")).not.toBe("/login");
   });
 
   it("nav links point at routes, not in-page anchors", async () => {

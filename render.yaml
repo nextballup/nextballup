@@ -186,6 +186,8 @@ services:
         value: "22"
       - key: NEXT_PUBLIC_REGISTRATION_MODE
         value: invite_only
+      # Omit NEXT_PUBLIC_PRODUCT_BASE_URL here: alpha hosts the product auth
+      # surface, so marketing-shell Sign in must route to same-origin /login.
       - key: API_UPSTREAM_HOSTPORT
         fromService:
           type: pserv

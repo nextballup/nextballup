@@ -12,6 +12,7 @@ vi.mock("next/navigation", () => ({
 }));
 
 const originalMode = process.env.NEXT_PUBLIC_REGISTRATION_MODE;
+const originalProductBase = process.env.NEXT_PUBLIC_PRODUCT_BASE_URL;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -19,6 +20,11 @@ afterEach(() => {
     delete process.env.NEXT_PUBLIC_REGISTRATION_MODE;
   } else {
     process.env.NEXT_PUBLIC_REGISTRATION_MODE = originalMode;
+  }
+  if (originalProductBase === undefined) {
+    delete process.env.NEXT_PUBLIC_PRODUCT_BASE_URL;
+  } else {
+    process.env.NEXT_PUBLIC_PRODUCT_BASE_URL = originalProductBase;
   }
 });
 
@@ -38,6 +44,7 @@ describe("registration channel UI", () => {
   ] as const)(
     "never exposes same-origin /register or /login links on the marketing landing (mode=%s)",
     (_label, mode) => {
+      process.env.NEXT_PUBLIC_PRODUCT_BASE_URL = "https://beta.nextballup.com";
       if (mode === undefined) {
         delete process.env.NEXT_PUBLIC_REGISTRATION_MODE;
       } else {

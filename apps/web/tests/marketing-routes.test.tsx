@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, within } from "@testing-library/react";
 import FaqPage from "@/app/faq/page";
 import ProductPage from "@/app/product/page";
@@ -8,6 +8,16 @@ import UseCasesPage from "@/app/use-cases/page";
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
 }));
+
+const originalProductBase = process.env.NEXT_PUBLIC_PRODUCT_BASE_URL;
+
+afterEach(() => {
+  if (originalProductBase === undefined) {
+    delete process.env.NEXT_PUBLIC_PRODUCT_BASE_URL;
+  } else {
+    process.env.NEXT_PUBLIC_PRODUCT_BASE_URL = originalProductBase;
+  }
+});
 
 describe("Marketing detail routes", () => {
   it("renders /product with the workflow section and a pilot CTA", async () => {
@@ -53,9 +63,16 @@ describe("Marketing detail routes", () => {
     expect(screen.getByTestId("cta-pilot")).toBeInTheDocument();
   });
 
-  it("each detail route never exposes same-origin /register or /login links", async () => {
+  it("each public marketing detail route uses the configured product host for auth links", async () => {
+    process.env.NEXT_PUBLIC_PRODUCT_BASE_URL = "https://beta.nextballup.com";
+
     for (const Page of [ProductPage, UseCasesPage, SecurityPage, FaqPage]) {
       const { unmount } = render(<Page />);
+      expect(
+        (screen.getByTestId("header-signin") as HTMLAnchorElement).getAttribute(
+          "href",
+        ),
+      ).toBe("https://beta.nextballup.com/login");
       const sameOriginAuth = screen.queryAllByRole("link").filter((link) => {
         const href = link.getAttribute("href") ?? "";
         return href === "/register" || href === "/login";
