@@ -10,7 +10,7 @@ dependencies = [
     "celery[redis]>=5.4,<5.7",
     "boto3>=1.35",
     "filetype>=1.2,<2",
-    "redis>=5.0,<6",
+    "redis>=5.0,<5.3",
 ]
 
 [build-system]

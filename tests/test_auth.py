@@ -273,6 +273,22 @@ async def test_me_rejects_garbage_token(client: AsyncClient) -> None:
     assert response.status_code == 401
 
 
+@pytest.mark.asyncio(loop_scope="session")
+async def test_me_rejects_tampered_token_signature(client: AsyncClient) -> None:
+    payload = _register_payload("tampered-token@example.com")
+    register = await client.post(f"{API}/auth/register", json=payload)
+    assert register.status_code == 201
+    access_token = register.cookies.get("nbu_access_token")
+    assert access_token
+
+    header, claims, signature = access_token.split(".")
+    replacement = "A" if signature[0] != "A" else "B"
+    tampered = f"{header}.{claims}.{replacement}{signature[1:]}"
+
+    response = await client.get(f"{API}/auth/me", headers={"Authorization": f"Bearer {tampered}"})
+    assert response.status_code == 401
+
+
 # ---- /auth/refresh ---------------------------------------------------------
 
 

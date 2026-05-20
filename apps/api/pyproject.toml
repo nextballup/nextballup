@@ -9,10 +9,10 @@ dependencies = [
     "nextballup-clips",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "python-jose[cryptography]>=3.3",
+    "cryptography>=46,<47",
     "bcrypt>=4.2",
     "boto3>=1.35",          # S3/MinIO presigned URLs
-    "redis>=5.0,<6",
+    "redis>=5.0,<5.3",
 ]
 
 [build-system]

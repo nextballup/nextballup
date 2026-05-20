@@ -16,6 +16,8 @@ dependencies = [
     "nextballup-db",
     "nextballup-api",
     "nextballup-worker",
+    # Security floor for transitive users (anyio/httpx/email-validator).
+    "idna>=3.15",
 ]
 
 [dependency-groups]
@@ -103,7 +105,7 @@ disallow_untyped_defs = true
 plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
 
 [[tool.mypy.overrides]]
-module = ["boto3", "botocore.*", "celery", "celery.*", "jose"]
+module = ["boto3", "botocore.*", "celery", "celery.*"]
 ignore_missing_imports = true
 
 # Celery has no py.typed marker, so its Task base and @app.task decorators
